@@ -224,7 +224,8 @@ pub fn run(path: &Path, opts: &Options, progress: &Progress) -> Result<Analysis>
     })
 }
 
-/// Percentile × percentile of recency-weighted revisions and complexity (D-08).
+/// Percentile × percentile of recency-weighted revisions and complexity (D-08), within
+/// each repository.
 fn score_hotspots(tree: &mut Tree) -> Vec<Hotspot> {
     let cands: Vec<NodeId> = (0..tree.len() as NodeId)
         .filter(|&id| {
@@ -259,24 +260,35 @@ fn score_hotspots(tree: &mut Tree) -> Vec<Hotspot> {
         }
         out
     };
-    let pr = pct(cands
-        .iter()
-        .map(|&id| f64::from(tree.get(id).recent))
-        .collect());
-    let pc = pct(cands
-        .iter()
-        .map(|&id| f64::from(tree.get(id).complexity))
-        .collect());
-    let mut hot: Vec<Hotspot> = cands
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| Hotspot {
+    // Percentiles are taken within each repository: in a multi-repo scan, a C codebase's
+    // 5k-line files must not push every other repository's hotspots off the scale.
+    let repo_of = |id: NodeId| -> NodeId {
+        tree.ancestors(id)
+            .find(|&a| tree.get(a).flags.has(Flags::REPO))
+            .unwrap_or(0)
+    };
+    let mut groups: std::collections::BTreeMap<NodeId, Vec<NodeId>> =
+        std::collections::BTreeMap::new();
+    for &id in &cands {
+        groups.entry(repo_of(id)).or_default().push(id);
+    }
+    let mut hot: Vec<Hotspot> = Vec::with_capacity(cands.len());
+    for members in groups.values() {
+        let pr = pct(members
+            .iter()
+            .map(|&id| f64::from(tree.get(id).recent))
+            .collect());
+        let pc = pct(members
+            .iter()
+            .map(|&id| f64::from(tree.get(id).complexity))
+            .collect());
+        hot.extend(members.iter().enumerate().map(|(i, &id)| Hotspot {
             node: id,
             change_pct: pr[i],
             complexity_pct: pc[i],
             score: pr[i] * pc[i],
-        })
-        .collect();
+        }));
+    }
     for h in &hot {
         tree.get_mut(h.node).hotspot = h.score;
     }

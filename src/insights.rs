@@ -604,12 +604,16 @@ fn cycles(c: &mut Ctx<'_>) {
             .collect::<Vec<_>>()
             .join("; ");
         let cut_imports: u32 = cy.cuts.iter().map(|x| x.2).sum();
-        let cut_list = cy
+        let mut cut_list = cy
             .cuts
             .iter()
+            .take(6)
             .map(|&(a, b, w)| format!("{} → {} ({w})", t.get(a).name, t.get(b).name))
             .collect::<Vec<_>>()
             .join(", ");
+        if cy.cuts.len() > 6 {
+            cut_list.push_str(&format!(" and {} more edges", cy.cuts.len() - 6));
+        }
         c.push(
             "dep-cycle",
             sev,

@@ -397,6 +397,7 @@ pub fn render(a: &Analysis, findings: &[Finding], opts: &Options) -> String {
                     names.join(" ↔ "),
                     c.cuts
                         .iter()
+                        .take(4)
                         .map(|&(x, y, w)| format!("{} → {} ({w})", t.get(x).name, t.get(y).name))
                         .collect::<Vec<_>>()
                         .join(", ")

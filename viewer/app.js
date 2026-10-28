@@ -937,7 +937,7 @@ renderers.architecture = (root) => {
   for (const c of deps.cycles) {
     cyc.append(h('div', { class: 'finding', 'data-sev': c.members.some(isDir) ? 'medium' : 'low', style: { marginTop: '8px' } },
       h('div', { class: 'title', text: `${path(c.parent)}: ${c.members.map((m) => N[m].name + (isDir(m) ? '/' : '')).join(' ↔ ')}` }),
-      h('div', { class: 'detail', text: `${c.weight} imports in the cycle. Removing ${c.cuts.reduce((a, x) => a + x[2], 0)} breaks it: ${c.cuts.map((x) => `${N[x[0]].name} → ${N[x[1]].name} (${x[2]})`).join(', ')}.` }),
+      h('div', { class: 'detail', text: `${c.weight} imports in the cycle. Removing ${c.cuts.reduce((a, x) => a + x[2], 0)} breaks it: ${c.cuts.slice(0, 8).map((x) => `${N[x[0]].name} → ${N[x[1]].name} (${x[2]})`).join(', ')}${c.cuts.length > 8 ? ` and ${c.cuts.length - 8} more` : ''}.` }),
       h('div', { class: 'detail mono', style: { fontSize: '12px' } }, c.cutFiles.map(([a, b]) => h('div', { text: `${path(a)} → ${path(b)}` }))),
       h('div', { class: 'row' }, h('button', { class: 'linkish', type: 'button', text: 'Open in matrix', onclick: () => { dir = c.parent; drawMatrix(); panel.scrollIntoView({ behavior: 'smooth' }); } }))));
   }
