@@ -30,11 +30,21 @@ tempfile = "3.27.0"
 [lints.rust]
 unsafe_code = "forbid"
 
-# Guardrails for AI-written code (see docs/rust-ai-playbook.md §4.3).
+# Guardrails for AI-written code (see docs/rust-ai-playbook.md §4.3 and decision D-15).
+# The gate runs clippy with -D warnings, so "warn" here fails `fsmap verify`.
 [lints.clippy]
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
+# Suppressions need a reason and must still be needed: `#[expect(lint, reason = "...")]`.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+# Panics and swallowed errors that compile fine (tests may unwrap: clippy.toml).
+unwrap_used = "warn"
+map_err_ignore = "warn"
+# Borrow-checker evasion by copying.
+redundant_clone = "warn"
+clone_on_ref_ptr = "warn"
 
 [profile.release]
 lto = "thin"

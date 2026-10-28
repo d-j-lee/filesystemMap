@@ -114,7 +114,7 @@ impl Layout<'_> {
         if files.len() <= 8 {
             return (files, hidden);
         }
-        let mut ranked = files.clone();
+        let mut ranked = files;
         ranked.sort_by_key(|&c| {
             let n = self.t.get(c);
             (

@@ -1,6 +1,10 @@
 //! Helpers shared by the end-to-end tests.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::unwrap_used,
+    reason = "each test crate uses a subset; in tests a failed unwrap is a failed test"
+)]
 
 use std::path::Path;
 use std::process::{Command, Output};

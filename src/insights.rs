@@ -140,7 +140,10 @@ impl Ctx<'_> {
         self.t.get(id).git.is_some() || self.project_without_git
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every field of a finding; callers read better with them inline"
+    )]
     fn push(
         &mut self,
         rule: &'static str,

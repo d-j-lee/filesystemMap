@@ -1,6 +1,11 @@
 //! End-to-end tests: build a small git repository with a known history, run the real
 //! binary against it, and check every output contract.
 
+#![allow(
+    clippy::unwrap_used,
+    reason = "allow-unwrap-in-tests does not cover helper functions in integration tests"
+)]
+
 mod common;
 
 use common::{commit, fsmap, git, write};

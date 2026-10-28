@@ -239,7 +239,7 @@ fn with_progress<T>(quiet: bool, f: impl FnOnce(&Progress) -> T) -> T {
     let done = Arc::new(AtomicBool::new(false));
     let show = !quiet && std::io::stderr().is_terminal();
     let handle = show.then(|| {
-        let (p, d) = (progress.clone(), done.clone());
+        let (p, d) = (Arc::clone(&progress), Arc::clone(&done));
         std::thread::spawn(move || {
             let bar = indicatif::ProgressBar::new_spinner();
             bar.set_style(

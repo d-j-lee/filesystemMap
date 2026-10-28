@@ -552,7 +552,7 @@ impl<'a> Resolver<'a> {
             "crate" => self.rust_path(crate_base, &segs[1..]),
             "self" => self.rust_path(&module_dir, &segs[1..]),
             "super" => {
-                let mut base = module_dir.clone();
+                let mut base = module_dir;
                 let mut i = 0;
                 while segs.get(i).is_some_and(|s| s == "super") {
                     base = parent_dir(&base).to_string();

@@ -37,9 +37,9 @@ impl Window {
             return Ok(Window::Since(s.to_string()));
         }
         let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
-        let n: i64 = num
-            .parse()
-            .map_err(|_| format!("bad window {s:?}: use all, 2y, 18m, 6w, 90d or YYYY-MM-DD"))?;
+        let n: i64 = num.parse().map_err(|e| {
+            format!("bad window {s:?} ({e}): use all, 2y, 18m, 6w, 90d or YYYY-MM-DD")
+        })?;
         let day = 86_400;
         let secs = match unit {
             "y" => n * 365 * day,
@@ -417,7 +417,10 @@ pub fn analyse(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one pass over the log fills several outputs; a struct would only rename them"
+)]
 fn process(
     tree: &mut Tree,
     index: &PathIndex,

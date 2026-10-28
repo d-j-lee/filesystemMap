@@ -116,7 +116,7 @@ fn run_with_stdin(mut cmd: Command, input: Vec<u8>) -> Result<Vec<u8>> {
     let out = child.wait_with_output()?;
     writer
         .join()
-        .map_err(|_| anyhow::anyhow!("stdin writer panicked"))??;
+        .map_err(|panic| anyhow::anyhow!("stdin writer panicked: {panic:?}"))??;
     if !out.status.success() {
         bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
