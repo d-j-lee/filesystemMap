@@ -7,7 +7,7 @@ use std::fmt::Write;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::util::{bytes, count};
+use crate::util::{bytes, count, date, duration};
 
 #[derive(Deserialize)]
 struct NodeIn {
@@ -114,17 +114,21 @@ pub fn render(old_path: &str, new_path: &str, top: usize) -> Result<String> {
     if old.pruned.is_some() || new.pruned.is_some() {
         let _ = writeln!(
             out,
-            "note: a snapshot was pruned; small entries may appear or vanish. Use `fsmap scan --json` output for exact diffs.\n"
+            "note: a snapshot was pruned; small entries may appear or vanish. Diff unpruned `fsmap scan` output for exact results.\n"
         );
     }
     let (a, b) = (index(&old), index(&new));
     let root = |m: &HashMap<String, Vals>| m.get("").copied().unwrap_or_default();
     let (ra, rb) = (root(&a), root(&b));
+    let span = match duration(new.generated_at - old.generated_at) {
+        d if d == "today" => "under a day apart".to_string(),
+        d => format!("{d} apart"),
+    };
     let _ = writeln!(
         out,
-        "fsmap diff · {} → {} seconds apart\n  disk  {} → {} ({})\n  files {} → {} ({})\n  code  {} → {} ({})\n",
-        old.generated_at,
-        new.generated_at - old.generated_at,
+        "fsmap diff · {} → {} ({span})\n  disk  {} → {} ({})\n  files {} → {} ({})\n  code  {} → {} ({})\n",
+        date(old.generated_at),
+        date(new.generated_at),
         bytes(ra.disk),
         bytes(rb.disk),
         signed(i128::from(rb.disk) - i128::from(ra.disk), bytes),

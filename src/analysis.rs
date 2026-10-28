@@ -140,7 +140,7 @@ pub fn run(path: &Path, opts: &Options, progress: &Progress) -> Result<Analysis>
     let index = PathIndex::new(&tree);
     tick("classify", &mut timings);
 
-    let git_available = opts.git && git::available();
+    let git_available = opts.git && git::available(&root);
     let (mut repos, repos_total) = if git_available {
         progress.start("git status", 0);
         let (mut repos, total) = git::discover(&tree, &root, opts.max_repos);
@@ -200,6 +200,9 @@ pub fn run(path: &Path, opts: &Options, progress: &Progress) -> Result<Analysis>
     if opts.authors == AuthorMode::None {
         for n in &mut tree.nodes {
             n.owner = None;
+        }
+        for h in repos.iter_mut().filter_map(|r| r.history.as_mut()) {
+            h.truck_authors.clear();
         }
     }
 

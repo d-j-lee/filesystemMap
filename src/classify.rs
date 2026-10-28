@@ -489,9 +489,14 @@ pub fn is_manifest(name: &str) -> bool {
     MANIFESTS.contains(&name) || name.ends_with(".csproj") || name.ends_with(".sln")
 }
 
-/// Reason for names that are output by convention but also common for hand-written code
-/// (`build/` scripts, `bin/` tools). Git tracking overrides it: see [`settle_tracked_outputs`].
-pub const AMBIGUOUS_OUTPUT: &str = "build output next to its manifest";
+/// Reason for `build/` next to a manifest: output by convention, but also where projects
+/// keep hand-written build scripts (hono). Git tracking overrides it: see
+/// [`settle_tracked_outputs`]. Must stay distinct from [`BUILD_OUTPUT`] (decision D-14).
+pub const AMBIGUOUS_OUTPUT: &str = "build directory next to its manifest";
+
+/// Reason for names that are output whether or not git tracks them (`target/`, `dist/`,
+/// `out/`, .NET `bin/`/`obj/`): a committed one is reported as a committed artifact.
+const BUILD_OUTPUT: &str = "build output next to its manifest";
 
 /// Origin implied by a directory's name, given its siblings, with a human-readable reason.
 /// Ambiguous names (`target`, `build`, `dist`, …) need a matching manifest next to them.
@@ -513,7 +518,7 @@ fn zone_for_dir(name: &str, sibling_names: &[&str]) -> Option<(Zone, &'static st
             (Zone::Artifact, "tool cache / build directory")
         }
         "target" if has("Cargo.toml") || has("pom.xml") || has("build.sbt") => {
-            (Zone::Artifact, "build output next to its manifest")
+            (Zone::Artifact, BUILD_OUTPUT)
         }
         "build"
             if has("build.gradle")
@@ -525,14 +530,26 @@ fn zone_for_dir(name: &str, sibling_names: &[&str]) -> Option<(Zone, &'static st
             (Zone::Artifact, AMBIGUOUS_OUTPUT)
         }
         "dist" if has("package.json") || has("setup.py") || has("pyproject.toml") => {
-            (Zone::Artifact, AMBIGUOUS_OUTPUT)
+            (Zone::Artifact, BUILD_OUTPUT)
         }
-        "out" if has("package.json") || has("tsconfig.json") => (Zone::Artifact, AMBIGUOUS_OUTPUT),
+        "out" if has("package.json") || has("tsconfig.json") => (Zone::Artifact, BUILD_OUTPUT),
         "bin" | "obj" if sibling_names.iter().any(|n| n.ends_with(".csproj")) => {
-            (Zone::Artifact, AMBIGUOUS_OUTPUT)
+            (Zone::Artifact, BUILD_OUTPUT)
+        }
+        // `deps` is also a common module name (`src/deps/`): only next to a build file.
+        "deps" if has("mix.exs") || has("rebar.config") => {
+            (Zone::Dependency, "package-manager directory")
+        }
+        "deps"
+            if has("Makefile")
+                || has("CMakeLists.txt")
+                || has("configure")
+                || has("meson.build") =>
+        {
+            (Zone::Vendored, "third-party directory name")
         }
         "third_party" | "third-party" | "thirdparty" | "3rdparty" | "vendor" | "vendors"
-        | "external" | "extern" | "deps" => (Zone::Vendored, "third-party directory name"),
+        | "external" | "extern" => (Zone::Vendored, "third-party directory name"),
         n if n.starts_with("cmake-build-") || n.starts_with("bazel-") => {
             (Zone::Artifact, "build output directory name")
         }
@@ -654,8 +671,9 @@ fn classify_node_file(tree: &mut Tree, id: NodeId) {
     }
 }
 
-/// An ambiguously named "output" directory that git tracks is hand-written code (hono's
-/// `build/` holds build scripts): return it to its parent's origin. Run after git status.
+/// A `build/` directory that git tracks is hand-written code (hono's holds build scripts):
+/// return it to its parent's origin. Run after git status. Other output names stay
+/// artifacts when tracked, so committing them is reported.
 pub fn settle_tracked_outputs(tree: &mut Tree, roots: &mut Vec<ZoneRoot>) {
     let mut keep = Vec::with_capacity(roots.len());
     for r in roots.drain(..) {
@@ -746,5 +764,26 @@ mod tests {
             Some(Zone::Artifact)
         );
         assert_eq!(zone_from_markers(".cargo", &["config.toml"]), None);
+        // `src/deps/` is a module; `deps/` beside a Makefile is vendored (redis).
+        assert_eq!(z("deps", &["deps", "lib.rs", "mod.rs"]), None);
+        assert_eq!(
+            z("deps", &["Makefile", "deps", "src"]),
+            Some(Zone::Vendored)
+        );
+    }
+
+    #[test]
+    fn only_build_dirs_are_settled_by_tracking() {
+        let reason = |n: &str, s: &[&str]| zone_for_dir(n, s).map(|r| r.1);
+        assert_eq!(reason("build", &["package.json"]), Some(AMBIGUOUS_OUTPUT));
+        for (name, manifest) in [
+            ("target", "Cargo.toml"),
+            ("dist", "package.json"),
+            ("out", "tsconfig.json"),
+            ("obj", "App.csproj"),
+        ] {
+            let r = reason(name, &[manifest]);
+            assert!(r.is_some() && r != Some(AMBIGUOUS_OUTPUT), "{name}");
+        }
     }
 }

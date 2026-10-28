@@ -118,6 +118,10 @@ fn json_snapshot_contract() {
         })
         .expect("api.py ⇄ schema.txt coupling");
     assert_eq!(pair["shared"], 9, "8 bumps + the initial commit");
+    assert!(
+        pair.get("linked").is_none(),
+        "no extractor for .txt: {pair}"
+    );
     // Findings: committed build output is flagged.
     let rules: Vec<&str> = v["findings"]
         .as_array()
@@ -279,6 +283,10 @@ fn snapshot_diff_and_agent_ignore() {
     let out = fsmap(&["diff", "old.json", "new.json"], d);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("data/big.bin"), "{text}");
+    assert!(
+        text.starts_with("fsmap diff · 2") && text.contains("under a day apart"),
+        "{text}"
+    );
 
     let ign = fsmap(&["agent-ignore", ".", "-q"], d);
     let v: serde_json::Value = serde_json::from_slice(&ign.stdout).unwrap();

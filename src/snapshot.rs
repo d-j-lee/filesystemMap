@@ -1,4 +1,4 @@
-//! The versioned JSON contract (`schema: "fsmap/1"`) shared by `scan --json`, the HTML
+//! The versioned JSON contract (`schema: "fsmap/1"`) shared by `scan`, the HTML
 //! report and `diff`. Field reference: docs/snapshot-schema.md.
 
 use std::collections::{BTreeMap, HashSet};

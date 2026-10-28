@@ -19,7 +19,7 @@ for humans (interactive HTML), AI agents (budgeted Markdown, hooks) and CI (SARI
 | What does this codebase look like — languages, layers, cycles, hotspots, owners? | `fsmap report .` |
 | What should an AI agent know before it starts? | `fsmap context . > REPO_MAP.md` |
 | I changed A — which files usually change with A that I forgot? | `fsmap brief --diff` |
-| Fail CI only when something *new* goes wrong (a cycle, a committed build dir, a secret)? | `fsmap insights . --baseline b.json --fail-on medium` |
+| Fail CI only when something *new* goes wrong (a cycle, a committed `dist/`, a secret-looking file)? | `fsmap insights . --baseline b.json --fail-on medium` |
 | What grew since last week? | `fsmap diff old.json new.json` |
 | Which paths should agents not waste tokens on? | `fsmap agent-ignore .` |
 
@@ -67,12 +67,12 @@ it to a ticket. Its tabs:
 | Command | Output |
 |---|---|
 | `report [PATH] [-o FILE] [--open]` | Interactive HTML + terminal summary |
-| `scan [PATH] [-o FILE] [--pretty]` | JSON snapshot ([schema](docs/snapshot-schema.md)), unpruned |
+| `scan [PATH] [-o FILE] [--pretty]` | JSON snapshot ([schema](docs/snapshot-schema.md)), unpruned unless `--max-nodes` |
 | `context [PATH] [--budget N]` | Deterministic Markdown repo map for agents |
 | `insights [PATH] [--format text\|json\|sarif\|markdown] [--fail-on SEV] [--baseline F] [--write-baseline F]` | Findings; exit 1 when a (new) finding ≥ SEV |
-| `brief [FILES…] [--diff [BASE]] [--hook]` | Pre/post-edit briefing; forgotten co-change partners; Claude Code hook protocol |
-| `diff OLD.json NEW.json` | Growth, new large files, new/resolved findings |
-| `agent-ignore [PATH] [--format claude\|gitignore]` | Read-deny suggestions with token costs |
+| `brief [FILES…] [--diff [BASE]] [--hook] [--root DIR] [--refresh]` | Pre/post-edit briefing; forgotten co-change partners; Claude Code hook protocol. The index is cached per repository and HEAD |
+| `diff OLD.json NEW.json [--top N]` | Growth, new large files, new/resolved findings |
+| `agent-ignore [PATH] [--format claude\|gitignore]` | Read-deny rules for dependency, build-output and vendored directories; `gitignore` format adds reasons and token costs |
 
 Common analysis flags:
 
@@ -80,11 +80,15 @@ Common analysis flags:
 |---|---|
 | `--sizes-only` | du speed: no git, no file reads |
 | `--no-git`, `--no-deps`, `--no-dupes` | Skip that stage |
-| `--since 2y\|18m\|90d\|all\|YYYY-MM-DD` | History window, measured back from each repo's newest commit |
+| `--since 2y\|18m\|6w\|90d\|all\|YYYY-MM-DD` | History window: a duration counts back from each repo's newest commit; a date is absolute |
+| `--git-max-commits N`, `--max-repos N` | Safety caps: commits read per repository (30 000), repositories analysed (64) |
+| `--max-file-mib N` | Larger files are not read (default 4) |
 | `--exclude GLOB` | Skip paths |
 | `--cross-fs` | Descend into other mounts |
 | `--authors names\|hashed\|none` | Author identities in outputs; emails are never output |
-| `-q` | No progress display |
+| `--max-nodes N` | `report`/`scan`: fold the tree to this many nodes (report default 60 000); totals stay exact |
+| `--no-csp` | `report`: omit the Content-Security-Policy tag, for hosts that inject scripts |
+| `-j N`, `-q` | Worker threads; no progress display |
 
 Exit codes: `0` ok, `1` findings at or above `--fail-on`, `2` error.
 

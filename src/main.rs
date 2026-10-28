@@ -162,7 +162,7 @@ struct AnalyzeArgs {
     /// Skip duplicate-file detection.
     #[arg(long)]
     no_dupes: bool,
-    /// History window back from each repo's newest commit: `2y`, `18m`, `90d`, `all`, or a `YYYY-MM-DD` date.
+    /// History window: `2y`, `18m`, `6w`, `90d` back from each repo's newest commit, `all`, or an absolute `YYYY-MM-DD` date.
     #[arg(long, default_value = "2y", value_parser = parse_window)]
     since: Window,
     /// Safety cap on commits read per repository.
@@ -505,23 +505,22 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-fn repo_root(dir: &Path) -> PathBuf {
-    brief::current_head(dir)
-        .and_then(|_| {
-            fsmap::git::run({
-                let mut c = fsmap::git::git(dir);
-                c.args(["rev-parse", "--show-toplevel"]);
-                c
-            })
-            .ok()
-        })
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o).trim()))
-        .and_then(|p| std::fs::canonicalize(p).ok())
-        .unwrap_or_else(|| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
+/// The enclosing work tree and its HEAD, or the canonical `dir` and `None` outside one.
+fn repo_root(dir: &Path) -> (PathBuf, Option<String>) {
+    match brief::locate(dir) {
+        Some((top, head)) => (top, Some(head)),
+        None => (
+            std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+            None,
+        ),
+    }
 }
 
-fn brief_index(root: &Path, refresh: bool, quiet: bool) -> Result<Index> {
-    if !refresh && let Some(idx) = brief::load_cached(root) {
+fn brief_index(root: &Path, head: Option<&str>, refresh: bool, quiet: bool) -> Result<Index> {
+    if !refresh
+        && let Some(head) = head
+        && let Some(idx) = brief::load_cached(root, head)
+    {
         return Ok(idx);
     }
     let opts = analysis::Options {
@@ -541,17 +540,17 @@ fn run_brief(
     hook: bool,
     refresh: bool,
 ) -> Result<ExitCode> {
-    let root = repo_root(&root);
+    let (root, head) = repo_root(&root);
     if hook {
         // Hooks must never break the agent: any problem means "say nothing".
         let mut input = String::new();
         let _ = std::io::stdin().read_to_string(&mut input);
         // Outside a git work tree there is no history to brief on and nothing to key the
         // cache on: stay silent instead of re-analysing on every edit.
-        if brief::current_head(&root).is_none() {
+        if head.is_none() {
             return Ok(ExitCode::SUCCESS);
         }
-        if let Ok(idx) = brief_index(&root, refresh, true) {
+        if let Ok(idx) = brief_index(&root, head.as_deref(), refresh, true) {
             let owners = CodeOwners::load(&root);
             if let Some(json) = brief::hook_response(&idx, owners.as_ref(), &root, &input) {
                 println!("{json}");
@@ -559,7 +558,7 @@ fn run_brief(
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let idx = brief_index(&root, refresh, false)?;
+    let idx = brief_index(&root, head.as_deref(), refresh, false)?;
     let owners = CodeOwners::load(&root);
     let mut out = String::new();
     if let Some(base) = diff {

@@ -1,5 +1,5 @@
-//! Regression tests for defects found by the adversarial code review (see
-//! docs/decisions.md D-13). Each reproduces the reviewer's failing input.
+//! Regression tests for defects found by independent reviews (docs/decisions.md D-13:
+//! adversarial code review; D-14: documentation audit). Each reproduces the failing input.
 
 mod common;
 
@@ -242,4 +242,80 @@ fn git_file_is_vcs() {
     let v = snapshot(&fsmap(&["scan", ".", "-q", "--no-deps"], d));
     let g = node_by_path(&v, "libs/child/.git");
     assert_eq!(g["zone"], "vcs");
+}
+
+// ---- Round 3 (documentation audit, D-14) ----
+
+/// Committed `dist/` and `target/` are build output and get reported; a committed `build/`
+/// stays hand-written code (hono keeps its build scripts there).
+#[test]
+fn committed_output_dirs_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    init(d);
+    write(d, "web/package.json", "{}\n");
+    write(d, "web/build/release.js", "console.log(1);\n");
+    write(d, "rs/Cargo.toml", "[package]\nname = \"x\"\n");
+    for i in 0..5 {
+        write(d, &format!("web/dist/chunk{i}.js"), "var a=1;\n");
+        write(d, &format!("rs/target/debug/f{i}.d"), "x\n");
+    }
+    commit(d, "A", "init", T0);
+    let v = snapshot(&fsmap(&["scan", ".", "-q"], d));
+    let flagged: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "committed-artifact")
+        .flat_map(|f| f["paths"].as_array().unwrap())
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert!(
+        flagged.iter().any(|p| p.ends_with("web/dist")),
+        "{flagged:?}"
+    );
+    assert!(
+        flagged.iter().any(|p| p.ends_with("rs/target")),
+        "{flagged:?}"
+    );
+    assert!(node_by_path(&v, "web/build/release.js")["zone"].is_null());
+}
+
+/// `src/deps/` is a module, not vendored code.
+#[test]
+fn deps_module_is_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    write(d, "Cargo.toml", "[package]\nname = \"x\"\n");
+    write(d, "src/deps/mod.rs", "pub fn f() {}\n");
+    write(d, "c/Makefile", "all:\n");
+    write(d, "c/deps/lib/x.c", "int x;\n");
+    let v = snapshot(&fsmap(&["scan", ".", "-q", "--no-git"], d));
+    assert!(node_by_path(&v, "src/deps/mod.rs")["zone"].is_null());
+    assert_eq!(node_by_path(&v, "c/deps/lib/x.c")["zone"], "vendored");
+}
+
+/// `--authors none` leaves no way back to a person, truck-factor lists included.
+#[test]
+fn authors_none_hides_truck_authors() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    init(d);
+    for i in 0..4 {
+        write(d, "a.py", &format!("x = {i}\n"));
+        commit(d, "Solo Dev", "edit", T0 + i * DAY);
+    }
+    let out = fsmap(
+        &["scan", ".", "-q", "--since", "all", "--authors", "none"],
+        d,
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("Solo Dev"));
+    let v = snapshot(&out);
+    let h = &v["repos"][0]["history"];
+    assert_eq!(h["truckFactor"], 1, "{h}");
+    assert!(
+        h["truckAuthors"].as_array().is_none_or(|a| a.is_empty()),
+        "{h}"
+    );
 }

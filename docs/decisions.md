@@ -175,3 +175,35 @@ repositories. Every item below has a regression test in `tests/review_regression
 | Hook ignored projects reached through a symlink | minor | Hook paths are canonicalised (via the parent for files not yet written). |
 | Submodule/worktree `.git` *file* counted as untracked source | minor | Classified as VCS. |
 | Pinned nodes could exceed the node budget | minor | Pins are prioritised and stop at half the budget. |
+
+## D-14 Review round 3 (documentation audit) — what changed
+
+An independent agent compared every claim in the current-state docs with the code and the
+binary (CLI help, real `scan` output on ripgrep/flask/hono/redis, crafted fixtures). It
+reported 26 mismatches between docs and behaviour and 4 code defects. Docs were corrected in
+place; each code defect has a regression test in `tests/review_regressions.rs` that fails on
+the previous code.
+
+| Finding | Fix | Alternative and why not |
+|---|---|---|
+| A tracked `dist/` (next to `package.json`) or `target/` was returned to source, so committing build output raised no finding. `target`'s reason string was identical to the "ambiguous" one by accident. | Only `build/` is settled by git tracking (hono keeps build scripts there). `target/`, `dist/`, `out/` and .NET `bin/`/`obj/` stay artifacts and are reported when committed. The two reasons are distinct constants with a unit test. | Keep all five ambiguous and fix the docs: rejected, the evidence (hono) only covers `build/`, and a committed `dist/` is the case the ratchet exists for. Repos that commit `dist/` on purpose (GitHub Actions) baseline it. |
+| `deps` was vendored at any depth, so fsmap's own `src/deps/` counted as third-party and its cycles would have been downgraded. | `deps` is vendored only beside a C/C++ build file (`Makefile`, `CMakeLists.txt`, `configure`, `meson.build`) and is a dependency directory beside `mix.exs`/`rebar.config`. redis's `deps/` is unchanged. | Drop `deps` entirely: rejected, redis's `deps/` (1.9M tokens of vendored code) would become "source". |
+| `--authors none` still wrote `repos[].history.truckAuthors`. | Cleared with the other author data. | — |
+| Coupling pairs serialised `"linked": null`; the schema says absent. | Omitted when unknown. Additive per the schema rule (readers treating null and absent alike are unaffected), so the schema stays `fsmap/1`. | Document `null`: rejected, absent is the convention for every other optional field. |
+| `diff` printed a raw timestamp and suggested a non-existent `scan --json`. | Dates and a readable span; the hint names `scan`. | — |
+| `brief --hook` ran git 4 times per edit (HEAD read 3×). | One `rev-parse --show-toplevel --short=12 HEAD`; warm hook on ripgrep 19.8 → 7.9 ms (median of 30). Found while re-measuring the documented 14 ms. | — |
+
+Doc corrections, by kind:
+
+- **Stale after later changes**: per-repository hotspot ranking, the prune pin budget, weak
+  edges (TS type-only, test code), partial-clone history, test files in CLAUDE.md, the
+  `git_worktree` rule, line counts and timings.
+- **Wrong from the start**: the `agent-ignore` description (it emits directories only, and
+  costs only in the gitignore format), the "I/O-agnostic" ROADMAP claim, which tests found
+  D-09.
+- **Unsourced playbook claims**: re-checked against primary sources in
+  [research/rust-ai-evidence-addendum-2026-10-28.md](research/rust-ai-evidence-addendum-2026-10-28.md),
+  or marked as rules of thumb. The CRUST-Bench "3×" compared different models and was
+  removed.
+- **Process**: CLAUDE.md now treats doc numbers as measurements to re-run, and asks for an
+  independent claim-by-claim audit before large docs changes.

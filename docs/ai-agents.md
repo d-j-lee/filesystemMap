@@ -71,14 +71,20 @@ fsmap agent-ignore .                     # Claude Code permissions.deny entries
 fsmap agent-ignore . --format gitignore  # .cursorignore / .aiderignore / similar
 ```
 
-The suggestions come from the same analysis as the report:
+The rules cover whole directories the analysis classified as dependency, build output or
+vendored code (the outermost one of each, 64 KiB or more). `--format gitignore` adds the
+reason and an approximate token cost to each line as a comment; the `claude` format is plain
+JSON for `settings.json`.
 
-- dependency and build-output directories, with the reason each was classified that way;
-- directories dominated by generated files;
-- large data files.
+Generated files and large data files inside source directories are *not* turned into rules:
+they sit next to hand-written files, and a directory-wide deny would hide those too.
+`fsmap context` lists them in its "Skip when reading" section instead.
 
-Each comes with an approximate token cost. Review the list before you paste it: a
-`Read(...)` deny also blocks edits to those paths.
+Paste the `claude` output into the **project's** `.claude/settings.json`: a leading `/` in a
+rule is relative to the settings file's project, so the same rule in user settings would
+point somewhere else. Review the list first. A `Read(...)` deny stops Claude's file tools
+from reading those paths, which in practice also gets in the way of editing them
+(permissions documentation, `https://code.claude.com/docs/en/permissions`, as of 2026-10).
 
 ## 4. In CI — the ratchet
 
@@ -88,5 +94,5 @@ fsmap insights . --baseline .fsmap-baseline.json --fail-on medium
 ```
 
 Only findings that are **new** relative to the baseline fail the build: a new import cycle, a
-newly committed build directory, a secret-looking file. Existing debt does not block work but
+newly committed `dist/` or `target/`, a secret-looking file. Existing debt does not block work but
 cannot grow. `--format sarif` feeds GitHub code scanning.

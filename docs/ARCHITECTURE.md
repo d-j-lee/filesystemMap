@@ -26,7 +26,7 @@ scan ─▶ classify ─▶ git status ─▶ content ─▶ git history ─▶ 
                                                                                               │
               findings ◀───────────────────────────────────────────────────────────────────────┘
                  │
-     prune (HTML only) ─▶ render: html · json · markdown · sarif · terminal
+     prune (HTML; scan --max-nodes) ─▶ render: html · json · markdown · sarif · terminal
 ```
 
 Each stage enriches one arena (`model::Tree`). The order matters:
@@ -44,11 +44,14 @@ Each stage enriches one arena (`model::Tree`). The order matters:
   - Directory roll-ups are one reverse pass.
   - The JSON is flat, with no recursion limits, and the viewer rebuilds it in one loop.
 - **Zone = origin**: `source`, `vendored`, `dependency`, `artifact`, `vcs`. It is decided by:
-  1. names, with ambiguous names (`target`, `build`, `dist`) only next to a matching manifest;
+  1. names, with ambiguous names (`target`, `build`, `dist`, `out`, `deps`) only next to a
+     matching manifest or build file;
   2. markers (`CACHEDIR.TAG`, `pyvenv.cfg`, a Cargo home's `registry/`);
   3. `.gitattributes` `linguist-vendored` / `linguist-generated`.
 
-  The directory where the zone changes keeps its reason (`zoneRoots`).
+  The directory where the zone changes keeps its reason (`zoneRoots`). A `build/` that git
+  tracks returns to source (projects keep build scripts there); a tracked `target/`,
+  `dist/` or `out/` stays an artifact and is reported as committed (decision D-14).
 - **Git state** is separate: `tracked` / `untracked` / `ignored`, per owning work tree.
 - **Analysed** = origin `source`/`vendored` and not git-ignored and not a cloud placeholder.
   Only analysed files are read. A 2 GB `node_modules` costs one `lstat` per entry.
@@ -61,12 +64,12 @@ Each stage enriches one arena (`model::Tree`). The order matters:
 | Classify | `classify` | <ul><li>71-language table (comment syntax, import extractor, colour)</li><li>categories; test and manifest heuristics</li></ul> |
 | Git status | `git` | <ul><li>discovers every work tree in the scan (`.git` dir or file) plus the one enclosing the root</li><li>per tree: `ls-files` (tracked, then ignored with `--directory`), `check-attr` for linguist attributes, hygiene (`status --porcelain=v2`, stashes, unpushed branches, worktrees)</li><li>each node belongs to its deepest work tree</li></ul> |
 | Content | `content`, `strip` | <ul><li>one parallel read per eligible file: NUL sniff, shebang, generated markers in the first 5 lines, minified detection</li><li>a single-pass comment stripper gives code/comment/blank counts and the stripped text for import extraction</li></ul> |
-| History | `git::history` | <ul><li>`git log --no-merges -M --raw -z` (tree diffs only; partial clones never fetch blobs)</li><li>walked newest→oldest with a rename alias map; additions tombstone their path</li><li>skips shallow boundaries, `.git-blame-ignore-revs` and `[bot]` authors</li><li>large commits count for neither revisions nor coupling</li></ul> |
-| Imports | `deps` | <ul><li>regex extraction over stripped text, then resolution against the scanned files: Rust crate roots from `Cargo.toml` targets, `mod`/`use`, workspace crates; Python package chains and source roots; JS/TS relative paths, tsconfig `paths`, workspace packages; Go modules; JVM packages; C/C++ quoted and angle includes; Protobuf/Mojom</li><li>deferred imports (indented Python, JS `import()`) are *weak*</li><li>child→parent-module references are *up*</li><li>neither kind counts toward cycles</li></ul> |
+| History | `git::history` | <ul><li>`git log --no-merges -M --raw -z`; partial clones use exact renames (`-M100%`), which compare object ids only and so never fetch blobs; any repository falls back to that when the log fails</li><li>walked newest→oldest with a rename alias map; additions tombstone their path</li><li>skips shallow boundaries, `.git-blame-ignore-revs` and `[bot]` authors</li><li>large commits count for neither revisions nor coupling</li></ul> |
+| Imports | `deps` | <ul><li>regex extraction over stripped text, then resolution against the scanned files: Rust crate roots from `Cargo.toml` targets, `mod`/`use`, workspace crates; Python package chains and source roots; JS/TS relative paths, tsconfig `paths`, workspace packages; Go modules; JVM packages; C/C++ quoted and angle includes; Protobuf/Mojom</li><li>*weak* edges: every import behind them is deferred or type-only (indented Python, JS `import()`, TS `import type`/`export type`), or they touch test code</li><li>child→parent-module references are *up*</li><li>neither kind counts toward cycles</li></ul> |
 | Hotspots | `analysis` | percentile × percentile (§5) |
 | Duplicates | `dupes` | size bucket → 16 KiB prefix xxh3 → full xxh3-128; hard links and placeholders excluded |
 | Findings | `insights` | 19 rules (`insights::RULES`), stable ids, code-quality rules scoped to repos or manifest-rooted projects |
-| Prune | `prune` | multi-metric top-K plus everything a finding/table references; each directory's remainder folds into one `rest` node so totals stay exact |
+| Prune | `prune` | multi-metric top-K plus what findings and tables reference (pinned in priority order, up to half the budget); each directory's remainder folds into one `rest` node; headline totals come from the unpruned tree |
 | Render | `report::*`, `snapshot` | HTML = template + JS/CSS compiled into the binary + escaped JSON; hash-based CSP |
 
 ## 5. Scoring definitions
@@ -77,29 +80,31 @@ Each stage enriches one arena (`model::Tree`). The order matters:
   with a safety cap of 30 000 commits per repository.
 - **Recent change** = Σ 0.5^(age / 90 days) over revisions; age is measured from the repo's
   newest commit.
-- **Hotspot score** = percentile(recent change) × percentile(indentation complexity) among
-  analysed, non-generated code files with history. A file is **flagged** when both
-  percentiles ≥ 0.8, commits ≥ 5, recent change ≥ 1, and it is not a test.
+- **Hotspot score** = percentile(recent change) × percentile(indentation complexity),
+  ranked **within each repository** among analysed, non-generated code files with history
+  and complexity > 0. A file is **flagged** when both percentiles ≥ 0.8, commits ≥ 5,
+  recent change ≥ 1, and it is not a test.
 - **Change coupling** is computed over commits touching 2–30 files.
   - Confidence: conf(A→B) = n_AB / n_A. Lift = n_AB · N / (n_A · n_B).
   - A pair is kept when n_AB ≥ 5, lift ≥ 2, max confidence ≥ 0.3, and neither file is
     generated.
   - It is *hidden coupling* when both languages have extractors, no import path of ≤ 2 hops
-    links the files, neither file is a test, and they sit in different directories.
+    links the files, neither file is a test, and they sit in different directories. The
+    finding additionally needs max confidence ≥ 0.5 and reports at most 10 pairs.
 - **Authorship**: Degree-of-Authorship (Fritz et al.), DOA = 3.293 + 1.098·FA + 0.164·DL −
   0.321·ln(1+AC).
   - A developer is an author when the normalised DOA > 0.75 and the absolute DOA ≥ 3.293.
   - **Truck factor** uses Avelino et al.'s greedy removal until more than half of the files
     are orphaned.
   - **Knowledge risk**: no author active within 180 days of the newest commit, **and** the
-    file is a flagged hotspot or in the top 5 % by fan-in.
+    file is a flagged hotspot or its fan-in is at least max(95th percentile, 5).
 - **Cycles**: SCCs of the *lifted sibling graph*.
   - An import a→b becomes an edge between the two children of lca(a, b) that contain them.
   - So every cycle is reported at the level where it exists.
   - The suggested fix is a weighted feedback arc set (Eades–Lin–Smyth): the few, light
     edges whose removal makes the members acyclic. On hono's 9-module `src` cycle (59
-    imports) it names 3: `utils → helper` (1, against 16 the other way) and
-    `helper → jsx` (2, against 8).
+    imports) it names 3 imports on 2 edges: `utils → helper` (1, against 16 the other way)
+    and `helper → jsx` (2, against 8).
   - Cycles inside one Rust crate are low severity, since they compile fine.
 
 ## 6. Measured performance
@@ -108,11 +113,11 @@ Measured 2026-10-28 on a 4-core cloud container, release build.
 
 | Workload | Result |
 |---|---|
-| ripgrep: 2,241 commits, full history, imports, findings | 0.3 s |
-| flask: 3.8 k commits | 0.28 s |
+| ripgrep: 2,241 commits, full history, imports, findings | 0.23 s (median of 5) |
+| flask: 3.8 k commits | 0.33 s (median of 5) |
 | `/usr`, 93 k entries, `--no-git` | scan 0.14 s; content 1.6 s warm / 10.8 s cold (456 MiB text); peak RSS 88 MB |
 | `/usr --sizes-only` → HTML | 0.57 s, 6.6 MiB report |
-| `brief --hook` with a warm cache | 14 ms |
+| `brief --hook` on ripgrep with a warm cache (one git call) | 8 ms (median of 30) |
 
 ## 7. Safety and privacy
 

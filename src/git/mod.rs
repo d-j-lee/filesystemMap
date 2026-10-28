@@ -1,7 +1,8 @@
 //! Git integration by shelling out to the `git` CLI (decision D-03, hardened per D-08).
 //!
 //! Every invocation goes through [`git`], which pins config that could otherwise break
-//! parsing or execute programs from an untrusted repository's config.
+//! parsing or execute programs from an untrusted repository's config. Commands that
+//! compare the work tree with the index go through [`git_worktree`] instead (D-13).
 
 pub mod history;
 
@@ -123,8 +124,8 @@ fn text(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).trim_end().to_string()
 }
 
-pub fn available() -> bool {
-    Command::new("git")
+pub fn available(dir: &Path) -> bool {
+    git(dir)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

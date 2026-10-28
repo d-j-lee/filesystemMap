@@ -1,6 +1,7 @@
 //! Commit history → revisions, recency, authorship (DOA), truck factor, change coupling,
-//! monthly activity. Reads `git log --raw -z` (tree diffs only: no blob reads, safe on
-//! partial clones). See decision D-08 for why each rule exists.
+//! monthly activity. Reads `git log --raw -z`. Rename detection (`-M`) compares blob
+//! contents, so partial clones use exact renames (`-M100%`, object ids only) and never
+//! fetch blobs. See decision D-08 for why each rule exists.
 
 use std::collections::{HashMap, HashSet};
 
@@ -127,6 +128,7 @@ pub struct CouplingPair {
     pub lift: f32,
     /// Filled by the dependency stage: is there an import path (≤ 2 hops) between them?
     /// `None` when either language has no import extractor.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub linked: Option<bool>,
     /// A test file and the file it most likely tests.
     pub test_pair: bool,

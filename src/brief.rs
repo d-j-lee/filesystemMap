@@ -153,19 +153,24 @@ fn cache_path(root: &Path) -> Option<PathBuf> {
     Some(base.join("fsmap").join(format!("brief-{key:016x}.json")))
 }
 
-pub fn current_head(root: &Path) -> Option<String> {
-    git::run({
-        let mut c = git::git(root);
-        c.args(["rev-parse", "--short=12", "HEAD"]);
+/// The work tree containing `dir` (canonical) and its HEAD, in one git call. `None` outside
+/// a work tree or before the first commit: there is no history to brief on.
+pub fn locate(dir: &Path) -> Option<(PathBuf, String)> {
+    let out = git::run({
+        let mut c = git::git(dir);
+        c.args(["rev-parse", "--show-toplevel", "--short=12", "HEAD"]);
         c
     })
-    .ok()
-    .map(|o| String::from_utf8_lossy(&o).trim().to_string())
+    .ok()?;
+    let text = String::from_utf8_lossy(&out);
+    let mut lines = text.lines();
+    let top = std::fs::canonicalize(lines.next()?).ok()?;
+    let head = lines.next()?.trim().to_string();
+    Some((top, head))
 }
 
-/// Load the cached index for `root` if it matches HEAD and this fsmap version.
-pub fn load_cached(root: &Path) -> Option<Index> {
-    let head = current_head(root)?;
+/// Load the cached index for `root` if it matches `head` and this fsmap version.
+pub fn load_cached(root: &Path, head: &str) -> Option<Index> {
     let text = std::fs::read_to_string(cache_path(root)?).ok()?;
     let idx: Index = serde_json::from_str(&text).ok()?;
     (idx.head == head && idx.version == env!("CARGO_PKG_VERSION")).then_some(idx)
