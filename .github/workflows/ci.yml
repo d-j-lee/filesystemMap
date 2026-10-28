@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        if: runner.os == 'Linux'
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
+      - name: viewer syntax
+        if: runner.os == 'Linux'
+        run: node --check viewer/app.js
+
+  dogfood:
+    # fsmap analyses itself: new high-severity findings fail the build, and the report
+    # is kept as an artifact for review.
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: findings gate
+        run: ./target/release/fsmap insights . -q --fail-on high
+      - name: report
+        run: ./target/release/fsmap report . -q -o fsmap-report.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fsmap-report
+          path: fsmap-report.html

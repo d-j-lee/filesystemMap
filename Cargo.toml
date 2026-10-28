@@ -26,3 +26,17 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 [dev-dependencies]
 serde_json = "1.0.154"
 tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Guardrails for AI-written code (see docs/rust-ai-playbook.md §4.3).
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "debuginfo"

@@ -57,7 +57,7 @@ Superseded entries stay, marked **Superseded by D-xx**, so the reasoning trail s
   (friction), a TUI (not shareable).
 - **Cost**: we own ~1.5k lines of JS (squarified treemap, DSM, tables).
 
-## D-06 Default analysis window: latest 10 000 non-merge commits
+## D-06 Default analysis window: latest 10 000 non-merge commits — **Superseded by D-08, D-09**
 
 - **Why**: bounded cost on monorepos (Linux, Chromium) while covering years of history
   on normal repos. Files untouched inside the window are reported as "unchanged since
@@ -104,3 +104,46 @@ Rejected / deferred, with reason:
 - *Drop duplicates / C++ / Java resolution from v1*: kept — cheap, heuristic, labelled as such.
 - *Side-table node layout (≤ 64 B/node)*: deferred to ROADMAP; current ~100 B/node is fine
   below ~5 M entries.
+
+## D-09 The history window is measured from each repository's newest commit
+
+- **Decision**: `--since 2y` (default) means two years before the newest commit of *that*
+  repository, not two years before today. Absolute dates (`--since 2024-01-01`) and `all`
+  remain available.
+- **Why**: the end-to-end tests caught this. A wall-clock window gives a repository with no
+  recent commits (archived, vendored, a fixture) no history at all. Every history-derived
+  metric then silently goes to zero. The compiler cannot see this class of bug.
+- **Cost**: one extra `git log -1` per repository.
+
+## D-10 Deferred imports do not form cycles
+
+- **Decision**: these imports are recorded as *weak* edges and excluded from cycle detection
+  and the dependency matrix:
+  - Python imports that are indented (inside functions or `if TYPE_CHECKING:`);
+  - JS/TS dynamic `import()`.
+- **Why**: on flask, the first version reported a 15-module "cycle". All of it came from
+  `TYPE_CHECKING` imports, and none of it could fail at import time. Cycles are reported only
+  where they have runtime meaning.
+- **Related**: references from a child module to its own parent module file (Rust `super::`
+  into `mod.rs`/`lib.rs`, Python `__init__.py`) are marked *up* and excluded the same way.
+  Module cycles inside one Rust crate are reported, but at low severity, because they compile.
+
+## D-11 Viewer: findings first, map second, system fonts, validated palette
+
+- **Decision**: the report opens on ranked findings with evidence and copyable commands. The
+  treemap is the second tab.
+- **Why**: the reviewer noted that pictures don't drive decisions and that small hot files
+  are invisible by area. Tables and the scatter cover what the treemap hides.
+- **Map defaults**: a repository opens as a code map (size = code lines, colour = language).
+  Any other directory opens as a disk map.
+- **Look**: system font stacks keep the report offline and CSP-clean. Colours come from a
+  colour-blind-validated categorical palette with fixed slot order. Text is never coloured
+  by series.
+
+## D-12 Language of the documents
+
+- **Decision**: technical documents (README, architecture, schema, decision log, agent
+  guide, CLAUDE.md) are in English. They sit next to code identifiers, and agents and
+  reviewers outside the team read them. The personal adoption guide
+  ([rust-ai-playbook.md](rust-ai-playbook.md)) is in Korean, the owner's working language.
+- **Revisit** if the repository's audience is only the owner's team.
