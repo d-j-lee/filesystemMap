@@ -335,3 +335,48 @@ fn authors_none_hides_truck_authors() {
         "{h}"
     );
 }
+
+/// A submodule's own filter driver must not run when fsmap compares the superproject's
+/// work tree (found by the D-15 design review; D-13 only covered the top-level config).
+#[test]
+fn submodule_filter_driver_is_not_executed() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let sub = d.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    init(&sub);
+    write(&sub, "a.txt", "hi\n");
+    write(&sub, ".gitattributes", "*.txt filter=evil\n");
+    commit(&sub, "A", "sub", T0);
+    let sup = d.join("sup");
+    std::fs::create_dir(&sup).unwrap();
+    init(&sup);
+    write(&sup, "x.txt", "x\n");
+    commit(&sup, "A", "init", T0);
+    git(
+        &sup,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            "../sub",
+            "sub",
+        ],
+        T0,
+    );
+    commit(&sup, "A", "add submodule", T0 + DAY);
+    let marker = d.join("pwned.log");
+    let cmd = format!("sh -c 'echo PWNED >> {}; cat'", marker.display());
+    git(&sup.join("sub"), &["config", "filter.evil.clean", &cmd], T0);
+    // Stat-dirty inside the submodule, so a dirty check would re-clean the file.
+    write(&sup.join("sub"), "a.txt", "hi\n");
+    let _ = fsmap(&["brief", "--diff"], &sup);
+    let _ = fsmap(&["scan", ".", "-q"], &sup);
+    assert!(
+        !marker.exists(),
+        "submodule filter driver ran: {:?}",
+        std::fs::read_to_string(&marker)
+    );
+}

@@ -58,7 +58,9 @@ pub fn git(dir: &Path) -> Command {
 /// A `git` command for subcommands that compare the work tree with the index (`status`,
 /// `diff` against the work tree). Those can run `filter.<driver>.clean` programs named in
 /// an untrusted repository's config whenever a file's stat data changed, so every
-/// configured filter driver is neutralised for this invocation.
+/// configured filter driver is neutralised for this invocation. Submodules have their own
+/// config, which this cannot see: callers also pass `--ignore-submodules=dirty`, and
+/// `diff.ignoreSubmodules=dirty` covers porcelain diffs that forget to.
 pub fn git_worktree(dir: &Path) -> Command {
     let mut drivers: Vec<String> = run({
         let mut c = git(dir);
@@ -77,6 +79,7 @@ pub fn git_worktree(dir: &Path) -> Command {
     drivers.sort();
     drivers.dedup();
     let mut c = git(dir);
+    c.args(["-c", "diff.ignoreSubmodules=dirty"]);
     for d in drivers {
         for key in ["clean", "smudge", "process"] {
             c.arg("-c").arg(format!("filter.{d}.{key}="));

@@ -409,6 +409,9 @@ pub fn changed_files(root: &Path, base: &str) -> Result<Vec<String>> {
             "-z",
             "--no-relative",
             "--no-ext-diff",
+            // A dirty-submodule check runs `git status` inside each submodule, with that
+            // submodule's own (not neutralised) filter drivers.
+            "--ignore-submodules=dirty",
             base,
         ]);
         c
