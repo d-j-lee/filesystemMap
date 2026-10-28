@@ -574,20 +574,7 @@ fn repo_root(dir: &Path) -> (PathBuf, Option<String>) {
 }
 
 fn brief_index(root: &Path, head: Option<&str>, refresh: bool, quiet: bool) -> Result<Index> {
-    if !refresh
-        && let Some(head) = head
-        && let Some(idx) = brief::load_cached(root, head)
-    {
-        return Ok(idx);
-    }
-    let opts = analysis::Options {
-        dupes: None,
-        ..Default::default()
-    };
-    let a = with_progress(quiet, |p| analysis::run(root, &opts, p))?;
-    let idx = Index::build(&a);
-    brief::store_cached(root, &idx);
-    Ok(idx)
+    with_progress(quiet, |p| brief::index(root, head, refresh, p))
 }
 
 fn run_brief(

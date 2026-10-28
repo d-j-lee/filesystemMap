@@ -455,6 +455,27 @@ pub fn hook_response(
     let v: serde_json::Value = serde_json::from_str(stdin).ok()?;
     let event = v.get("hook_event_name")?.as_str()?.to_string();
     let file = v.get("tool_input")?.get("file_path")?.as_str()?;
+    let text = hook_context(idx, owners, root, file, &event)?;
+    Some(
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": text,
+            }
+        })
+        .to_string(),
+    )
+}
+
+/// The briefing text for a file an agent is editing, when the file is notable (co-change
+/// partners, generated, a hotspot, or widely imported). `file` may be absolute.
+pub fn hook_context(
+    idx: &Index,
+    owners: Option<&CodeOwners>,
+    root: &Path,
+    file: &str,
+    event: &str,
+) -> Option<String> {
     // The root is canonical; make the file canonical too (symlinked project paths). A
     // file that does not exist yet (Write) is resolved through its parent directory.
     let abs = PathBuf::from(file);
@@ -492,15 +513,30 @@ pub fn hook_response(
         text.truncate(cut);
         text.push('…');
     }
-    Some(
-        serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": event,
-                "additionalContext": text,
-            }
-        })
-        .to_string(),
-    )
+    Some(text)
+}
+
+/// The cached index for `root` at `head`, or a fresh analysis (cached for next time).
+pub fn index(
+    root: &Path,
+    head: Option<&str>,
+    refresh: bool,
+    progress: &crate::analysis::Progress,
+) -> Result<Index> {
+    if !refresh
+        && let Some(head) = head
+        && let Some(idx) = load_cached(root, head)
+    {
+        return Ok(idx);
+    }
+    let opts = crate::analysis::Options {
+        dupes: None,
+        ..Default::default()
+    };
+    let a = crate::analysis::run(root, &opts, progress)?;
+    let idx = Index::build(&a);
+    store_cached(root, &idx);
+    Ok(idx)
 }
 
 #[cfg(test)]
