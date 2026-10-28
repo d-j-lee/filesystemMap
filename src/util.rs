@@ -66,6 +66,22 @@ pub fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// For Markdown meant for agents: no control characters (no injected headings or list
+/// items) and no backticks (no breaking out of a code span). Names are data, not markup.
+pub fn md(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                '?'
+            } else if c == '`' {
+                '\''
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Quote a path for a POSIX shell command line.
 pub fn shell_quote(s: &str) -> String {
     if !s.is_empty()
@@ -91,6 +107,7 @@ mod tests {
         assert_eq!(date(0), "1970-01-01");
         assert_eq!(date(1_793_194_026), "2026-10-28");
         assert_eq!(sanitize("a\x1b[31mb"), "a?[31mb");
+        assert_eq!(md("x`\n## y"), "x'?## y");
         assert_eq!(shell_quote("src/a.rs"), "src/a.rs");
         assert_eq!(shell_quote("it's here"), "'it'\\''s here'");
     }

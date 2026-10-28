@@ -150,3 +150,28 @@ Rejected / deferred, with reason:
   reviewers outside the team read them. The personal adoption guide
   ([rust-ai-playbook.md](rust-ai-playbook.md)) is in Korean, the owner's working language.
 - **Revisit** if the repository's audience is only the owner's team.
+
+## D-13 Review round 2 (adversarial code review) — what changed
+
+An independent reviewer attacked the implementation with crafted fixtures and the same real
+repositories. Every item below has a regression test in `tests/review_regressions.rs`.
+
+| Finding | Severity | Fix |
+|---|---|---|
+| `git status` / `git diff` against the work tree run `filter.<x>.clean` from an untrusted repo's config → code execution on scan | blocker | Work-tree commands go through `git::git_worktree`, which neutralises every configured filter driver (`-c filter.X.clean=` …). Verified: the hostile driver no longer runs. |
+| A file renamed onto a path that once held a deleted file inherited that file's history | major | Rename destinations are tombstoned; alias values are stored fully resolved so tombstones never cut a file renamed *through* a path. |
+| Scanning a subdirectory lost history from before a move into it (`log -- <prefix>` turns the move into an add) | major | The main `git log` is never pathspec-limited; paths outside the scan are dropped on join. |
+| Partial clones: `-M` needs blobs (fails with lazy fetch off); `remote.*.promisor` not detected | major | Detect both markers; partial clones use exact renames (`-M100%`); fall back to it on failure. |
+| Headline totals computed on the pruned tree | major | Totals always come from the full tree. |
+| Go imports target package directories → never "linked", fan-in 0 → false hidden coupling | major | An edge to a directory reaches its direct files for linking and fan-in. |
+| Empty/broken nested `.git` made git fall back to the parent → parent history counted twice | major | Nested work trees are kept only when `rev-parse --show-toplevel` names that directory. |
+| `brief --hook` outside a work tree re-analysed on every call | major | Silent no-op outside git. |
+| JS regex `/\/*$/` opened a block comment, swallowing code and imports | minor | Regex literals recognised from the preceding token. |
+| tsconfig without `baseUrl` resolved bare specifiers to local folders | minor | Bare-specifier fallback only with `baseUrl`; `paths` relative to the config dir otherwise. |
+| Git-ignored scan root showed everything as untracked | minor | The prefix itself maps to the scan root. |
+| `--since` reaching before 1970 silently dropped history | minor | Such windows mean "all". |
+| File names could inject Markdown (headings, code-span breaks) into agent-facing output | minor | Names are sanitised (no control characters, no backticks) in Markdown/brief/hook text and finding text. |
+| A root directory named `{{DATA}}` broke the HTML template | minor | Single-pass template fill. |
+| Hook ignored projects reached through a symlink | minor | Hook paths are canonicalised (via the parent for files not yet written). |
+| Submodule/worktree `.git` *file* counted as untracked source | minor | Classified as VCS. |
+| Pinned nodes could exceed the node budget | minor | Pins are prioritised and stop at half the budget. |

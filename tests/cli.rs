@@ -1,55 +1,10 @@
 //! End-to-end tests: build a small git repository with a known history, run the real
 //! binary against it, and check every output contract.
 
-use std::path::Path;
-use std::process::{Command, Output};
+mod common;
 
-fn fsmap(args: &[&str], cwd: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_fsmap"))
-        .args(args)
-        .current_dir(cwd)
-        .env("XDG_CACHE_HOME", cwd.join(".cache-test"))
-        .output()
-        .expect("run fsmap")
-}
-
-fn git(dir: &Path, args: &[&str], time: i64) {
-    let ok = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_DATE", format!("@{time} +0000"))
-        .env("GIT_COMMITTER_DATE", format!("@{time} +0000"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", dir)
-        .output()
-        .expect("run git")
-        .status
-        .success();
-    assert!(ok, "git {args:?} failed");
-}
-
-fn write(dir: &Path, rel: &str, text: &str) {
-    let p = dir.join(rel);
-    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::write(p, text).unwrap();
-}
-
-fn commit(dir: &Path, author: &str, msg: &str, time: i64) {
-    git(dir, &["add", "-A"], time);
-    git(
-        dir,
-        &[
-            "-c",
-            &format!("user.name={author}"),
-            "-c",
-            "user.email=dev@example.com",
-            "commit",
-            "-qm",
-            msg,
-        ],
-        time,
-    );
-}
+use common::{commit, fsmap, git, write};
+use std::process::Command;
 
 /// A Python package with a module-level import cycle (a ↔ b), a type-only import that
 /// must not count, two files that always change together without importing each other,

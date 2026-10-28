@@ -32,12 +32,34 @@ pub fn render(snapshot_json: &str, title: &str, csp: bool) -> String {
     } else {
         String::new()
     };
-    TEMPLATE
-        .replacen("{{TITLE}}", &html_escape(title), 1)
-        .replacen("{{CSP}}", &policy, 1)
-        .replacen("/*{{CSS}}*/", CSS, 1)
-        .replacen("/*{{JS}}*/", JS, 1)
-        .replacen("{{DATA}}", &script_safe(snapshot_json), 1)
+    fill(
+        TEMPLATE,
+        &[
+            ("{{CSP}}", &policy),
+            ("{{TITLE}}", &html_escape(title)),
+            ("/*{{CSS}}*/", CSS),
+            ("{{DATA}}", &script_safe(snapshot_json)),
+            ("/*{{JS}}*/", JS),
+        ],
+    )
+}
+
+/// Single pass over the template: each marker is replaced exactly once, in template order,
+/// and inserted text is never searched again (a directory named `{{DATA}}` stays a name).
+fn fill(template: &str, parts: &[(&str, &str)]) -> String {
+    let mut out =
+        String::with_capacity(template.len() + parts.iter().map(|p| p.1.len()).sum::<usize>());
+    let mut rest = template;
+    for (marker, value) in parts {
+        let Some(at) = rest.find(marker) else {
+            continue;
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(value);
+        rest = &rest[at + marker.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -57,5 +79,10 @@ mod tests {
         assert!(html.contains("Content-Security-Policy"));
         // The bundled script must be byte-identical to what the hash covers.
         assert!(html.contains(JS));
+        // Names that look like markers stay names.
+        let tricky = render(r#"{"root":"{{DATA}} /*{{JS}}*/"}"#, "{{DATA}}", false);
+        assert!(tricky.contains("<title>{{DATA}}</title>"));
+        assert!(tricky.contains(r#""root":"{{DATA}} /*{{JS}}*/""#));
+        assert!(tricky.contains(JS));
     }
 }

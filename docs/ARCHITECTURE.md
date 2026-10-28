@@ -118,7 +118,9 @@ Measured 2026-10-28 on a 4-core cloud container, release build.
 - No `unsafe` (`[lints.rust] unsafe_code = "forbid"`).
 - fsmap writes only the output you name, plus the `brief` cache under `$XDG_CACHE_HOME/fsmap`.
 - Git runs with a fixed prefix so an untrusted repository's config cannot break parsing or
-  execute programs (fsmonitor, textconv, external diff). `GIT_OPTIONAL_LOCKS=0` avoids
+  execute programs (fsmonitor, textconv, external diff). Commands that compare the work
+  tree with the index additionally neutralise every configured `filter.<driver>` (clean
+  filters would otherwise run on stat-dirty files; decision D-13). `GIT_OPTIONAL_LOCKS=0` avoids
   `index.lock` races with concurrent agents. `GIT_NO_LAZY_FETCH=1` prevents network fetches
   in partial clones.
 - Outputs contain paths, sizes, metrics and author names; never file contents or commit

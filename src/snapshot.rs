@@ -98,29 +98,32 @@ impl Parts {
         }
     }
 
-    /// Node ids every view needs to exist (kept through pruning).
-    pub fn pinned(&self) -> HashSet<NodeId> {
-        let mut p = HashSet::new();
-        p.extend(self.zone_roots.iter().map(|z| z.node));
-        p.extend(self.repos.iter().map(|r| r.node));
-        p.extend(self.hotspots.iter().map(|h| h.node));
-        p.extend(self.coupling.iter().flat_map(|c| [c.a, c.b]));
-        p.extend(self.activity.iter().map(|a| a.0));
-        p.extend(self.truck.iter().map(|t| t.node));
-        p.extend(
-            self.duplicates
-                .iter()
-                .take(50)
-                .flat_map(|d| d.nodes.iter().copied()),
-        );
+    /// Node ids the views refer to, most important first. Pruning keeps them in this order
+    /// until half the node budget is used.
+    pub fn pinned(&self) -> Vec<NodeId> {
+        let mut p: Vec<NodeId> = Vec::new();
         p.extend(self.findings.iter().flat_map(|f| f.nodes.iter().copied()));
+        p.extend(self.repos.iter().map(|r| r.node));
         if let Some(g) = &self.deps {
             for c in &g.cycles {
-                p.insert(c.parent);
+                p.push(c.parent);
                 p.extend(c.members.iter().copied());
                 p.extend(c.cut_files.iter().flat_map(|&(a, b)| [a, b]));
             }
         }
+        p.extend(self.zone_roots.iter().map(|z| z.node));
+        p.extend(self.truck.iter().map(|t| t.node));
+        p.extend(self.hotspots.iter().map(|h| h.node));
+        p.extend(self.coupling.iter().flat_map(|c| [c.a, c.b]));
+        p.extend(self.activity.iter().map(|a| a.0));
+        p.extend(
+            self.duplicates
+                .iter()
+                .take(50)
+                .flat_map(|d| d.nodes.iter().take(2).copied()),
+        );
+        let mut seen = HashSet::new();
+        p.retain(|id| seen.insert(*id));
         p
     }
 
@@ -304,7 +307,8 @@ impl<'a> Snapshot<'a> {
                 cross_fs: o.scan.cross_fs,
                 authors: o.authors,
             },
-            totals: totals(tree),
+            // Always the full tree: a pruned tree folds entries into `rest` nodes.
+            totals: totals(&a.tree),
             flag_names: FLAG_NAMES,
             languages: classify::LANGS
                 .iter()

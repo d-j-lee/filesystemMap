@@ -54,6 +54,37 @@ pub fn git(dir: &Path) -> Command {
     c
 }
 
+/// A `git` command for subcommands that compare the work tree with the index (`status`,
+/// `diff` against the work tree). Those can run `filter.<driver>.clean` programs named in
+/// an untrusted repository's config whenever a file's stat data changed, so every
+/// configured filter driver is neutralised for this invocation.
+pub fn git_worktree(dir: &Path) -> Command {
+    let mut drivers: Vec<String> = run({
+        let mut c = git(dir);
+        c.args(["config", "--get-regexp", r"^filter\."]);
+        c
+    })
+    .map(|out| {
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter_map(|key| key.strip_prefix("filter."))
+            .filter_map(|rest| rest.rsplit_once('.').map(|(name, _)| name.to_string()))
+            .collect()
+    })
+    .unwrap_or_default();
+    drivers.sort();
+    drivers.dedup();
+    let mut c = git(dir);
+    for d in drivers {
+        for key in ["clean", "smudge", "process"] {
+            c.arg("-c").arg(format!("filter.{d}.{key}="));
+        }
+        c.arg("-c").arg(format!("filter.{d}.required=false"));
+    }
+    c
+}
+
 /// Run and return stdout; a non-zero exit is an error carrying the first stderr line.
 pub fn run(mut cmd: Command) -> Result<Vec<u8>> {
     let out = cmd
@@ -145,9 +176,14 @@ impl Repo {
     /// Map a toplevel-relative git path to a scan-root-relative path.
     fn to_scan_path(&self, git_path: &str, repo_rel: &str) -> Option<String> {
         let p = match &self.prefix {
+            // The scan root itself (e.g. an ignored directory reported as `out/`).
+            Some(prefix) if git_path == prefix.as_str() => "",
             Some(prefix) => git_path.strip_prefix(prefix.as_str())?.strip_prefix('/')?,
             None => git_path,
         };
+        if p.is_empty() {
+            return Some(repo_rel.to_string());
+        }
         Some(if repo_rel.is_empty() {
             p.to_string()
         } else {
@@ -202,20 +238,37 @@ pub fn discover(tree: &Tree, root: &Path, max_repos: usize) -> (Vec<Repo>, usize
             });
         }
     }
-    for id in 1..tree.len() as NodeId {
-        let n = tree.get(id);
-        if n.kind != Kind::Dir || !n.zone.is_analysed() {
-            continue;
-        }
-        if tree.children(id).any(|c| &*tree.get(c).name == ".git") {
-            repos.push(Repo {
+    let candidates: Vec<NodeId> = (1..tree.len() as NodeId)
+        .filter(|&id| {
+            let n = tree.get(id);
+            n.kind == Kind::Dir
+                && n.zone.is_analysed()
+                && tree.children(id).any(|c| &*tree.get(c).name == ".git")
+        })
+        .collect();
+    // A `.git` entry is not proof of a work tree (an empty or broken one makes git fall
+    // back to the parent repository): keep only directories git itself names as toplevel.
+    let nested: Vec<Repo> = candidates
+        .par_iter()
+        .filter_map(|&id| {
+            let dir = root.join(tree.rel_path(id));
+            let top = run({
+                let mut c = git(&dir);
+                c.args(["rev-parse", "--show-toplevel"]);
+                c
+            })
+            .ok()?;
+            let top = PathBuf::from(text(top));
+            let same = std::fs::canonicalize(&top).ok()? == std::fs::canonicalize(&dir).ok()?;
+            same.then(|| Repo {
                 node: id,
                 path: tree.rel_path(id),
-                toplevel: root.join(tree.rel_path(id)),
+                toplevel: dir,
                 ..Default::default()
-            });
-        }
-    }
+            })
+        })
+        .collect();
+    repos.extend(nested);
     let total = repos.len();
     repos.truncate(max_repos);
     (repos, total)
@@ -325,12 +378,7 @@ fn collect_status(repo: &Repo) -> Result<StatusData> {
         c
     })
     .is_ok_and(|o| text(o) == "true");
-    let partial = run({
-        let mut c = git(top);
-        c.args(["config", "--get", "extensions.partialclone"]);
-        c
-    })
-    .is_ok();
+    let partial = is_partial(top);
 
     Ok(StatusData {
         tracked,
@@ -344,10 +392,29 @@ fn collect_status(repo: &Repo) -> Result<StatusData> {
     })
 }
 
+/// Partial (promisor) clone: blobs may be missing locally. Older gits record it as
+/// `extensions.partialclone`, newer ones as `remote.<name>.promisor = true`.
+pub fn is_partial(top: &Path) -> bool {
+    run({
+        let mut c = git(top);
+        c.args([
+            "config",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+        ]);
+        c
+    })
+    .is_ok_and(|o| {
+        String::from_utf8_lossy(&o)
+            .lines()
+            .any(|l| l.starts_with("extensions.partialclone") || l.ends_with(" true"))
+    })
+}
+
 fn collect_hygiene(top: &Path) -> Result<Hygiene> {
     let mut h = Hygiene::default();
     let status = run({
-        let mut c = git(top);
+        let mut c = git_worktree(top);
         c.args([
             "status",
             "--porcelain=v2",

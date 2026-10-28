@@ -12,7 +12,7 @@ use crate::classify;
 use crate::insights::{Finding, Severity};
 use crate::model::{Category, Flags, Kind, NodeId, Tree, Zone};
 use crate::snapshot::totals;
-use crate::util::{bytes, count, date};
+use crate::util::{bytes, count, date, md};
 
 pub struct Options {
     /// Approximate token budget for the whole document.
@@ -50,7 +50,7 @@ struct Layout<'a> {
 impl Layout<'_> {
     fn dir_line(&self, id: NodeId, depth: usize) -> String {
         let n = self.t.get(id);
-        let mut s = format!("{}{}/", "  ".repeat(depth), n.name);
+        let mut s = format!("{}{}/", "  ".repeat(depth), md(&n.name));
         if n.zone != Zone::Source {
             let _ = write!(s, " [{} · {}]", n.zone.as_str(), bytes(n.disk));
             return s;
@@ -72,7 +72,7 @@ impl Layout<'_> {
 
     fn file_line(&self, id: NodeId, depth: usize) -> String {
         let n = self.t.get(id);
-        let mut s = format!("{}{}", "  ".repeat(depth), n.name);
+        let mut s = format!("{}{}", "  ".repeat(depth), md(&n.name));
         let mut tags = Vec::new();
         if n.code > 0 {
             tags.push(format!("{} lines", count(u64::from(n.code))));
@@ -324,7 +324,7 @@ pub fn render(a: &Analysis, findings: &[Finding], opts: &Options) -> String {
     if !by_rule.is_empty() {
         let mut s = String::from("## Watch out\n");
         for (_, fs) in by_rule.iter().take(8) {
-            let titles: Vec<&str> = fs.iter().take(4).map(|f| f.title.as_str()).collect();
+            let titles: Vec<String> = fs.iter().take(4).map(|f| md(&f.title)).collect();
             let more = if fs.len() > 4 {
                 format!(" (+{} more)", fs.len() - 4)
             } else {
@@ -357,7 +357,7 @@ pub fn render(a: &Analysis, findings: &[Finding], opts: &Options) -> String {
         let mut s = String::from("## Entry points & manifests\n");
         let list: Vec<String> = manifests
             .iter()
-            .map(|&id| format!("`{}`", t.rel_path(id)))
+            .map(|&id| format!("`{}`", md(&t.rel_path(id))))
             .collect();
         let _ = writeln!(s, "{}", list.join(", "));
         sections.push(s);
@@ -382,23 +382,28 @@ pub fn render(a: &Analysis, findings: &[Finding], opts: &Options) -> String {
             let mut s =
                 String::from("## Module dependencies (imports between top-level directories)\n");
             for ((x, y), w) in edges.iter().take(15) {
-                let _ = writeln!(s, "- `{}` → `{}` ({w})", t.rel_path(*x), t.rel_path(*y));
+                let _ = writeln!(
+                    s,
+                    "- `{}` → `{}` ({w})",
+                    md(&t.rel_path(*x)),
+                    md(&t.rel_path(*y))
+                );
             }
             for c in g.cycles.iter().take(5) {
-                let names: Vec<String> = c
-                    .members
-                    .iter()
-                    .map(|&m| t.get(m).name.to_string())
-                    .collect();
+                let names: Vec<String> = c.members.iter().map(|&m| md(&t.get(m).name)).collect();
                 let _ = writeln!(
                     s,
                     "- Cycle in `{}`: {} (break it by removing {})",
-                    t.display_path(c.parent),
+                    md(&t.display_path(c.parent)),
                     names.join(" ↔ "),
                     c.cuts
                         .iter()
                         .take(4)
-                        .map(|&(x, y, w)| format!("{} → {} ({w})", t.get(x).name, t.get(y).name))
+                        .map(|&(x, y, w)| format!(
+                            "{} → {} ({w})",
+                            md(&t.get(x).name),
+                            md(&t.get(y).name)
+                        ))
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
@@ -421,7 +426,7 @@ pub fn render(a: &Analysis, findings: &[Finding], opts: &Options) -> String {
             let _ = writeln!(
                 s,
                 "- `{}` — {} commits, {} code lines",
-                t.rel_path(h.node),
+                md(&t.rel_path(h.node)),
                 n.commits,
                 count(u64::from(n.code))
             );
@@ -444,8 +449,8 @@ pub fn render(a: &Analysis, findings: &[Finding], opts: &Options) -> String {
             let _ = writeln!(
                 s,
                 "- `{}` ⇄ `{}` — {} shared commits ({:.0}% / {:.0}%){link}",
-                t.rel_path(p.a),
-                t.rel_path(p.b),
+                md(&t.rel_path(p.a)),
+                md(&t.rel_path(p.b)),
                 p.shared,
                 p.conf_ab * 100.0,
                 p.conf_ba * 100.0
@@ -458,7 +463,7 @@ pub fn render(a: &Analysis, findings: &[Finding], opts: &Options) -> String {
     if !skip.is_empty() {
         let mut s = String::from("## Skip when reading (low value, high token cost)\n");
         for (path, why, tok) in skip.iter().take(12) {
-            let _ = writeln!(s, "- `{path}` — {why}, ~{} tokens", count(*tok));
+            let _ = writeln!(s, "- `{}` — {why}, ~{} tokens", md(path), count(*tok));
         }
         sections.push(s);
     }

@@ -154,6 +154,12 @@ impl Ctx<'_> {
     ) {
         let paths: Vec<String> = nodes.iter().map(|&n| self.t.display_path(n)).collect();
         let key = format!("{rule}|{}", paths.join("|"));
+        // Titles and details embed file names; never let a name carry line breaks or
+        // control sequences into Markdown, terminals or agent context.
+        let (title, detail) = (
+            crate::util::sanitize(&title),
+            crate::util::sanitize(&detail),
+        );
         self.out.push(Finding {
             id: format!("{rule}:{:08x}", xxh3_64(key.as_bytes()) as u32),
             rule,

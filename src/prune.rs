@@ -2,8 +2,6 @@
 //! (disk, bytes, code, commits) plus everything a finding or table refers to, and fold
 //! the rest of each directory into one `Rest` node so every total still adds up.
 
-use std::collections::HashSet;
-
 use crate::model::{Kind, NO_PARENT, Node, NodeId, Tree};
 
 pub struct Pruned {
@@ -17,7 +15,8 @@ fn share(v: f64, total: f64) -> f64 {
 }
 
 /// Returns `None` when the tree already fits the budget.
-pub fn prune(tree: &Tree, budget: usize, pinned: &HashSet<NodeId>) -> Option<Pruned> {
+/// `pinned` is in priority order; pins are honoured until half the budget is used.
+pub fn prune(tree: &Tree, budget: usize, pinned: &[NodeId]) -> Option<Pruned> {
     if tree.len() <= budget.max(1) {
         return None;
     }
@@ -50,13 +49,10 @@ pub fn prune(tree: &Tree, budget: usize, pinned: &HashSet<NodeId>) -> Option<Pru
         added
     };
     mark(0, &mut keep, &mut kept);
-    let mut pins: Vec<NodeId> = pinned
-        .iter()
-        .copied()
-        .filter(|&p| (p as usize) < tree.len())
-        .collect();
-    pins.sort_unstable();
-    for p in pins {
+    for &p in pinned.iter().filter(|&&p| (p as usize) < tree.len()) {
+        if kept >= budget / 2 {
+            break;
+        }
         mark(p, &mut keep, &mut kept);
     }
 
@@ -188,8 +184,7 @@ mod tests {
     #[test]
     fn keeps_big_and_pinned_and_conserves_totals() {
         let t = tree_with(&[1000, 1, 2, 3, 500, 4, 5]);
-        let pinned: HashSet<NodeId> = [2].into_iter().collect();
-        let p = prune(&t, 5, &pinned).unwrap();
+        let p = prune(&t, 5, &[2]).unwrap();
         let names: Vec<&str> = p.tree.nodes.iter().map(|n| &*n.name).collect();
         assert!(names.contains(&"f0"));
         assert!(names.contains(&"f1"), "pinned node kept");
@@ -208,6 +203,6 @@ mod tests {
     #[test]
     fn small_trees_untouched() {
         let t = tree_with(&[1, 2]);
-        assert!(prune(&t, 10, &HashSet::new()).is_none());
+        assert!(prune(&t, 10, &[]).is_none());
     }
 }

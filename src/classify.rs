@@ -594,6 +594,10 @@ pub fn classify_tree(tree: &mut Tree) -> Vec<ZoneRoot> {
                     {
                         return (z, Some(reason));
                     }
+                    // Submodules and linked worktrees have a `.git` *file* (a gitdir pointer).
+                    if child.kind == Kind::File && &*child.name == ".git" {
+                        return (Zone::Vcs, None);
+                    }
                     (zone, None)
                 })
                 .collect();

@@ -546,6 +546,11 @@ fn run_brief(
         // Hooks must never break the agent: any problem means "say nothing".
         let mut input = String::new();
         let _ = std::io::stdin().read_to_string(&mut input);
+        // Outside a git work tree there is no history to brief on and nothing to key the
+        // cache on: stay silent instead of re-analysing on every edit.
+        if brief::current_head(&root).is_none() {
+            return Ok(ExitCode::SUCCESS);
+        }
         if let Ok(idx) = brief_index(&root, refresh, true) {
             let owners = CodeOwners::load(&root);
             if let Some(json) = brief::hook_response(&idx, owners.as_ref(), &root, &input) {
@@ -570,8 +575,10 @@ fn run_brief(
             out.push_str("### Possibly forgotten (usually change together)\n");
             for (from, other, conf, shared) in missing.iter().take(15) {
                 out.push_str(&format!(
-                    "- `{other}` — changed in {:.0}% of `{from}`'s commits ({shared} shared)\n",
-                    conf * 100.0
+                    "- `{}` — changed in {:.0}% of `{}`'s commits ({shared} shared)\n",
+                    util::md(other),
+                    conf * 100.0,
+                    util::md(from)
                 ));
             }
         }

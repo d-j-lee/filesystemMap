@@ -139,8 +139,10 @@ pub struct Sources {
     pub manifests: Vec<(NodeId, String)>,
 }
 
-/// tsconfig/jsconfig: (config dir, baseUrl dir, `paths` patterns → targets).
-type TsConfig = (String, String, Vec<(String, Vec<String>)>);
+/// tsconfig/jsconfig: (config dir, `baseUrl` dir if set, `paths` patterns → targets).
+/// Without `baseUrl`, `paths` targets are relative to the config's directory and bare
+/// specifiers resolve to packages, not local files.
+type TsConfig = (String, Option<String>, Vec<(String, Vec<String>)>);
 
 /// Lifted sibling edge → (weight, sample file edges).
 type Lifted = HashMap<(NodeId, NodeId), (u32, Vec<(NodeId, NodeId)>)>;
@@ -338,8 +340,7 @@ impl<'a> Resolver<'a> {
                         let base = opts
                             .get("baseUrl")
                             .and_then(|b| b.as_str())
-                            .and_then(|b| join_norm(&dir, b))
-                            .unwrap_or_else(|| dir.clone());
+                            .and_then(|b| join_norm(&dir, b));
                         let mut pats = Vec::new();
                         if let Some(map) = opts.get("paths").and_then(|p| p.as_object()) {
                             for (k, vals) in map {
@@ -679,7 +680,7 @@ impl<'a> Resolver<'a> {
             .iter()
             .find(|(d, _, _)| d.is_empty() || from_path.starts_with(&format!("{d}/")))
         {
-            let _ = cfg_dir;
+            let paths_base = base.as_deref().unwrap_or(cfg_dir);
             for (pat, targets) in pats {
                 let rest = match pat.strip_suffix('*') {
                     Some(prefix) => spec.strip_prefix(prefix),
@@ -687,7 +688,7 @@ impl<'a> Resolver<'a> {
                 };
                 if let Some(rest) = rest {
                     for t in targets {
-                        if let Some(p) = join_norm(base, &t.replace('*', rest))
+                        if let Some(p) = join_norm(paths_base, &t.replace('*', rest))
                             && let Some(id) = self.js_file(&p)
                         {
                             return Resolved::Internal(id);
@@ -695,7 +696,8 @@ impl<'a> Resolver<'a> {
                     }
                 }
             }
-            if let Some(p) = join_norm(base, spec)
+            if let Some(base) = base
+                && let Some(p) = join_norm(base, spec)
                 && let Some(id) = self.js_file(&p)
             {
                 return Resolved::Internal(id);
@@ -891,12 +893,28 @@ pub fn build(
         .collect();
     edges.sort_unstable_by_key(|e| (e.from, e.to));
 
+    // An import of a directory (a Go package) reaches every file directly in it.
+    let reached = |tree: &Tree, to: NodeId| -> Vec<NodeId> {
+        if tree.get(to).is_dir() {
+            tree.children(to)
+                .filter(|&c| tree.get(c).is_file())
+                .collect()
+        } else {
+            vec![to]
+        }
+    };
     // Fan-in / fan-out (distinct files).
+    let mut importers: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
     for e in &edges {
         tree.get_mut(e.from).fan_out += 1;
-        if tree.get(e.to).is_file() {
-            tree.get_mut(e.to).fan_in += 1;
+        for f in reached(tree, e.to) {
+            if f != e.from {
+                importers.entry(f).or_default().insert(e.from);
+            }
         }
+    }
+    for (f, from) in importers {
+        tree.get_mut(f).fan_in = from.len() as u32;
     }
 
     let cycles = find_cycles(tree, &edges);
@@ -904,8 +922,10 @@ pub fn build(
     // Static link check for coupling pairs: direct edge or a shared neighbour.
     let mut nbrs: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
     for e in &edges {
-        nbrs.entry(e.from).or_default().insert(e.to);
-        nbrs.entry(e.to).or_default().insert(e.from);
+        for to in reached(tree, e.to) {
+            nbrs.entry(e.from).or_default().insert(to);
+            nbrs.entry(to).or_default().insert(e.from);
+        }
     }
     let supported = |id: NodeId| tree.get(id).lang.is_some_and(|l| lang(l).imports.is_some());
     for p in coupling.iter_mut() {

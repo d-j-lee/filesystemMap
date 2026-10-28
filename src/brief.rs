@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::{Analysis, AuthorMode};
 use crate::git;
 use crate::model::{Flags, NodeId};
-use crate::util::{count, duration};
+use crate::util::{count, duration, md};
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct FileFacts {
@@ -267,7 +267,7 @@ pub fn brief_file(
     exclude: &HashSet<&str>,
 ) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "### `{path}`");
+    let _ = writeln!(s, "### `{}`", md(path));
     let Some(f) = idx.files.get(path) else {
         let _ = writeln!(s, "- Not in the map (new, ignored, or outside the scan).");
         return s;
@@ -294,7 +294,7 @@ pub fn brief_file(
             .map(|p| {
                 format!(
                     "`{}` ({:.0}% of this file's commits{})",
-                    p.other,
+                    md(&p.other),
                     p.conf * 100.0,
                     if p.linked == Some(false) {
                         ", no import link"
@@ -308,7 +308,7 @@ pub fn brief_file(
         let _ = writeln!(s, "- Usually changes with: {list}");
     }
     if let Some(imp) = idx.importers.get(path) {
-        let shown: Vec<String> = imp.iter().take(6).map(|p| format!("`{p}`")).collect();
+        let shown: Vec<String> = imp.iter().take(6).map(|p| format!("`{}`", md(p))).collect();
         let more = imp.len().saturating_sub(6);
         let _ = writeln!(
             s,
@@ -329,7 +329,7 @@ pub fn brief_file(
             "- Likely tests: {}",
             tests
                 .iter()
-                .map(|t| format!("`{t}`"))
+                .map(|t| format!("`{}`", md(t)))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -359,11 +359,11 @@ pub fn brief_file(
         let _ = writeln!(
             s,
             "- Authors (degree-of-authorship): {}",
-            f.owners.join(", ")
+            md(&f.owners.join(", "))
         );
     }
     if let Some(o) = owners.and_then(|o| o.owners(path)) {
-        let _ = writeln!(s, "- CODEOWNERS: {}", o.join(" "));
+        let _ = writeln!(s, "- CODEOWNERS: {}", md(&o.join(" ")));
     }
     s
 }
@@ -395,9 +395,17 @@ pub fn forgotten(
 /// Files changed in the work tree relative to `base` (default HEAD), plus untracked.
 pub fn changed_files(root: &Path, base: &str) -> Result<Vec<String>> {
     let mut files: Vec<String> = Vec::new();
+    // Work-tree comparison: filter drivers from the repo's config are neutralised.
     let out = git::run({
-        let mut c = git::git(root);
-        c.args(["diff", "--name-only", "-z", "--no-relative", base]);
+        let mut c = git::git_worktree(root);
+        c.args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-relative",
+            "--no-ext-diff",
+            base,
+        ]);
         c
     })
     .context("git diff failed")?;
@@ -439,7 +447,13 @@ pub fn hook_response(
     let v: serde_json::Value = serde_json::from_str(stdin).ok()?;
     let event = v.get("hook_event_name")?.as_str()?.to_string();
     let file = v.get("tool_input")?.get("file_path")?.as_str()?;
+    // The root is canonical; make the file canonical too (symlinked project paths). A
+    // file that does not exist yet (Write) is resolved through its parent directory.
     let abs = PathBuf::from(file);
+    let abs = std::fs::canonicalize(&abs).ok().or_else(|| {
+        let parent = std::fs::canonicalize(abs.parent()?).ok()?;
+        Some(parent.join(abs.file_name()?))
+    })?;
     let rel = abs
         .strip_prefix(root)
         .ok()?
@@ -534,9 +548,19 @@ mod tests {
     #[test]
     fn hook_protocol() {
         let idx = idx();
-        let root = Path::new("/repo");
-        let input = r#"{"hook_event_name":"PostToolUse","tool_name":"Edit","tool_input":{"file_path":"/repo/src/a.rs"}}"#;
-        let out = hook_response(&idx, None, root, input).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        let event = |file: &str| {
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "tool_input": { "file_path": root.join(file).to_string_lossy() }
+            })
+            .to_string()
+        };
+        let out = hook_response(&idx, None, &root, &event("src/a.rs")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
         assert!(
@@ -545,9 +569,8 @@ mod tests {
                 .unwrap()
                 .contains("src/b.rs")
         );
-        let quiet =
-            r#"{"hook_event_name":"PostToolUse","tool_input":{"file_path":"/repo/src/b.rs"}}"#;
-        assert!(hook_response(&idx, None, root, quiet).is_none());
+        // A file with nothing notable (and one not yet written) yields no output.
+        assert!(hook_response(&idx, None, &root, &event("src/b.rs")).is_none());
     }
 
     #[test]

@@ -226,3 +226,7 @@ footer .wrap { padding-block: 0 28px; display: flex; flex-wrap: wrap; gap: 6px 1
 @media (prefers-reduced-motion: no-preference) {
   .finding, .panel { transition: border-color 0.15s; }
 }
+
+details.more { border: 1px dashed var(--line); border-radius: var(--r); padding: 8px 12px; }
+details.more > summary { cursor: pointer; font-size: 13px; color: var(--fg-2); overflow-wrap: anywhere; }
+details.more[open] > summary { margin-bottom: 4px; }

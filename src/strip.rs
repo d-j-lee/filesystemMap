@@ -100,6 +100,18 @@ pub fn strip(src: &[u8], syn: &Syntax) -> (Vec<u8>, LineStats) {
         let is_ws = b == b' ' || b == b'\t' || b == b'\r';
         match state {
             State::Normal => {
+                // JS regex literal (`/\/*$/` must not open a comment): `/` not followed by
+                // `/` or `*`, where an operand may start.
+                if syn.strings == Strings::Js
+                    && b == b'/'
+                    && !matches!(src.get(i + 1), Some(b'/' | b'*'))
+                    && regex_may_start(src, line_start, i)
+                    && let Some(end) = regex_literal_end(src, i)
+                {
+                    line_has_code = true;
+                    i = end;
+                    continue;
+                }
                 // Block comment start (checked before line comments: Lua `--[[` vs `--`).
                 if let Some((open, _)) = block
                     && src[i..].starts_with(open.as_bytes())
@@ -317,6 +329,73 @@ fn line_comment_ok(src: &[u8], i: usize, line_start: usize, tok: &str) -> bool {
     true
 }
 
+/// Can a regex literal start at `i`? Yes after an operator or opening punctuation, at the
+/// start of a line, or after a keyword that takes an expression; no after an operand
+/// (identifier, number, `)`, `]`), where `/` is division.
+fn regex_may_start(src: &[u8], line_start: usize, i: usize) -> bool {
+    let mut j = i;
+    while j > line_start && matches!(src[j - 1], b' ' | b'\t') {
+        j -= 1;
+    }
+    if j == line_start {
+        return true;
+    }
+    let prev = src[j - 1];
+    if b"(,=:[!&|?{};+-*%<>~^".contains(&prev) {
+        return true;
+    }
+    if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$' {
+        let mut k = j;
+        while k > line_start
+            && (src[k - 1].is_ascii_alphanumeric() || src[k - 1] == b'_' || src[k - 1] == b'$')
+        {
+            k -= 1;
+        }
+        return matches!(
+            &src[k..j],
+            b"return"
+                | b"typeof"
+                | b"case"
+                | b"do"
+                | b"else"
+                | b"in"
+                | b"of"
+                | b"new"
+                | b"delete"
+                | b"void"
+                | b"throw"
+                | b"yield"
+                | b"await"
+        );
+    }
+    false
+}
+
+/// End (exclusive) of a regex literal starting at `i`, including flags; `None` if it does
+/// not close on this line (then it was not a regex).
+fn regex_literal_end(src: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    let mut class = false;
+    while j < src.len() {
+        match src[j] {
+            b'\n' => return None,
+            b'\\' => j += 1,
+            b'[' => class = true,
+            b']' => class = false,
+            b'/' if !class => {
+                j += 1;
+                while j < src.len() && src[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                return Some(j);
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
 fn prev_is_ident(src: &[u8], i: usize) -> bool {
     i > 0 && (src[i - 1].is_ascii_alphanumeric() || src[i - 1] == b'_')
 }
@@ -426,6 +505,16 @@ mod tests {
         assert!(out.contains("`http://x/${a}`"));
         assert!(out.contains("'http://y'"));
         assert!(!out.contains("// c"));
+    }
+
+    #[test]
+    fn js_regex_literals_are_not_comments() {
+        let src = "const t = s.replace(/\\/*$/, '');\nconst b = require('./b.js');\nconst half = x / 2; // c\nreturn /[/*]/.test(y);\n";
+        let (out, s) = run("u.js", src);
+        assert!(out.contains("require('./b.js')"), "{out}");
+        assert!(!out.contains("// c"));
+        assert_eq!(s.code, 4);
+        assert_eq!(s.comments, 0);
     }
 
     #[test]

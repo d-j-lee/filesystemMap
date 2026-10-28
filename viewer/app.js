@@ -326,24 +326,39 @@ renderers.overview = (root) => {
   let active = new Set(sevs);
   const list = h('div', { class: 'findings' });
   const chips = h('div', { class: 'filters' });
+  const card = (f) => {
+    const code = f.command ? h('code', { text: f.command }) : null;
+    const target = f.nodes.find((nd) => nd !== 0);
+    return h('article', { class: 'finding', 'data-sev': f.severity },
+      h('div', { class: 'head' },
+        h('span', { class: 'sev', 'data-sev': f.severity, text: f.severity }),
+        h('span', { class: 'title', text: f.title }),
+        f.new ? h('span', { class: 'tag', text: 'new' }) : null),
+      h('div', { class: 'detail', text: f.detail }),
+      h('div', { class: 'action', text: f.action }),
+      h('div', { class: 'row' },
+        code ? h('div', { class: 'cmd' }, code, copyButton(f.command, code)) : null,
+        target !== undefined ? h('button', { class: 'linkish', type: 'button', text: 'Show on map', onclick: () => goToNode(target) }) : null,
+        h('span', { class: 'rule', text: f.id })));
+  };
   const draw = () => {
     list.replaceChildren();
     const shown = findings.filter((f) => active.has(f.severity));
     if (!shown.length) list.append(h('div', { class: 'empty', text: findings.length ? 'No findings at the selected severities.' : 'No findings. Nothing here needs attention.' }));
+    // Group by severity + rule, keeping first-appearance order; show two, fold the rest.
+    const groups = [];
     for (const f of shown) {
-      const code = f.command ? h('code', { text: f.command }) : null;
-      const target = f.nodes.find((nd) => nd !== 0);
-      list.append(h('article', { class: 'finding', 'data-sev': f.severity },
-        h('div', { class: 'head' },
-          h('span', { class: 'sev', 'data-sev': f.severity, text: f.severity }),
-          h('span', { class: 'title', text: f.title }),
-          f.new ? h('span', { class: 'tag', text: 'new' }) : null),
-        h('div', { class: 'detail', text: f.detail }),
-        h('div', { class: 'action', text: f.action }),
-        h('div', { class: 'row' },
-          code ? h('div', { class: 'cmd' }, code, copyButton(f.command, code)) : null,
-          target !== undefined ? h('button', { class: 'linkish', type: 'button', text: 'Show on map', onclick: () => goToNode(target) }) : null,
-          h('span', { class: 'rule', text: f.id }))));
+      const g = groups.find((x) => x.sev === f.severity && x.rule === f.rule);
+      if (g) g.items.push(f); else groups.push({ sev: f.severity, rule: f.rule, items: [f] });
+    }
+    for (const g of groups) {
+      g.items.slice(0, 2).forEach((f) => list.append(card(f)));
+      if (g.items.length > 2) {
+        const rest = g.items.slice(2);
+        list.append(h('details', { class: 'more' },
+          h('summary', null, `${rest.length} more ${g.rule} finding${rest.length === 1 ? '' : 's'}: `, h('span', { class: 'muted', text: rest.map((f) => f.title.replace(/^[^:]+:\s*/, '')).slice(0, 4).join(' · ') + (rest.length > 4 ? ' …' : '') })),
+          h('div', { class: 'findings', style: { marginTop: '10px' } }, rest.map(card))));
+      }
     }
   };
   for (const sv of sevs) {

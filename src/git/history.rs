@@ -276,11 +276,52 @@ struct RepoLog {
 
 fn collect(repo: &Repo, opts: &Options) -> Result<RepoLog> {
     let top = &repo.toplevel;
+    let since = match &opts.window {
+        Window::All => None,
+        Window::Since(d) => Some(d.clone()),
+        Window::Relative(secs) => {
+            let mut last = git(top);
+            last.args(["log", "-1", "--no-show-signature", "--format=%ct"]);
+            String::from_utf8_lossy(&run(last)?)
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .map(|newest| newest - secs)
+                // A window reaching before 1970 means "everything".
+                .filter(|&start| start > 0)
+                .map(crate::util::date)
+        }
+    };
+    // Inexact rename detection compares blob contents; in a partial clone those blobs are
+    // not local (and lazy fetching is disabled), so only exact renames are detected there.
+    let renames = if repo.partial { "-M100%" } else { "-M" };
+    let mut log = log_command(top, opts, since.as_deref(), renames);
+    let out = match run(log) {
+        Ok(out) => out,
+        Err(_) if !repo.partial => {
+            log = log_command(top, opts, since.as_deref(), "-M100%");
+            run(log)?
+        }
+        Err(e) => return Err(e),
+    };
+    // No pathspec even when the scan root is a subdirectory: a file moved into it from
+    // elsewhere must keep its earlier history, and the large-commit rule must see whole
+    // commits. Paths outside the scan are dropped when joined onto the tree.
+    let commits = parse_log(&out);
+    collect_rest(repo, commits)
+}
+
+fn log_command(
+    top: &std::path::Path,
+    opts: &Options,
+    since: Option<&str>,
+    renames: &str,
+) -> std::process::Command {
     let mut c = git(top);
     c.args([
         "log",
         "--no-merges",
-        "-M",
+        renames,
         "--raw",
         "-z",
         "--no-abbrev",
@@ -292,29 +333,14 @@ fn collect(repo: &Repo, opts: &Options) -> Result<RepoLog> {
         "--format=%x1e%H%x1f%ct%x1f%aN%x1f%aE",
     ]);
     c.arg(format!("--max-count={}", opts.max_commits));
-    let since = match &opts.window {
-        Window::All => None,
-        Window::Since(d) => Some(d.clone()),
-        Window::Relative(secs) => {
-            let mut last = git(top);
-            last.args(["log", "-1", "--no-show-signature", "--format=%ct"]);
-            if let Some(prefix) = &repo.prefix {
-                last.arg("--").arg(prefix);
-            }
-            String::from_utf8_lossy(&run(last)?)
-                .trim()
-                .parse::<i64>()
-                .ok()
-                .map(|newest| crate::util::date(newest - secs))
-        }
-    };
     if let Some(since) = since {
         c.arg(format!("--since={since}"));
     }
-    if let Some(prefix) = &repo.prefix {
-        c.arg("--").arg(prefix);
-    }
-    let commits = parse_log(&run(c)?);
+    c
+}
+
+fn collect_rest(repo: &Repo, commits: Vec<Commit>) -> Result<RepoLog> {
+    let top = &repo.toplevel;
 
     let read_hashes = |path: std::path::PathBuf| -> HashSet<String> {
         std::fs::read_to_string(path)
@@ -430,17 +456,16 @@ fn process(
         v
     };
 
-    let mut alias: HashMap<String, String> = HashMap::new();
-    let mut tombs = 0u64;
-    let resolve = |alias: &HashMap<String, String>, p: &str| -> String {
-        let mut cur = p;
-        for _ in 0..64 {
-            match alias.get(cur) {
-                Some(next) => cur = next,
-                None => break,
-            }
+    // Path (as of some older commit) → identity of the file it denotes today: `Some(path
+    // at HEAD)`, or `None` when the file at that path no longer exists. Values are stored
+    // fully resolved, so a lookup never chains — tombstoning a path cannot cut off a file
+    // that was merely renamed *through* it.
+    let mut alias: HashMap<String, Option<String>> = HashMap::new();
+    let resolve = |alias: &HashMap<String, Option<String>>, p: &str| -> Option<String> {
+        match alias.get(p) {
+            Some(ident) => ident.clone(),
+            None => Some(p.to_string()),
         }
-        cur.to_string()
     };
 
     let mut acc: HashMap<NodeId, Acc> = HashMap::new();
@@ -483,32 +508,40 @@ fn process(
         for ch in &commit.changes {
             match ch {
                 Change::Modify(p) => {
-                    let cur = resolve(&alias, p);
-                    if let Some(id) = node_of(&cur, tree) {
+                    if let Some(id) = resolve(&alias, p).and_then(|cur| node_of(&cur, tree)) {
                         touched.push((id, false));
                     }
                 }
                 Change::Add(p) | Change::Copy { to: p } => {
-                    let cur = resolve(&alias, p);
-                    if let Some(id) = node_of(&cur, tree) {
+                    if let Some(id) = resolve(&alias, p).and_then(|cur| node_of(&cur, tree)) {
                         touched.push((id, true));
                     }
                     // Anything older at this path is a different file.
-                    tombs += 1;
-                    alias.insert(p.clone(), format!("\0dead{tombs}"));
+                    alias.insert(p.clone(), None);
                 }
                 Change::Delete(_) | Change::Rename { .. } => {}
             }
         }
-        // Phase 2: renames — the old path's older history belongs to the current file.
-        for ch in &commit.changes {
-            if let Change::Rename { from, to } = ch {
-                let cur = resolve(&alias, to);
-                if let Some(id) = node_of(&cur, tree) {
-                    touched.push((id, false));
-                }
-                alias.insert(from.clone(), cur);
+        // Phase 2: renames. The old path's older history belongs to the current file, and
+        // anything older at the *destination* path was a different file. Resolve every
+        // rename against the same alias state first, so renames within one commit
+        // (a→b, b→c) don't see each other.
+        let renames: Vec<(&String, &String, Option<String>)> = commit
+            .changes
+            .iter()
+            .filter_map(|ch| match ch {
+                Change::Rename { from, to } => Some((from, to, resolve(&alias, to))),
+                _ => None,
+            })
+            .collect();
+        for (_, to, cur) in &renames {
+            if let Some(id) = cur.as_deref().and_then(|c| node_of(c, tree)) {
+                touched.push((id, false));
             }
+            alias.insert((*to).clone(), None);
+        }
+        for (from, _, cur) in renames {
+            alias.insert(from.clone(), cur);
         }
         touched.sort_unstable();
         touched.dedup_by(|later, kept| {
