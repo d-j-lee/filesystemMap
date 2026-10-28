@@ -4,6 +4,7 @@
 //! The hooks are guardrails against an agent's shortcuts, not a security boundary: the
 //! agent can edit what the hooks read. CI, running the same gate, is the gate of record.
 
+pub mod hooks;
 pub mod integrity;
 pub mod proc;
 pub mod state;

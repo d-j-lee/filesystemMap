@@ -17,7 +17,7 @@ use globset::{Glob, GlobSetBuilder};
 use fsmap::analysis::{self, Analysis, AuthorMode, Progress};
 use fsmap::brief::{self, CodeOwners, Index};
 use fsmap::git::history::Window;
-use fsmap::harness::verify;
+use fsmap::harness::{hooks, verify};
 use fsmap::insights::{self, Finding, Severity};
 use fsmap::report::{context, html, sarif, terminal};
 use fsmap::snapshot::{Parts, PruneInfo, Snapshot};
@@ -139,6 +139,12 @@ enum Cmd {
         #[arg(long, default_value_t = 1800)]
         timeout: u64,
     },
+    /// Claude Code hooks for the agent harness: reads the hook event JSON on stdin and
+    /// prints the hook's JSON answer (`stats` summarises past outcomes instead).
+    Hook {
+        #[arg(value_enum)]
+        event: HookArg,
+    },
     /// Suggested read-deny rules so AI agents skip bulky, low-value paths.
     AgentIgnore {
         #[arg(default_value = ".")]
@@ -148,6 +154,16 @@ enum Cmd {
         #[command(flatten)]
         a: AnalyzeArgs,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HookArg {
+    SessionStart,
+    PostEdit,
+    Stop,
+    Prompt,
+    PreBash,
+    Stats,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -488,6 +504,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Diff { old, new, top } => {
             let text = fsmap::diff::render(&old.to_string_lossy(), &new.to_string_lossy(), top)?;
             write_out(None, text.as_bytes())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Hook { event } => {
+            let event = match event {
+                HookArg::SessionStart => hooks::Event::SessionStart,
+                HookArg::PostEdit => hooks::Event::PostEdit,
+                HookArg::Stop => hooks::Event::Stop,
+                HookArg::Prompt => hooks::Event::Prompt,
+                HookArg::PreBash => hooks::Event::PreBash,
+                HookArg::Stats => {
+                    let dir = std::env::var_os("CLAUDE_PROJECT_DIR")
+                        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                    write_out(None, hooks::stats(&dir)?.as_bytes())?;
+                    return Ok(ExitCode::SUCCESS);
+                }
+            };
+            let mut input = String::new();
+            let _ = std::io::stdin().read_to_string(&mut input);
+            if let Some(json) = hooks::run(event, &input) {
+                println!("{json}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Verify {

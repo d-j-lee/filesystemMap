@@ -235,22 +235,14 @@ pub fn run(
     mut progress: impl FnMut(&StepResult),
 ) -> Report {
     let started = Instant::now();
-    let removed_env = integrity::weakening_env(
-        std::env::vars_os()
-            .filter_map(|(k, _)| k.into_string().ok())
-            .collect::<Vec<_>>()
-            .iter()
-            .map(String::as_str),
-        &cfg.trust,
-    );
-    let target_dir = target_dir(root, &cfg.trust);
+    let removed_env = removed_env(&cfg.trust);
     let mut results = Vec::with_capacity(steps.len() + 1);
     let integrity = integrity_step(root, &cfg.trust);
     progress(&integrity);
     results.push(integrity);
     for step in steps {
         let left = budget.saturating_sub(started.elapsed());
-        let r = run_step(root, step, &removed_env, target_dir.as_deref(), left);
+        let r = run_step(root, step, cfg, left);
         progress(&r);
         results.push(r);
     }
@@ -263,6 +255,28 @@ pub fn run(
         steps: results,
         removed_env,
     }
+}
+
+/// Weakening environment variables set right now, minus trusted ones.
+fn removed_env(trust: &[String]) -> Vec<String> {
+    let names: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .collect();
+    integrity::weakening_env(names.iter().map(String::as_str), trust)
+}
+
+/// A command that runs like a gate step: in `root`, without the weakening environment
+/// variables, with the build directory inside the repository.
+pub fn step_command(root: &Path, program: &str, cfg: &Config) -> Command {
+    let mut c = Command::new(program);
+    c.current_dir(root).env("CARGO_TERM_COLOR", "never");
+    for k in removed_env(&cfg.trust) {
+        c.env_remove(k);
+    }
+    if let Some(t) = target_dir(root, &cfg.trust) {
+        c.env("CARGO_TARGET_DIR", t);
+    }
+    c
 }
 
 /// The build directory the steps use: inside the repository, unless the repository trusts
@@ -309,13 +323,7 @@ fn integrity_step(root: &Path, trust: &[String]) -> StepResult {
     }
 }
 
-fn run_step(
-    root: &Path,
-    step: &Step,
-    removed_env: &[String],
-    target_dir: Option<&Path>,
-    left: Duration,
-) -> StepResult {
+fn run_step(root: &Path, step: &Step, cfg: &Config, left: Duration) -> StepResult {
     let cmd = step.argv.join(" ");
     let result = |status, ms, tail: String, files| StepResult {
         name: step.name.clone(),
@@ -344,16 +352,8 @@ fn run_step(
     let Some((program, args)) = step.argv.split_first() else {
         return result(Status::Fail, 0, "empty command".into(), Vec::new());
     };
-    let mut c = Command::new(program);
-    c.args(args)
-        .current_dir(root)
-        .env("CARGO_TERM_COLOR", "never");
-    for k in removed_env {
-        c.env_remove(k);
-    }
-    if let Some(t) = target_dir {
-        c.env("CARGO_TARGET_DIR", t);
-    }
+    let mut c = step_command(root, program, cfg);
+    c.args(args);
     let o = proc::run(c, left);
     if let Some(e) = &o.start_error {
         return result(
