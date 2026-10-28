@@ -162,11 +162,11 @@ pub fn locate(dir: &Path) -> Option<(PathBuf, String)> {
         c
     })
     .ok()?;
+    // HEAD is the last line; the top-level path before it may itself contain newlines.
     let text = String::from_utf8_lossy(&out);
-    let mut lines = text.lines();
-    let top = std::fs::canonicalize(lines.next()?).ok()?;
-    let head = lines.next()?.trim().to_string();
-    Some((top, head))
+    let (top, head) = text.trim_end().rsplit_once('\n')?;
+    let top = std::fs::canonicalize(top.trim_end_matches('\r')).ok()?;
+    Some((top, head.trim().to_string()))
 }
 
 /// Load the cached index for `root` if it matches `head` and this fsmap version.

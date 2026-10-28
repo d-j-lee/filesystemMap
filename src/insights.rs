@@ -283,7 +283,9 @@ fn artifacts(c: &mut Ctx<'_>) {
             .filter(|&s| t.get(s).is_file() && t.get(s).git == Some(GitState::Tracked))
             .collect();
         let tracked_bytes: u64 = tracked.iter().map(|&s| t.get(s).bytes).sum();
-        if !tracked.is_empty() && (tracked.len() >= 5 || tracked_bytes >= 100 * 1024) {
+        let on_purpose = reason == crate::classify::ACTION_BUNDLE;
+        if !on_purpose && !tracked.is_empty() && (tracked.len() >= 5 || tracked_bytes >= 100 * 1024)
+        {
             let (_, rel) = c.repo_rel(id);
             let sev = if tracked.len() >= 50 || tracked_bytes >= 10 << 20 {
                 Severity::High

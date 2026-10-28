@@ -498,6 +498,10 @@ pub const AMBIGUOUS_OUTPUT: &str = "build directory next to its manifest";
 /// `out/`, .NET `bin/`/`obj/`): a committed one is reported as a committed artifact.
 const BUILD_OUTPUT: &str = "build output next to its manifest";
 
+/// A JavaScript GitHub Action's `dist/`: generated, but committed on purpose because the
+/// runner executes it from the repository. Not reported as a committed artifact.
+pub const ACTION_BUNDLE: &str = "GitHub Action bundle, committed on purpose";
+
 /// Origin implied by a directory's name, given its siblings, with a human-readable reason.
 /// Ambiguous names (`target`, `build`, `dist`, …) need a matching manifest next to them.
 fn zone_for_dir(name: &str, sibling_names: &[&str]) -> Option<(Zone, &'static str)> {
@@ -529,6 +533,7 @@ fn zone_for_dir(name: &str, sibling_names: &[&str]) -> Option<(Zone, &'static st
         {
             (Zone::Artifact, AMBIGUOUS_OUTPUT)
         }
+        "dist" if has("action.yml") || has("action.yaml") => (Zone::Artifact, ACTION_BUNDLE),
         "dist" if has("package.json") || has("setup.py") || has("pyproject.toml") => {
             (Zone::Artifact, BUILD_OUTPUT)
         }
@@ -536,24 +541,31 @@ fn zone_for_dir(name: &str, sibling_names: &[&str]) -> Option<(Zone, &'static st
         "bin" | "obj" if sibling_names.iter().any(|n| n.ends_with(".csproj")) => {
             (Zone::Artifact, BUILD_OUTPUT)
         }
-        // `deps` is also a common module name (`src/deps/`): only next to a build file.
         "deps" if has("mix.exs") || has("rebar.config") => {
             (Zone::Dependency, "package-manager directory")
         }
-        "deps"
-            if has("Makefile")
-                || has("CMakeLists.txt")
-                || has("configure")
-                || has("meson.build") =>
-        {
-            (Zone::Vendored, "third-party directory name")
-        }
+        // `deps/` usually holds vendored C (redis, gevent, better-sqlite3), but it is also a
+        // module name: next to a module root (`src/deps/` beside `lib.rs`) it is source.
+        "deps" if is_module_dir(sibling_names) => return None,
         "third_party" | "third-party" | "thirdparty" | "3rdparty" | "vendor" | "vendors"
-        | "external" | "extern" => (Zone::Vendored, "third-party directory name"),
+        | "external" | "extern" | "deps" => (Zone::Vendored, "third-party directory name"),
         n if n.starts_with("cmake-build-") || n.starts_with("bazel-") => {
             (Zone::Artifact, "build output directory name")
         }
         _ => return None,
+    })
+}
+
+/// Siblings that make a directory a code module of its parent rather than a bundle of
+/// third-party code: a crate/module root, a Python package, a JS package entry point.
+fn is_module_dir(sibling_names: &[&str]) -> bool {
+    sibling_names.iter().any(|n| {
+        matches!(
+            *n,
+            "lib.rs" | "main.rs" | "mod.rs" | "deps.rs" | "__init__.py" | "deps.py"
+        ) || n
+            .strip_prefix("index.")
+            .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs" | "ts" | "jsx" | "tsx"))
     })
 }
 
@@ -764,11 +776,29 @@ mod tests {
             Some(Zone::Artifact)
         );
         assert_eq!(zone_from_markers(".cargo", &["config.toml"]), None);
-        // `src/deps/` is a module; `deps/` beside a Makefile is vendored (redis).
+        // `src/deps/` is a module; `deps/` at a project root is vendored C, whatever the
+        // build system (redis: Makefile, gevent: setup.py, better-sqlite3: binding.gyp).
         assert_eq!(z("deps", &["deps", "lib.rs", "mod.rs"]), None);
+        assert_eq!(z("deps", &["deps", "__init__.py"]), None);
+        for build in [
+            "Makefile",
+            "setup.py",
+            "binding.gyp",
+            "configure.ac",
+            "build.zig",
+        ] {
+            assert_eq!(
+                z("deps", &[build, "deps", "src"]),
+                Some(Zone::Vendored),
+                "{build}"
+            );
+        }
+        assert_eq!(z("deps", &["mix.exs", "deps"]), Some(Zone::Dependency));
+        // A JavaScript GitHub Action commits its bundle on purpose.
+        assert_eq!(z("dist", &["package.json", "dist"]), Some(Zone::Artifact));
         assert_eq!(
-            z("deps", &["Makefile", "deps", "src"]),
-            Some(Zone::Vendored)
+            zone_for_dir("dist", &["action.yml", "package.json", "dist"]),
+            Some((Zone::Artifact, ACTION_BUNDLE))
         );
     }
 

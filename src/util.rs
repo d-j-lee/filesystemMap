@@ -36,6 +36,8 @@ pub fn duration(secs: i64) -> String {
     let d = secs.max(0) / 86_400;
     if d < 1 {
         "today".into()
+    } else if d == 1 {
+        "1 day".into()
     } else if d < 60 {
         format!("{d} days")
     } else if d < 730 {
@@ -110,5 +112,7 @@ mod tests {
         assert_eq!(md("x`\n## y"), "x'?## y");
         assert_eq!(shell_quote("src/a.rs"), "src/a.rs");
         assert_eq!(shell_quote("it's here"), "'it'\\''s here'");
+        assert_eq!(duration(86_400), "1 day");
+        assert_eq!(duration(40 * 86_400), "40 days");
     }
 }

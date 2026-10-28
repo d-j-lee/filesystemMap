@@ -198,28 +198,8 @@ fn brief_diff_reports_forgotten_partner() {
     assert!(text.contains("proto/schema.txt"), "{text}");
 
     // Hook mode: JSON for Claude Code, silent for unremarkable files.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_fsmap"))
-        .args(["brief", "--hook"])
-        .current_dir(d)
-        .env("XDG_CACHE_HOME", d.join(".cache-test"))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
     let abs = std::fs::canonicalize(d.join("client/api.py")).unwrap();
-    let event = serde_json::json!({
-        "hook_event_name": "PostToolUse",
-        "tool_name": "Edit",
-        "tool_input": { "file_path": abs.to_string_lossy() }
-    });
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(event.to_string().as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
+    let out = hook(d, &abs, &[]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("hook JSON");
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
     assert!(
@@ -228,6 +208,40 @@ fn brief_diff_reports_forgotten_partner() {
             .unwrap()
             .contains("schema.txt")
     );
+
+    // The index is cached per HEAD. Delete the partner from the work tree (HEAD unchanged):
+    // the cached index still names it, a re-analysis no longer does.
+    std::fs::remove_file(d.join("proto/schema.txt")).unwrap();
+    let cached = String::from_utf8_lossy(&hook(d, &abs, &[]).stdout).to_string();
+    assert!(cached.contains("schema.txt"), "cache miss: {cached}");
+    let fresh = String::from_utf8_lossy(&hook(d, &abs, &["--refresh"]).stdout).to_string();
+    assert!(!fresh.contains("schema.txt"), "{fresh}");
+}
+
+/// Run `brief --hook` for a PostToolUse event on `file`.
+fn hook(d: &std::path::Path, file: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fsmap"))
+        .args(["brief", "--hook"])
+        .args(extra)
+        .current_dir(d)
+        .env("XDG_CACHE_HOME", d.join(".cache-test"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let event = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Edit",
+        "tool_input": { "file_path": file.to_string_lossy() }
+    });
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(event.to_string().as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 #[test]
@@ -286,6 +300,38 @@ fn snapshot_diff_and_agent_ignore() {
     assert!(
         text.starts_with("fsmap diff · 2") && text.contains("under a day apart"),
         "{text}"
+    );
+    // Arguments swapped across a real gap: the span is still positive, and says so.
+    let mut older: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(d.join("old.json")).unwrap()).unwrap();
+    older["generatedAt"] = (older["generatedAt"].as_i64().unwrap() - 40 * 86_400).into();
+    std::fs::write(d.join("older.json"), older.to_string()).unwrap();
+    let out = fsmap(&["diff", "new.json", "older.json"], d);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("(40 days apart; NEW is older than OLD)"),
+        "{text}"
+    );
+
+    // gitignore format: every rule must actually match (no trailing comments).
+    let ign = fsmap(&["agent-ignore", ".", "-q", "--format", "gitignore"], d);
+    std::fs::write(d.join("ignore-test.txt"), &ign.stdout).unwrap();
+    let matched = Command::new("git")
+        .args([
+            "-c",
+            "core.excludesFile=ignore-test.txt",
+            "check-ignore",
+            "--no-index",
+            "-q",
+            "pkg/__pycache__/m0.cpython-312.pyc",
+        ])
+        .current_dir(d)
+        .status()
+        .unwrap();
+    assert!(
+        matched.success(),
+        "{}",
+        String::from_utf8_lossy(&ign.stdout)
     );
 
     let ign = fsmap(&["agent-ignore", ".", "-q"], d);

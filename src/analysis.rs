@@ -140,7 +140,12 @@ pub fn run(path: &Path, opts: &Options, progress: &Progress) -> Result<Analysis>
     let index = PathIndex::new(&tree);
     tick("classify", &mut timings);
 
-    let git_available = opts.git && git::available(&root);
+    let git_dir = if root.is_dir() {
+        root.as_path()
+    } else {
+        root.parent().unwrap_or(&root)
+    };
+    let git_available = opts.git && git::available(git_dir);
     let (mut repos, repos_total) = if git_available {
         progress.start("git status", 0);
         let (mut repos, total) = git::discover(&tree, &root, opts.max_repos);

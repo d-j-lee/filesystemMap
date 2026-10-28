@@ -256,9 +256,12 @@ fn committed_output_dirs_are_reported() {
     write(d, "web/package.json", "{}\n");
     write(d, "web/build/release.js", "console.log(1);\n");
     write(d, "rs/Cargo.toml", "[package]\nname = \"x\"\n");
+    write(d, "action/action.yml", "runs:\n  main: dist/index.js\n");
+    write(d, "action/package.json", "{}\n");
     for i in 0..5 {
         write(d, &format!("web/dist/chunk{i}.js"), "var a=1;\n");
         write(d, &format!("rs/target/debug/f{i}.d"), "x\n");
+        write(d, &format!("action/dist/part{i}.js"), "var b=1;\n");
     }
     commit(d, "A", "init", T0);
     let v = snapshot(&fsmap(&["scan", ".", "-q"], d));
@@ -279,20 +282,33 @@ fn committed_output_dirs_are_reported() {
         "{flagged:?}"
     );
     assert!(node_by_path(&v, "web/build/release.js")["zone"].is_null());
+    // A JavaScript GitHub Action commits its bundle on purpose (actions/checkout).
+    assert!(!flagged.iter().any(|p| p.contains("action")), "{flagged:?}");
 }
 
-/// `src/deps/` is a module, not vendored code.
+/// `src/deps/` is a module, not vendored code; `deps/` at a project root is vendored C
+/// whatever the build system (shapes of redis, gevent and better-sqlite3).
 #[test]
 fn deps_module_is_source() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     write(d, "Cargo.toml", "[package]\nname = \"x\"\n");
+    write(d, "src/lib.rs", "mod deps;\n");
     write(d, "src/deps/mod.rs", "pub fn f() {}\n");
-    write(d, "c/Makefile", "all:\n");
-    write(d, "c/deps/lib/x.c", "int x;\n");
+    for (project, build) in [
+        ("redis", "Makefile"),
+        ("gevent", "setup.py"),
+        ("sqlite", "binding.gyp"),
+    ] {
+        write(d, &format!("{project}/{build}"), "\n");
+        write(d, &format!("{project}/deps/lib/x.c"), "int x;\n");
+    }
     let v = snapshot(&fsmap(&["scan", ".", "-q", "--no-git"], d));
     assert!(node_by_path(&v, "src/deps/mod.rs")["zone"].is_null());
-    assert_eq!(node_by_path(&v, "c/deps/lib/x.c")["zone"], "vendored");
+    for project in ["redis", "gevent", "sqlite"] {
+        let x = node_by_path(&v, &format!("{project}/deps/lib/x.c"));
+        assert_eq!(x["zone"], "vendored", "{project}");
+    }
 }
 
 /// `--authors none` leaves no way back to a person, truck-factor lists included.

@@ -181,17 +181,22 @@ repositories. Every item below has a regression test in `tests/review_regression
 An independent agent compared every claim in the current-state docs with the code and the
 binary (CLI help, real `scan` output on ripgrep/flask/hono/redis, crafted fixtures). It
 reported 26 mismatches between docs and behaviour and 4 code defects. Docs were corrected in
-place; each code defect has a regression test in `tests/review_regressions.rs` that fails on
-the previous code.
+place. A second independent agent then reviewed the fix commit itself and found two more
+problems, one of them a regression the first fix introduced (the `deps/` row). Each code
+defect has a test in `tests/review_regressions.rs` or `tests/cli.rs` that fails on the
+previous code; the hook's git-call count was checked with `strace`, not a test.
 
 | Finding | Fix | Alternative and why not |
 |---|---|---|
-| A tracked `dist/` (next to `package.json`) or `target/` was returned to source, so committing build output raised no finding. `target`'s reason string was identical to the "ambiguous" one by accident. | Only `build/` is settled by git tracking (hono keeps build scripts there). `target/`, `dist/`, `out/` and .NET `bin/`/`obj/` stay artifacts and are reported when committed. The two reasons are distinct constants with a unit test. | Keep all five ambiguous and fix the docs: rejected, the evidence (hono) only covers `build/`, and a committed `dist/` is the case the ratchet exists for. Repos that commit `dist/` on purpose (GitHub Actions) baseline it. |
-| `deps` was vendored at any depth, so fsmap's own `src/deps/` counted as third-party and its cycles would have been downgraded. | `deps` is vendored only beside a C/C++ build file (`Makefile`, `CMakeLists.txt`, `configure`, `meson.build`) and is a dependency directory beside `mix.exs`/`rebar.config`. redis's `deps/` is unchanged. | Drop `deps` entirely: rejected, redis's `deps/` (1.9M tokens of vendored code) would become "source". |
+| A tracked `dist/` (next to `package.json`) or `target/` was returned to source, so committing build output raised no finding. `target`'s reason string was identical to the "ambiguous" one by accident. | Only `build/` is settled by git tracking (hono keeps build scripts there). `target/`, `dist/`, `out/` and .NET `bin/`/`obj/` stay artifacts and are reported when committed. The two reasons are distinct constants with a unit test. | Keep all five ambiguous and fix the docs: rejected, the evidence (hono) only covers `build/`, and a committed `dist/` is the case the ratchet exists for. |
+| (second review) A JavaScript GitHub Action commits `dist/` on purpose; actions/checkout got a medium finding advising `git rm`, which would break the action. | `dist/` beside `action.yml` stays an artifact (its bundle is not hand-written: treating it as source added 30k "code" lines to checkout) with its own reason, and is not reported as committed. | Return it to source: rejected for the line-count distortion. Ask users to baseline it: rejected, the advice itself was wrong. |
+| `deps` was vendored at any depth, so fsmap's own `src/deps/` counted as third-party and its cycles would have been downgraded. | `deps` stays vendored unless a sibling marks it as a module of its parent (`lib.rs`, `main.rs`, `mod.rs`, `deps.rs`, `__init__.py`, `index.{js,ts,…}`); beside `mix.exs`/`rebar.config` it is a dependency directory. | First fix, superseded within this PR: vendored only beside `Makefile`/`CMakeLists.txt`/`configure`/`meson.build`. The second review showed it turned the vendored C in gevent (`setup.py`), better-sqlite3 (`binding.gyp`) and autotools checkouts into "source" (gevent: source code 184k → 327k lines). It was checked on redis alone. Dropping `deps` entirely: rejected for the same reason. |
 | `--authors none` still wrote `repos[].history.truckAuthors`. | Cleared with the other author data. | — |
 | Coupling pairs serialised `"linked": null`; the schema says absent. | Omitted when unknown. Additive per the schema rule (readers treating null and absent alike are unaffected), so the schema stays `fsmap/1`. | Document `null`: rejected, absent is the convention for every other optional field. |
 | `diff` printed a raw timestamp and suggested a non-existent `scan --json`. | Dates and a readable span; the hint names `scan`. | — |
 | `brief --hook` ran git 4 times per edit (HEAD read 3×). | One `rev-parse --show-toplevel --short=12 HEAD`; warm hook on ripgrep 19.8 → 7.9 ms (median of 30). Found while re-measuring the documented 14 ms. | — |
+| (second review) `agent-ignore --format gitignore` wrote `/deps/  # reason`; gitignore has no trailing comments, so no rule matched anything. | The reason goes on its own comment line; a test runs the output through `git check-ignore`. | — |
+| (second review, minor) `diff NEW OLD` printed "under a day apart" for a 40-day gap; "1 days". | Absolute span with a note when NEW is older; singular day. | — |
 
 Doc corrections, by kind:
 
@@ -207,3 +212,8 @@ Doc corrections, by kind:
   removed.
 - **Process**: CLAUDE.md now treats doc numbers as measurements to re-run, and asks for an
   independent claim-by-claim audit before large docs changes.
+- **Lesson**: a fix to a classification heuristic is itself a heuristic change. The narrowed
+  `deps/` rule was checked on one repository and regressed on others; it took a review of
+  the fix commit to catch it. Before/after zone and finding diffs now cover eight
+  repositories (ripgrep, flask, hono, redis, gevent, better-sqlite3, actions/checkout,
+  fsmap).

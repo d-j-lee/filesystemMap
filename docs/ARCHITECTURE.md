@@ -44,14 +44,17 @@ Each stage enriches one arena (`model::Tree`). The order matters:
   - Directory roll-ups are one reverse pass.
   - The JSON is flat, with no recursion limits, and the viewer rebuilds it in one loop.
 - **Zone = origin**: `source`, `vendored`, `dependency`, `artifact`, `vcs`. It is decided by:
-  1. names, with ambiguous names (`target`, `build`, `dist`, `out`, `deps`) only next to a
-     matching manifest or build file;
+  1. names, with ambiguous names (`target`, `build`, `dist`, `out`) only next to a matching
+     manifest, and `deps` unless a sibling marks it as a module of its parent (`lib.rs`,
+     `__init__.py`, `index.ts`, …);
   2. markers (`CACHEDIR.TAG`, `pyvenv.cfg`, a Cargo home's `registry/`);
   3. `.gitattributes` `linguist-vendored` / `linguist-generated`.
 
   The directory where the zone changes keeps its reason (`zoneRoots`). A `build/` that git
   tracks returns to source (projects keep build scripts there); a tracked `target/`,
-  `dist/` or `out/` stays an artifact and is reported as committed (decision D-14).
+  `dist/` or `out/` stays an artifact and is reported as committed once it holds 5 files
+  or 100 KiB. A GitHub Action's `dist/` (beside `action.yml`) is committed on purpose and
+  is not reported (decision D-14).
 - **Git state** is separate: `tracked` / `untracked` / `ignored`, per owning work tree.
 - **Analysed** = origin `source`/`vendored` and not git-ignored and not a cloud placeholder.
   Only analysed files are read. A 2 GB `node_modules` costs one `lstat` per entry.

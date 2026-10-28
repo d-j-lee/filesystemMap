@@ -80,9 +80,10 @@ Generated files and large data files inside source directories are *not* turned 
 they sit next to hand-written files, and a directory-wide deny would hide those too.
 `fsmap context` lists them in its "Skip when reading" section instead.
 
-Paste the `claude` output into the **project's** `.claude/settings.json`: a leading `/` in a
-rule is relative to the settings file's project, so the same rule in user settings would
-point somewhere else. Review the list first. A `Read(...)` deny stops Claude's file tools
+Run it from the directory where you start Claude Code and paste the `claude` output into
+that project's `.claude/settings.json`: in project settings a leading `/` is relative to
+Claude Code's primary working directory, so rules from `fsmap agent-ignore SUBDIR` only line
+up when you start Claude Code in `SUBDIR`. Review the list first. A `Read(...)` deny stops Claude's file tools
 from reading those paths, which in practice also gets in the way of editing them
 (permissions documentation, `https://code.claude.com/docs/en/permissions`, as of 2026-10).
 

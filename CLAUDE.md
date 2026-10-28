@@ -39,7 +39,7 @@ release build to "see if it works".
 | `src/dupes.rs`, `src/util.rs` | Duplicate detection; formatting and sanitising helpers |
 | `viewer/` | Report UI, vanilla JS, no dependencies |
 | `tests/cli.rs` | End-to-end against a generated git fixture |
-| `tests/review_regressions.rs` | One test per defect found by independent reviews (D-13, D-14) |
+| `tests/review_regressions.rs` | Tests for defects found by independent reviews (D-13, D-14); a few D-14 checks extend `tests/cli.rs` |
 
 ## Rules
 
@@ -58,7 +58,9 @@ release build to "see if it works".
 - **Heuristics need evidence**: when changing a metric or rule, run it on a real repository
   (e.g. a clone of ripgrep or flask) and compare against git ground truth, not only unit tests.
   Real defects were found this way (D-10 on flask, D-14 on fsmap itself); the end-to-end
-  fixture caught another (D-09).
+  fixture caught another (D-09). For zone or rule changes, diff `zoneRoots`, findings and
+  `totals.byZone` before/after on several repositories, not one (D-14's first `deps/` fix
+  regressed because it was checked on redis alone).
 
 ## Keeping the docs alive
 

@@ -120,9 +120,14 @@ pub fn render(old_path: &str, new_path: &str, top: usize) -> Result<String> {
     let (a, b) = (index(&old), index(&new));
     let root = |m: &HashMap<String, Vals>| m.get("").copied().unwrap_or_default();
     let (ra, rb) = (root(&a), root(&b));
-    let span = match duration(new.generated_at - old.generated_at) {
+    let dt = new.generated_at - old.generated_at;
+    let span = match duration(dt.abs()) {
         d if d == "today" => "under a day apart".to_string(),
         d => format!("{d} apart"),
+    } + if dt < 0 {
+        "; NEW is older than OLD"
+    } else {
+        ""
     };
     let _ = writeln!(
         out,
