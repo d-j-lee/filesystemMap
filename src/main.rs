@@ -17,6 +17,7 @@ use globset::{Glob, GlobSetBuilder};
 use fsmap::analysis::{self, Analysis, AuthorMode, Progress};
 use fsmap::brief::{self, CodeOwners, Index};
 use fsmap::git::history::Window;
+use fsmap::harness::verify;
 use fsmap::insights::{self, Finding, Severity};
 use fsmap::report::{context, html, sarif, terminal};
 use fsmap::snapshot::{Parts, PruneInfo, Snapshot};
@@ -120,6 +121,20 @@ enum Cmd {
         new: PathBuf,
         #[arg(long, default_value_t = 15)]
         top: usize,
+    },
+    /// The verification gate: fmt, clippy -D warnings, tests, the repository's extra steps
+    /// (`[workspace.metadata.fsmap.verify] extra`), and cargo-deny in full mode.
+    Verify {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = verify::Mode::Quick)]
+        mode: verify::Mode,
+        /// Treat a skipped step (a tool that is not installed) as a failure.
+        #[arg(long)]
+        strict: bool,
+        /// Machine-readable report.
+        #[arg(long)]
+        json: bool,
     },
     /// Suggested read-deny rules so AI agents skip bulky, low-value paths.
     AgentIgnore {
@@ -471,6 +486,41 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let text = fsmap::diff::render(&old.to_string_lossy(), &new.to_string_lossy(), top)?;
             write_out(None, text.as_bytes())?;
             Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Verify {
+            path,
+            mode,
+            strict,
+            json,
+        } => {
+            let root = verify::workspace_root(&path)?;
+            let exe = std::env::current_exe().context("locating the fsmap binary")?;
+            let steps = verify::plan(&root, mode, &exe)?;
+            let report = verify::run(&root, mode, &steps, |r| {
+                if !json {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "verify: {} {}",
+                        r.name,
+                        serde_json::to_string(&r.status).unwrap_or_default()
+                    );
+                }
+            });
+            let text = if json {
+                serde_json::to_string_pretty(&report)? + "\n"
+            } else {
+                verify::render(&report)
+            };
+            write_out(None, text.as_bytes())?;
+            let skipped = report
+                .steps
+                .iter()
+                .any(|s| s.status == verify::Status::Skip);
+            Ok(if report.passed() && !(strict && skipped) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
         }
         Cmd::AgentIgnore { path, format, a } => {
             let (analysis, _) = analyse(&path, &a)?;

@@ -1,0 +1,32 @@
+# cargo-deny: known vulnerabilities, licences and where dependencies come from.
+# Run by `fsmap verify --mode full` and in CI (decision D-15).
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec advisory database; yanked versions are treated as errors.
+yanked = "deny"
+
+[licenses]
+# Every licence in the current tree, all permissive. Adding a crate with another licence
+# fails the gate until someone decides it is acceptable.
+allow = [
+    "Apache-2.0",
+    "BSL-1.0",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# fsmap itself is `publish = false` and has no licence yet (README: decision for the owner).
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

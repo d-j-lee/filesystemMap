@@ -27,6 +27,14 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 serde_json = "1.0.154"
 tempfile = "3.27.0"
 
+# Extra steps for `fsmap verify` (the gate people, agent hooks and CI share; D-15).
+# `{fsmap}` is the running fsmap binary.
+[package.metadata.fsmap.verify]
+extra = [
+    ["node", "--check", "viewer/app.js"],
+    ["{fsmap}", "insights", ".", "--fail-on", "high", "-q"],
+]
+
 [lints.rust]
 unsafe_code = "forbid"
 
