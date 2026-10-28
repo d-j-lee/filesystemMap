@@ -124,6 +124,9 @@ Rejected / deferred, with reason:
 - **Why**: on flask, the first version reported a 15-module "cycle". All of it came from
   `TYPE_CHECKING` imports, and none of it could fail at import time. Cycles are reported only
   where they have runtime meaning.
+- **Also excluded**: TS `import type` / `export type` and inline `{ type X }` clauses (erased
+  by the compiler), and any edge touching test code (tests depend on everything; on hono a
+  single `types.test.ts` importing the package root closed a 13-module "cycle").
 - **Related**: references from a child module to its own parent module file (Rust `super::`
   into `mod.rs`/`lib.rs`, Python `__init__.py`) are marked *up* and excluded the same way.
   Module cycles inside one Rust crate are reported, but at low severity, because they compile.

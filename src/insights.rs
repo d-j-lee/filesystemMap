@@ -577,7 +577,9 @@ fn cycles(c: &mut Ctx<'_>) {
                     .is_some_and(|l| crate::classify::lang(l).name == "Rust")
             })
         });
-        let sev = if dirs == 0 || rust_only {
+        // Third-party code is not ours to restructure.
+        let vendored = cy.members.iter().any(|&m| t.get(m).zone == Zone::Vendored);
+        let sev = if dirs == 0 || rust_only || vendored {
             Severity::Low
         } else if t.get(cy.parent).depth <= 1 && dirs >= 2 {
             Severity::High
@@ -597,24 +599,29 @@ fn cycles(c: &mut Ctx<'_>) {
         let files = cy
             .cut_files
             .iter()
+            .take(6)
             .map(|&(a, b)| format!("{} → {}", c.p(a), c.p(b)))
             .collect::<Vec<_>>()
             .join("; ");
+        let cut_imports: u32 = cy.cuts.iter().map(|x| x.2).sum();
+        let cut_list = cy
+            .cuts
+            .iter()
+            .map(|&(a, b, w)| format!("{} → {} ({w})", t.get(a).name, t.get(b).name))
+            .collect::<Vec<_>>()
+            .join(", ");
         c.push(
             "dep-cycle",
             sev,
             cy.members.clone(),
             format!("Dependency cycle in {}: {shown}", c.p(cy.parent)),
             format!(
-                "{} imports form the cycle. Cheapest cut: {} → {} ({} import{}: {files}).",
+                "{} imports form the cycle. Removing {cut_imports} import{} breaks it: {cut_list}. Files: {files}.",
                 cy.weight,
-                t.get(cy.cut.0).name,
-                t.get(cy.cut.1).name,
-                cy.cut.2,
-                if cy.cut.2 == 1 { "" } else { "s" }
+                if cut_imports == 1 { "" } else { "s" }
             ),
-            "Cycles make modules impossible to build, test or reason about separately. Remove \
-             the cheapest edge: move the shared piece down a layer or invert the dependency.",
+            "Cycles make modules impossible to build, test or reason about separately. Change \
+             those imports: move the shared piece down a layer or invert the dependency.",
             None,
             None,
         );

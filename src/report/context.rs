@@ -392,11 +392,14 @@ pub fn render(a: &Analysis, findings: &[Finding], opts: &Options) -> String {
                     .collect();
                 let _ = writeln!(
                     s,
-                    "- Cycle in `{}`: {} (cheapest cut {} → {})",
+                    "- Cycle in `{}`: {} (break it by removing {})",
                     t.display_path(c.parent),
                     names.join(" ↔ "),
-                    t.get(c.cut.0).name,
-                    t.get(c.cut.1).name
+                    c.cuts
+                        .iter()
+                        .map(|&(x, y, w)| format!("{} → {} ({w})", t.get(x).name, t.get(y).name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             sections.push(s);

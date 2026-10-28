@@ -79,10 +79,13 @@ fn fixture() -> tempfile::TempDir {
     );
     write(d, "proto/schema.txt", "v1\n");
     write(d, "client/api.py", "VERSION = 1\n");
-    write(d, "dist/bundle.js", &"x".repeat(200_000));
+    // Committed bytecode cache: an unambiguous build artifact.
+    write(d, "pkg/__pycache__/a.cpython-312.pyc", &"x".repeat(200_000));
     for i in 0..6 {
-        write(d, &format!("dist/chunk{i}.js"), "y");
+        write(d, &format!("pkg/__pycache__/m{i}.cpython-312.pyc"), "y");
     }
+    // A tracked `build/` next to a manifest is build *scripts*, not output.
+    write(d, "build/release.py", "import os\n");
     write(d, "cache/blob.bin", "z");
     commit(d, "Alice", "init", t0);
     for i in 0..8 {
@@ -127,7 +130,11 @@ fn json_snapshot_contract() {
     // Git state and origins.
     assert_eq!(nodes[find("a.py")]["git"], "tracked");
     assert_eq!(nodes[find("blob.bin")]["git"], "ignored");
-    assert_eq!(nodes[find("dist")]["zone"], "artifact");
+    assert_eq!(nodes[find("__pycache__")]["zone"], "artifact");
+    assert!(
+        nodes[find("build")]["zone"].is_null(),
+        "tracked build/ is source"
+    );
     // History: api.py changed in 9 commits by two authors.
     assert_eq!(nodes[find("api.py")]["commits"], 9);
     // The module-level cycle is found; the TYPE_CHECKING import does not make c.py part of it.
@@ -175,7 +182,7 @@ fn insights_gate_and_baseline_ratchet() {
     assert_eq!(
         gate.status.code(),
         Some(1),
-        "committed dist/ is at least medium severity"
+        "committed __pycache__/ is at least medium severity"
     );
     let base = fsmap(
         &[
@@ -326,7 +333,7 @@ fn snapshot_diff_and_agent_ignore() {
         .iter()
         .map(|x| x.as_str().unwrap())
         .collect();
-    assert!(deny.iter().any(|r| r.contains("dist")), "{deny:?}");
+    assert!(deny.iter().any(|r| r.contains("__pycache__")), "{deny:?}");
 }
 
 #[test]

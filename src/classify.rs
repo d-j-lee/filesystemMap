@@ -489,6 +489,10 @@ pub fn is_manifest(name: &str) -> bool {
     MANIFESTS.contains(&name) || name.ends_with(".csproj") || name.ends_with(".sln")
 }
 
+/// Reason for names that are output by convention but also common for hand-written code
+/// (`build/` scripts, `bin/` tools). Git tracking overrides it: see [`settle_tracked_outputs`].
+pub const AMBIGUOUS_OUTPUT: &str = "build output next to its manifest";
+
 /// Origin implied by a directory's name, given its siblings, with a human-readable reason.
 /// Ambiguous names (`target`, `build`, `dist`, …) need a matching manifest next to them.
 fn zone_for_dir(name: &str, sibling_names: &[&str]) -> Option<(Zone, &'static str)> {
@@ -518,19 +522,17 @@ fn zone_for_dir(name: &str, sibling_names: &[&str]) -> Option<(Zone, &'static st
                 || has("pyproject.toml")
                 || has("package.json") =>
         {
-            (Zone::Artifact, "build output next to its manifest")
+            (Zone::Artifact, AMBIGUOUS_OUTPUT)
         }
         "dist" if has("package.json") || has("setup.py") || has("pyproject.toml") => {
-            (Zone::Artifact, "build output next to its manifest")
+            (Zone::Artifact, AMBIGUOUS_OUTPUT)
         }
-        "out" if has("package.json") || has("tsconfig.json") => {
-            (Zone::Artifact, "build output next to its manifest")
-        }
+        "out" if has("package.json") || has("tsconfig.json") => (Zone::Artifact, AMBIGUOUS_OUTPUT),
         "bin" | "obj" if sibling_names.iter().any(|n| n.ends_with(".csproj")) => {
-            (Zone::Artifact, "build output next to its manifest")
+            (Zone::Artifact, AMBIGUOUS_OUTPUT)
         }
         "third_party" | "third-party" | "thirdparty" | "3rdparty" | "vendor" | "vendors"
-        | "external" | "extern" => (Zone::Vendored, "third-party directory name"),
+        | "external" | "extern" | "deps" => (Zone::Vendored, "third-party directory name"),
         n if n.starts_with("cmake-build-") || n.starts_with("bazel-") => {
             (Zone::Artifact, "build output directory name")
         }
@@ -618,31 +620,60 @@ pub fn classify_tree(tree: &mut Tree) -> Vec<ZoneRoot> {
     }
 
     for id in 0..n as NodeId {
-        let node = tree.get(id);
-        if node.kind != Kind::File {
-            continue;
-        }
-        let name = node.name.to_string();
-        let (cat, lang) = classify_file(&name);
-        let analysed = node.zone.is_analysed();
-        let rel = if analysed {
-            tree.rel_path(id)
-        } else {
-            String::new()
-        };
-        let node = tree.get_mut(id);
-        node.category = cat;
-        node.lang = lang;
-        if analysed {
-            if is_test_path(&rel, &name) {
-                node.flags.set(Flags::TEST);
-            }
-            if is_manifest(&name) {
-                node.flags.set(Flags::MANIFEST);
-            }
+        if tree.get(id).kind == Kind::File {
+            classify_node_file(tree, id);
         }
     }
     roots
+}
+
+fn classify_node_file(tree: &mut Tree, id: NodeId) {
+    let node = tree.get(id);
+    let name = node.name.to_string();
+    let (cat, lang) = classify_file(&name);
+    let analysed = node.zone.is_analysed();
+    let rel = if analysed {
+        tree.rel_path(id)
+    } else {
+        String::new()
+    };
+    let node = tree.get_mut(id);
+    node.category = cat;
+    node.lang = lang;
+    if analysed {
+        if is_test_path(&rel, &name) {
+            node.flags.set(Flags::TEST);
+        }
+        if is_manifest(&name) {
+            node.flags.set(Flags::MANIFEST);
+        }
+    }
+}
+
+/// An ambiguously named "output" directory that git tracks is hand-written code (hono's
+/// `build/` holds build scripts): return it to its parent's origin. Run after git status.
+pub fn settle_tracked_outputs(tree: &mut Tree, roots: &mut Vec<ZoneRoot>) {
+    let mut keep = Vec::with_capacity(roots.len());
+    for r in roots.drain(..) {
+        let tracked = r.reason == AMBIGUOUS_OUTPUT
+            && tree.subtree(r.node).any(|s| {
+                tree.get(s).is_file() && tree.get(s).git == Some(crate::model::GitState::Tracked)
+            });
+        if !tracked {
+            keep.push(r);
+            continue;
+        }
+        let parent_zone = tree.get(tree.get(r.node).parent).zone;
+        for s in tree.subtree(r.node) {
+            if tree.get(s).zone == Zone::Artifact {
+                tree.get_mut(s).zone = parent_zone;
+                if tree.get(s).kind == Kind::File {
+                    classify_node_file(tree, s);
+                }
+            }
+        }
+    }
+    *roots = keep;
 }
 
 #[cfg(test)]

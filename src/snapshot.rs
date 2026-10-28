@@ -170,6 +170,10 @@ impl Parts {
                 c.members.iter_mut().for_each(m);
                 m(&mut c.cut.0);
                 m(&mut c.cut.1);
+                for cut in &mut c.cuts {
+                    m(&mut cut.0);
+                    m(&mut cut.1);
+                }
                 for (a, b) in &mut c.cut_files {
                     m(a);
                     m(b);

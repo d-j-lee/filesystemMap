@@ -932,12 +932,12 @@ renderers.architecture = (root) => {
   drawMatrix();
 
   // Cycles.
-  const cyc = h('div', { class: 'panel' }, h('h2', null, 'Cycles', h('span', { class: 'sub', text: 'between siblings, at the level where they occur; deferred and type-only imports excluded' })));
+  const cyc = h('div', { class: 'panel' }, h('h2', null, 'Cycles', h('span', { class: 'sub', text: 'between siblings, at the level where they occur; deferred, type-only and test imports excluded' })));
   if (!deps.cycles.length) cyc.append(h('div', { class: 'empty', text: 'No import cycles. Every directory level is layered.' }));
   for (const c of deps.cycles) {
     cyc.append(h('div', { class: 'finding', 'data-sev': c.members.some(isDir) ? 'medium' : 'low', style: { marginTop: '8px' } },
       h('div', { class: 'title', text: `${path(c.parent)}: ${c.members.map((m) => N[m].name + (isDir(m) ? '/' : '')).join(' ↔ ')}` }),
-      h('div', { class: 'detail', text: `${c.weight} imports in the cycle. Cheapest cut: ${N[c.cut[0]].name} → ${N[c.cut[1]].name} (${c.cut[2]}).` }),
+      h('div', { class: 'detail', text: `${c.weight} imports in the cycle. Removing ${c.cuts.reduce((a, x) => a + x[2], 0)} breaks it: ${c.cuts.map((x) => `${N[x[0]].name} → ${N[x[1]].name} (${x[2]})`).join(', ')}.` }),
       h('div', { class: 'detail mono', style: { fontSize: '12px' } }, c.cutFiles.map(([a, b]) => h('div', { text: `${path(a)} → ${path(b)}` }))),
       h('div', { class: 'row' }, h('button', { class: 'linkish', type: 'button', text: 'Open in matrix', onclick: () => { dir = c.parent; drawMatrix(); panel.scrollIntoView({ behavior: 'smooth' }); } }))));
   }

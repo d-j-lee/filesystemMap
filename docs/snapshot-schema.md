@@ -75,8 +75,11 @@ changing a meaning, bumps the schema to `fsmap/2`.
   `confBa`, `lift`, `linked` (`true` = an import path of ≤ 2 hops exists, `false` = none,
   absent = a language without an extractor), `testPair`.
 - **Graph**: `edges` = `{from, to, weight, up?, weak?}[]` (`up`: child module referencing its
-  parent module file; `weak`: every import behind it is deferred or type-only),
-  `cycles` = `{parent, members[], weight, cut: [from, to, weight], cutFiles: [from, to][]}[]`,
+  parent module file; `weak`: every import behind it is deferred or type-only, or it touches
+  test code),
+  `cycles` = `{parent, members[], weight, cuts: [from, to, weight][], cut, cutFiles: [from, to][]}[]`
+  (`cuts`: a feedback arc set — removing those lifted edges makes the members acyclic;
+  `cut`: the lightest of them),
   `stats` = `{lang, files, imports, internal, external}[]`.
 - **Finding**: `id` (stable: `rule:hash(paths)`), `rule`, `severity` (`high`/`medium`/`low`/`info`),
   `title`, `detail`, `action`, `command?`, `nodes[]`, `paths[]`, `bytes?`, `new?` (with `--baseline`).

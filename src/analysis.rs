@@ -136,7 +136,7 @@ pub fn run(path: &Path, opts: &Options, progress: &Progress) -> Result<Analysis>
     let mut tree = scanned.tree;
     tick("scan", &mut timings);
 
-    let zone_roots = classify::classify_tree(&mut tree);
+    let mut zone_roots = classify::classify_tree(&mut tree);
     let index = PathIndex::new(&tree);
     tick("classify", &mut timings);
 
@@ -145,6 +145,7 @@ pub fn run(path: &Path, opts: &Options, progress: &Progress) -> Result<Analysis>
         progress.start("git status", 0);
         let (mut repos, total) = git::discover(&tree, &root, opts.max_repos);
         git::apply_status(&mut tree, &index, &mut repos);
+        classify::settle_tracked_outputs(&mut tree, &mut zone_roots);
         (repos, total)
     } else {
         (Vec::new(), 0)

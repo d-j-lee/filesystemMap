@@ -24,8 +24,9 @@ pub enum Import {
     },
     /// JS/TS module specifier as written (static `import`/`export … from`/`require`).
     Js(String),
-    /// JS/TS dynamic `import("…")`: loaded lazily, cannot create an evaluation-time cycle.
-    JsLazy(String),
+    /// JS/TS import that does not run at module evaluation: dynamic `import("…")`, or a
+    /// type-only `import type` / `export type` (erased by the compiler).
+    JsWeak(String),
     /// Go import path.
     Go(String),
     /// Java / Kotlin / Scala / Groovy dotted import.
@@ -62,7 +63,17 @@ re!(
     PY_FROM,
     r"(?m)^([ \t]*)from[ \t]+(\.*)([\w.]*)[ \t]+import[ \t]+(\([^)]*\)|[^\n]+)"
 );
-re!(JS_FROM, r#"\bfrom\s*['"]([^'"\n]+)['"]"#);
+// `import … from '…'` / `export … from '…'`; group 2 = `type` modifier, group 3 = clause.
+// The clause may span lines but never contains quotes, so a side-effect import without
+// `from` cannot swallow the next statement.
+re!(
+    JS_FROM,
+    r#"\b(import|export)(\s+type)?\s+([^;'"]*?)\s*\bfrom\s*['"]([^'"\n]+)['"]"#
+);
+re!(
+    JS_TYPE_CLAUSE,
+    r"^\{\s*(?:type\s+[\w$]+(?:\s+as\s+[\w$]+)?\s*,?\s*)+\}$"
+);
 re!(JS_SIDE, r#"\bimport\s*['"]([^'"\n]+)['"]"#);
 re!(JS_REQUIRE, r#"\brequire\s*\(\s*['"]([^'"\n]+)['"]\s*\)"#);
 re!(JS_DYNAMIC, r#"\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)"#);
@@ -132,13 +143,22 @@ pub fn extract(lang: ImportLang, stripped: &str) -> Vec<Import> {
             }
         }
         ImportLang::Js => {
-            for re in [&*JS_FROM, &*JS_SIDE, &*JS_REQUIRE] {
+            for c in JS_FROM.captures_iter(stripped) {
+                let type_only = c.get(2).is_some() || JS_TYPE_CLAUSE.is_match(c[3].trim());
+                let spec = c[4].to_string();
+                out.push(if type_only {
+                    Import::JsWeak(spec)
+                } else {
+                    Import::Js(spec)
+                });
+            }
+            for re in [&*JS_SIDE, &*JS_REQUIRE] {
                 for c in re.captures_iter(stripped) {
                     out.push(Import::Js(c[1].to_string()));
                 }
             }
             for c in JS_DYNAMIC.captures_iter(stripped) {
-                out.push(Import::JsLazy(c[1].to_string()));
+                out.push(Import::JsWeak(c[1].to_string()));
             }
         }
         ImportLang::Go => {
@@ -399,7 +419,7 @@ mod tests {
         let got: Vec<_> = extract(ImportLang::Js, src)
             .into_iter()
             .map(|i| match i {
-                Import::Js(s) | Import::JsLazy(s) => s,
+                Import::Js(s) | Import::JsWeak(s) => s,
                 _ => unreachable!(),
             })
             .collect();
@@ -409,6 +429,31 @@ mod tests {
                 "{want} missing from {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn js_type_only_imports_are_weak() {
+        let src = "import type { A } from './a'\nimport { type B, type C as D } from './b'\nimport { type E, f } from './c'\nexport type { G } from './g'\nimport './side'\nimport h from './h'\n";
+        let got = extract(ImportLang::Js, src);
+        let weak: Vec<&str> = got
+            .iter()
+            .filter_map(|i| match i {
+                Import::JsWeak(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let strong: Vec<&str> = got
+            .iter()
+            .filter_map(|i| match i {
+                Import::Js(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(weak, ["./a", "./b", "./g"]);
+        assert!(
+            strong.contains(&"./c") && strong.contains(&"./side") && strong.contains(&"./h"),
+            "{strong:?}"
+        );
     }
 
     #[test]

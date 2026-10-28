@@ -16,7 +16,7 @@ use serde::Serialize;
 use crate::classify::{ImportLang, lang};
 use crate::git::PathIndex;
 use crate::git::history::CouplingPair;
-use crate::model::{Kind, NodeId, Tree};
+use crate::model::{Flags, Kind, NodeId, Tree};
 use extract::Import;
 
 #[derive(Clone, Debug, Serialize)]
@@ -30,8 +30,9 @@ pub struct Edge {
     /// idiomatic, excluded from cycle detection.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub up: bool,
-    /// Every import behind this edge is deferred (function-level / type-only Python
-    /// import, JS dynamic `import()`): excluded from cycle detection.
+    /// The edge does not shape the runtime architecture: every import behind it is
+    /// deferred or type-only (indented Python import, TS `import type`, JS `import()`), or
+    /// it starts or ends in test code. Excluded from cycle detection and the matrix.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub weak: bool,
 }
@@ -44,10 +45,72 @@ pub struct Cycle {
     pub members: Vec<NodeId>,
     /// Import statements on lifted edges inside the cycle.
     pub weight: u32,
-    /// Cheapest lifted edge to cut: (from, to, weight).
+    /// Lifted edges whose removal makes the members acyclic (weighted greedy feedback arc
+    /// set, Eades–Lin–Smyth), lightest first: (from, to, import count).
+    pub cuts: Vec<(NodeId, NodeId, u32)>,
+    /// The lightest of `cuts` (kept for consumers that show one suggestion).
     pub cut: (NodeId, NodeId, u32),
-    /// File-level imports behind the cheapest cut (up to 5).
+    /// File-level imports behind every cut edge (up to 5 per edge).
     pub cut_files: Vec<(NodeId, NodeId)>,
+}
+
+/// Weighted Eades–Lin–Smyth heuristic: order the vertices so that few, light edges point
+/// backwards; those backward edges are the feedback arc set.
+fn feedback_arcs(nodes: &[NodeId], edges: &[(NodeId, NodeId, u32)]) -> Vec<(NodeId, NodeId, u32)> {
+    let mut alive: HashSet<NodeId> = nodes.iter().copied().collect();
+    let weight_in = |v: NodeId, alive: &HashSet<NodeId>| -> i64 {
+        edges
+            .iter()
+            .filter(|e| e.1 == v && alive.contains(&e.0))
+            .map(|e| i64::from(e.2))
+            .sum()
+    };
+    let weight_out = |v: NodeId, alive: &HashSet<NodeId>| -> i64 {
+        edges
+            .iter()
+            .filter(|e| e.0 == v && alive.contains(&e.1))
+            .map(|e| i64::from(e.2))
+            .sum()
+    };
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    while !alive.is_empty() {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut sorted: Vec<NodeId> = alive.iter().copied().collect();
+            sorted.sort_unstable();
+            for v in sorted {
+                if weight_out(v, &alive) == 0 {
+                    right.push(v);
+                    alive.remove(&v);
+                    changed = true;
+                } else if weight_in(v, &alive) == 0 {
+                    left.push(v);
+                    alive.remove(&v);
+                    changed = true;
+                }
+            }
+        }
+        if let Some(&v) = alive.iter().max_by_key(|&&v| {
+            (
+                weight_out(v, &alive) - weight_in(v, &alive),
+                std::cmp::Reverse(v),
+            )
+        }) {
+            left.push(v);
+            alive.remove(&v);
+        }
+    }
+    right.reverse();
+    left.extend(right);
+    let pos: HashMap<NodeId, usize> = left.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+    let mut back: Vec<(NodeId, NodeId, u32)> = edges
+        .iter()
+        .copied()
+        .filter(|e| pos[&e.0] > pos[&e.1])
+        .collect();
+    back.sort_by_key(|e| (e.2, e.0, e.1));
+    back
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -414,7 +477,7 @@ impl<'a> Resolver<'a> {
                 names,
                 ..
             } => self.python(from_path, *level, module, names),
-            Import::Js(spec) | Import::JsLazy(spec) => self.js(from_path, spec),
+            Import::Js(spec) | Import::JsWeak(spec) => self.js(from_path, spec),
             Import::Go(p) => self.go(p),
             Import::Jvm(p) => self.jvm(from_path, p),
             Import::Include { path, quoted } => self.include(from_path, path, *quoted),
@@ -714,12 +777,21 @@ impl<'a> Resolver<'a> {
         if let Some(id) = self.file(inc) {
             return Resolved::Internal(id);
         }
+        // Elsewhere in the tree (include paths set by the build). A bare generic name like
+        // "config.h" only matches inside the includer's own top-level component, so vendored
+        // libraries don't get wired to the main project's headers by name alone.
         let suffix = format!("/{inc}");
+        let top = |p: &str| p.split('/').next().unwrap_or("").to_string();
+        let from_top = top(from_path);
+        let specific = inc.contains('/');
         if let Some(cands) = self.by_name.get(file_name(inc)) {
             let matching: Vec<NodeId> = cands
                 .iter()
                 .copied()
-                .filter(|&c| self.tree.rel_path(c).ends_with(&suffix))
+                .filter(|&c| {
+                    let p = self.tree.rel_path(c);
+                    p.ends_with(&suffix) && (specific || top(&p) == from_top)
+                })
                 .collect();
             if let Some(id) = self.closest(from_path, &matching) {
                 return Resolved::Internal(id);
@@ -794,7 +866,7 @@ pub fn build(
                 Resolved::Internal(to) => {
                     st.internal += 1;
                     let deferred =
-                        matches!(imp, Import::Python { nested: true, .. } | Import::JsLazy(_));
+                        matches!(imp, Import::Python { nested: true, .. } | Import::JsWeak(_));
                     let e = weights.entry((*from, to)).or_insert((0, true));
                     e.0 += 1;
                     e.1 &= deferred;
@@ -807,12 +879,14 @@ pub fn build(
 
     let mut edges: Vec<Edge> = weights
         .into_iter()
-        .map(|((from, to), (weight, weak))| Edge {
+        .map(|((from, to), (weight, deferred))| Edge {
             from,
             to,
             weight,
             up: is_up_edge(tree, from, to),
-            weak,
+            weak: deferred
+                || tree.get(from).flags.has(Flags::TEST)
+                || tree.get(to).flags.has(Flags::TEST),
         })
         .collect();
     edges.sort_unstable_by_key(|e| (e.from, e.to));
@@ -895,25 +969,29 @@ fn find_cycles(tree: &Tree, edges: &[Edge]) -> Vec<Cycle> {
         }
         scc.sort_unstable();
         let set: HashSet<NodeId> = scc.iter().copied().collect();
-        let mut weight = 0;
-        let mut cut: Option<(NodeId, NodeId, u32)> = None;
-        for &a in &scc {
-            for (_, b, &w) in g.edges(a) {
-                if set.contains(&b) {
-                    weight += w;
-                    if cut.is_none_or(|c| w < c.2 || (w == c.2 && (a, b) < (c.0, c.1))) {
-                        cut = Some((a, b, w));
-                    }
-                }
-            }
-        }
-        let Some(cut) = cut else { continue };
+        let inner: Vec<(NodeId, NodeId, u32)> = scc
+            .iter()
+            .flat_map(|&a| {
+                g.edges(a)
+                    .filter(|e| set.contains(&e.1))
+                    .map(|(a, b, &w)| (a, b, w))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let weight = inner.iter().map(|e| e.2).sum();
+        let cuts = feedback_arcs(&scc, &inner);
+        let Some(&cut) = cuts.first() else { continue };
+        let cut_files = cuts
+            .iter()
+            .flat_map(|c| lifted[&(c.0, c.1)].1.clone())
+            .collect();
         cycles.push(Cycle {
             parent: tree.get(scc[0]).parent,
             members: scc,
             weight,
+            cuts,
             cut,
-            cut_files: lifted[&(cut.0, cut.1)].1.clone(),
+            cut_files,
         });
     }
     cycles.sort_by(|a, b| {
@@ -929,6 +1007,15 @@ fn find_cycles(tree: &Tree, edges: &[Edge]) -> Vec<Cycle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feedback_arc_set_breaks_the_light_back_edge() {
+        // helper→utils ×13, utils→helper ×1, plus a 3-cycle a→b→c→a with c→a lightest.
+        let fas = feedback_arcs(&[1, 2], &[(1, 2, 13), (2, 1, 1)]);
+        assert_eq!(fas, vec![(2, 1, 1)]);
+        let fas = feedback_arcs(&[3, 4, 5], &[(3, 4, 5), (4, 5, 4), (5, 3, 1)]);
+        assert_eq!(fas, vec![(5, 3, 1)]);
+    }
 
     #[test]
     fn path_helpers() {
