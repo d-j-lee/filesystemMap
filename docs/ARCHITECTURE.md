@@ -97,8 +97,9 @@ Each stage enriches one arena (`model::Tree`). The order matters:
   - An import a→b becomes an edge between the two children of lca(a, b) that contain them.
   - So every cycle is reported at the level where it exists.
   - The suggested fix is a weighted feedback arc set (Eades–Lin–Smyth): the few, light
-    edges whose removal makes the members acyclic. On hono it singles out
-    `utils → helper` (1 import) against `helper → utils` (13).
+    edges whose removal makes the members acyclic. On hono's 9-module `src` cycle (59
+    imports) it names 3: `utils → helper` (1, against 16 the other way) and
+    `helper → jsx` (2, against 8).
   - Cycles inside one Rust crate are low severity, since they compile fine.
 
 ## 6. Measured performance
