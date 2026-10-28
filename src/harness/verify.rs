@@ -1,29 +1,34 @@
 //! `fsmap verify`: the single gate shared by people, agent hooks and CI (decision D-15).
 //!
-//! The steps for a Cargo workspace are fixed (fmt, clippy, test; cargo-deny in full mode).
-//! A repository adds its own checks in `Cargo.toml`:
+//! Steps for a Cargo workspace: `integrity` (configuration that would make the other steps
+//! pass without the code changing), fmt, clippy `-D warnings`, tests, and cargo-deny in
+//! full mode. A repository adds its own checks and trusted settings in `Cargo.toml`:
 //!
 //! ```toml
 //! [workspace.metadata.fsmap.verify]   # or [package.metadata.fsmap.verify]
 //! extra = [["node", "--check", "viewer/app.js"], ["{fsmap}", "insights", ".", "--fail-on", "high", "-q"]]
+//! trust = ["rustc-wrapper", "env:RUSTC_WRAPPER"]   # kinds the integrity step accepts
 //! ```
 //!
 //! `{fsmap}` is replaced by the running fsmap binary. Every step runs even after a failure,
-//! so one round reports everything that is wrong.
+//! so one round reports everything that is wrong. Steps run without the environment
+//! variables that weaken them and with the build directory inside the repository.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+
+use super::{integrity, proc};
 
 /// How much of a failing step's output is kept.
 const TAIL_LINES: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Mode {
-    /// fmt, clippy, tests and the repository's extra steps (the stop gate).
+    /// integrity, fmt, clippy, tests and the repository's extra steps (the stop gate).
     Quick,
     /// Quick plus `cargo deny check`.
     Full,
@@ -49,8 +54,13 @@ pub struct StepResult {
     pub cmd: String,
     pub status: Status,
     pub ms: u64,
-    /// Last lines of output for a failure, or the reason for a skip.
+    /// Last lines of output for a failure, or the reason for a skip. Control characters
+    /// are removed: this text reaches an agent as part of a hook message.
     pub tail: String,
+    /// Files the failure points at (fmt, clippy, integrity), relative to the root. Empty
+    /// when the output cannot be attributed (tests, extra steps).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -58,6 +68,9 @@ pub struct Report {
     pub root: String,
     pub mode: &'static str,
     pub steps: Vec<StepResult>,
+    /// Environment variables removed before running the steps.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed_env: Vec<String>,
 }
 
 impl Report {
@@ -68,6 +81,13 @@ impl Report {
     pub fn failures(&self) -> impl Iterator<Item = &StepResult> {
         self.steps.iter().filter(|s| s.status == Status::Fail)
     }
+}
+
+/// `[*.metadata.fsmap.verify]` of the workspace.
+#[derive(Clone, Debug, Default)]
+pub struct Config {
+    pub extra: Vec<Vec<String>>,
+    pub trust: Vec<String>,
 }
 
 /// The Cargo workspace root containing `dir`.
@@ -92,58 +112,9 @@ pub fn workspace_root(dir: &Path) -> Result<PathBuf> {
         .context("manifest path has no parent")
 }
 
-/// The steps `verify` runs in `root` (a workspace root).
-pub fn plan(root: &Path, mode: Mode, fsmap_exe: &Path) -> Result<Vec<Step>> {
-    let locked = root.join("Cargo.lock").is_file();
-    let lock_flag: &[&str] = if locked { &["--locked"] } else { &[] };
-    let step = |name: &str, args: &[&str]| Step {
-        name: name.to_string(),
-        argv: args.iter().map(|s| (*s).to_string()).collect(),
-    };
-    let mut steps = vec![
-        step(
-            "fmt",
-            &["cargo", "fmt", "--all", "--", "--check", "--color", "never"],
-        ),
-        step(
-            "clippy",
-            &[
-                &["cargo", "clippy", "--all-targets"][..],
-                lock_flag,
-                &["--", "-D", "warnings"],
-            ]
-            .concat(),
-        ),
-        step(
-            "test",
-            &[&["cargo", "test"][..], lock_flag, &["--quiet"]].concat(),
-        ),
-    ];
-    if mode == Mode::Full {
-        steps.push(step("deny", &["cargo", "deny", "check"]));
-    }
-    for (i, argv) in extra_steps(root)?.into_iter().enumerate() {
-        let argv: Vec<String> = argv
-            .into_iter()
-            .map(|a| {
-                if a == "{fsmap}" {
-                    fsmap_exe.to_string_lossy().into_owned()
-                } else {
-                    a
-                }
-            })
-            .collect();
-        steps.push(Step {
-            name: format!("extra-{}", i + 1),
-            argv,
-        });
-    }
-    Ok(steps)
-}
-
-/// `extra` from `[workspace.metadata.fsmap.verify]` or the root package's metadata, read
-/// through `cargo metadata` so no TOML parser is needed.
-fn extra_steps(root: &Path) -> Result<Vec<Vec<String>>> {
+/// Read the workspace's verify configuration through `cargo metadata`, so no TOML parser
+/// is needed. A broken manifest yields the default; the clippy and test steps report it.
+pub fn config(root: &Path) -> Result<Config> {
     let out = Command::new("cargo")
         .args([
             "metadata",
@@ -157,8 +128,7 @@ fn extra_steps(root: &Path) -> Result<Vec<Vec<String>>> {
         .output()
         .context("failed to run cargo metadata")?;
     if !out.status.success() {
-        // A broken manifest is reported by the clippy/test steps; nothing extra to add.
-        return Ok(Vec::new());
+        return Ok(Config::default());
     }
     let meta: serde_json::Value =
         serde_json::from_slice(&out.stdout).context("cargo metadata output")?;
@@ -176,36 +146,111 @@ fn extra_steps(root: &Path) -> Result<Vec<Vec<String>>> {
     ]
     .into_iter()
     .flatten()
-    .map(|m| &m["fsmap"]["verify"]["extra"])
-    .find(|v| v.is_array());
-    let Some(list) = table.and_then(|v| v.as_array()) else {
-        return Ok(Vec::new());
+    .map(|m| &m["fsmap"]["verify"])
+    .find(|v| v.is_object());
+    let Some(table) = table else {
+        return Ok(Config::default());
     };
-    list.iter()
-        .map(|cmd| {
-            let argv: Option<Vec<String>> = cmd.as_array().map(|a| {
-                a.iter()
-                    .filter_map(|s| s.as_str().map(String::from))
-                    .collect()
-            });
-            match argv {
-                Some(v) if !v.is_empty() && v.len() == cmd.as_array().map_or(0, Vec::len) => Ok(v),
+    let strings = |v: &serde_json::Value| -> Option<Vec<String>> {
+        let a = v.as_array()?;
+        let s: Vec<String> = a
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
+        (s.len() == a.len()).then_some(s)
+    };
+    let mut cfg = Config::default();
+    if let Some(list) = table["extra"].as_array() {
+        for cmd in list {
+            match strings(cmd) {
+                Some(v) if !v.is_empty() => cfg.extra.push(v),
                 _ => bail!("fsmap.verify.extra entries must be non-empty arrays of strings: {cmd}"),
             }
-        })
-        .collect()
+        }
+    }
+    if !table["trust"].is_null() {
+        cfg.trust =
+            strings(&table["trust"]).context("fsmap.verify.trust must be an array of strings")?;
+    }
+    Ok(cfg)
 }
 
-/// Run every step in `root`; `progress` sees each result as it finishes.
+/// The steps `verify` runs in `root` (a workspace root), after the in-process integrity
+/// step.
+pub fn plan(root: &Path, mode: Mode, fsmap_exe: &Path, cfg: &Config) -> Vec<Step> {
+    let locked = root.join("Cargo.lock").is_file();
+    let lock_flag: &[&str] = if locked { &["--locked"] } else { &[] };
+    let step = |name: &str, args: &[&str]| Step {
+        name: name.to_string(),
+        argv: args.iter().map(|s| (*s).to_string()).collect(),
+    };
+    let mut steps = vec![
+        step(
+            "fmt",
+            &["cargo", "fmt", "--all", "--", "--check", "--color", "never"],
+        ),
+        step(
+            "clippy",
+            &[
+                &["cargo", "clippy", "--all-targets", "--message-format=short"][..],
+                lock_flag,
+                &["--", "-D", "warnings"],
+            ]
+            .concat(),
+        ),
+        step(
+            "test",
+            &[&["cargo", "test"][..], lock_flag, &["--quiet"]].concat(),
+        ),
+    ];
+    if mode == Mode::Full {
+        steps.push(step("deny", &["cargo", "deny", "check"]));
+    }
+    for (i, argv) in cfg.extra.iter().enumerate() {
+        steps.push(Step {
+            name: format!("extra-{}", i + 1),
+            argv: argv
+                .iter()
+                .map(|a| {
+                    if a == "{fsmap}" {
+                        fsmap_exe.to_string_lossy().into_owned()
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect(),
+        });
+    }
+    steps
+}
+
+/// Run the integrity check and every step in `root` within `budget`; `progress` sees each
+/// result as it finishes. A step that runs past the remaining budget is killed and fails.
 pub fn run(
     root: &Path,
     mode: Mode,
     steps: &[Step],
+    cfg: &Config,
+    budget: Duration,
     mut progress: impl FnMut(&StepResult),
 ) -> Report {
-    let mut results = Vec::with_capacity(steps.len());
+    let started = Instant::now();
+    let removed_env = integrity::weakening_env(
+        std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str),
+        &cfg.trust,
+    );
+    let target_dir = target_dir(root, &cfg.trust);
+    let mut results = Vec::with_capacity(steps.len() + 1);
+    let integrity = integrity_step(root, &cfg.trust);
+    progress(&integrity);
+    results.push(integrity);
     for step in steps {
-        let r = run_step(root, step);
+        let left = budget.saturating_sub(started.elapsed());
+        let r = run_step(root, step, &removed_env, target_dir.as_deref(), left);
         progress(&r);
         results.push(r);
     }
@@ -216,43 +261,155 @@ pub fn run(
             Mode::Full => "full",
         },
         steps: results,
+        removed_env,
     }
 }
 
-fn run_step(root: &Path, step: &Step) -> StepResult {
-    let cmd = step.argv.join(" ");
+/// The build directory the steps use: inside the repository, unless the repository trusts
+/// `target-dir`. Sharing one across copies lets a copy pass on another copy's artefacts.
+fn target_dir(root: &Path, trust: &[String]) -> Option<PathBuf> {
+    if trust.iter().any(|t| t == "target-dir") {
+        return None;
+    }
+    match std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
+        Some(t) if t.is_absolute() && t.starts_with(root) => None,
+        _ => Some(root.join("target")),
+    }
+}
+
+fn integrity_step(root: &Path, trust: &[String]) -> StepResult {
     let started = Instant::now();
-    let done = |status, tail: String| StepResult {
+    let findings = integrity::scan(root, trust);
+    let mut files: Vec<String> = findings.iter().map(|f| f.file.clone()).collect();
+    files.sort();
+    files.dedup();
+    let tail = findings
+        .iter()
+        .map(|f| format!("{}:{}: {} — {}", f.file, f.line, f.kind, sanitize(&f.text)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    StepResult {
+        name: "integrity".into(),
+        cmd: "cargo/rustfmt/rustup settings that weaken the gate".into(),
+        status: if findings.is_empty() {
+            Status::Pass
+        } else {
+            Status::Fail
+        },
+        ms: started.elapsed().as_millis() as u64,
+        tail: if findings.is_empty() {
+            tail
+        } else {
+            format!(
+                "{tail}\nRemove these settings, or list the kind under \
+                 [*.metadata.fsmap.verify] trust if the repository needs it."
+            )
+        },
+        files,
+    }
+}
+
+fn run_step(
+    root: &Path,
+    step: &Step,
+    removed_env: &[String],
+    target_dir: Option<&Path>,
+    left: Duration,
+) -> StepResult {
+    let cmd = step.argv.join(" ");
+    let result = |status, ms, tail: String, files| StepResult {
         name: step.name.clone(),
         cmd: cmd.clone(),
         status,
-        ms: started.elapsed().as_millis() as u64,
+        ms,
         tail,
+        files,
     };
     if step.name == "deny" && !cargo_subcommand_exists(root, "deny") {
-        return done(
+        return result(
             Status::Skip,
+            0,
             "cargo-deny is not installed (cargo install cargo-deny --locked)".into(),
+            Vec::new(),
+        );
+    }
+    if left.is_zero() {
+        return result(
+            Status::Fail,
+            0,
+            "not run: the time budget was used up by earlier steps".into(),
+            Vec::new(),
         );
     }
     let Some((program, args)) = step.argv.split_first() else {
-        return done(Status::Fail, "empty command".into());
+        return result(Status::Fail, 0, "empty command".into(), Vec::new());
     };
-    let out = Command::new(program)
-        .args(args)
+    let mut c = Command::new(program);
+    c.args(args)
         .current_dir(root)
-        .env("CARGO_TERM_COLOR", "never")
-        .stdin(Stdio::null())
-        .output();
-    match out {
-        Err(e) => done(Status::Fail, format!("could not start `{program}`: {e}")),
-        Ok(o) if o.status.success() => done(Status::Pass, String::new()),
-        Ok(o) => {
-            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&o.stderr));
-            done(Status::Fail, tail(&text, TAIL_LINES))
-        }
+        .env("CARGO_TERM_COLOR", "never");
+    for k in removed_env {
+        c.env_remove(k);
     }
+    if let Some(t) = target_dir {
+        c.env("CARGO_TARGET_DIR", t);
+    }
+    let o = proc::run(c, left);
+    if let Some(e) = &o.start_error {
+        return result(
+            Status::Fail,
+            o.ms,
+            format!("could not start `{program}`: {e}"),
+            Vec::new(),
+        );
+    }
+    if o.timed_out {
+        return result(
+            Status::Fail,
+            o.ms,
+            format!(
+                "killed after {:.0} s (time budget)\n{}",
+                o.ms as f64 / 1000.0,
+                tail(&o.output, 10)
+            ),
+            Vec::new(),
+        );
+    }
+    if o.success() {
+        return result(Status::Pass, o.ms, String::new(), Vec::new());
+    }
+    let files = match step.name.as_str() {
+        "fmt" | "clippy" => attributed_files(root, &o.output),
+        _ => Vec::new(),
+    };
+    result(Status::Fail, o.ms, tail(&o.output, TAIL_LINES), files)
+}
+
+/// Files named by rustfmt (`Diff in /abs/path.rs:12:`) and short-format compiler
+/// diagnostics (`src/a.rs:3:5: error[E0308]: …`), relative to `root`.
+fn attributed_files(root: &Path, output: &str) -> Vec<String> {
+    let mut files: Vec<String> = output
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let path = if let Some(rest) = l.strip_prefix("Diff in ") {
+                rest.rsplitn(3, ':').nth(2)?
+            } else {
+                let (path, rest) = l.split_once(':')?;
+                let after = rest.splitn(3, ':').nth(2)?.trim_start();
+                if !(after.starts_with("warning") || after.starts_with("error")) {
+                    return None;
+                }
+                path
+            };
+            let p = Path::new(path);
+            let rel = p.strip_prefix(root).unwrap_or(p);
+            (!rel.is_absolute()).then(|| rel.to_string_lossy().replace('\\', "/"))
+        })
+        .collect();
+    files.sort();
+    files.dedup();
+    files
 }
 
 fn cargo_subcommand_exists(root: &Path, sub: &str) -> bool {
@@ -265,9 +422,9 @@ fn cargo_subcommand_exists(root: &Path, sub: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// The last `n` non-empty lines of `text`, without terminal colour codes.
+/// The last `n` non-empty lines of `text`, sanitised.
 pub fn tail(text: &str, n: usize) -> String {
-    let text = strip_ansi(text);
+    let text = sanitize(text);
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(n);
     let mut out = String::new();
@@ -278,21 +435,34 @@ pub fn tail(text: &str, n: usize) -> String {
     out
 }
 
-/// Removes CSI escape sequences (`ESC [ … letter`); tools differ in how they honour
-/// "no colour" settings.
-fn strip_ansi(text: &str) -> String {
+/// Removes terminal escape sequences (CSI `ESC [ … letter`, OSC `ESC ] … BEL|ESC \`, and
+/// two-byte `ESC x`) and every other control character except newline and tab: tool
+/// output is untrusted text on its way into an agent's context.
+pub fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
                 }
-            }
-        } else {
-            out.push(c);
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
         }
     }
     out
@@ -301,6 +471,12 @@ fn strip_ansi(text: &str) -> String {
 /// Human-readable report: one line per step, failing tails underneath.
 pub fn render(report: &Report) -> String {
     let mut out = String::new();
+    if !report.removed_env.is_empty() {
+        out.push_str(&format!(
+            "note: ran without {} (trust them as env:NAME to keep them)\n",
+            report.removed_env.join(", ")
+        ));
+    }
     for s in &report.steps {
         let mark = match s.status {
             Status::Pass => "ok  ",
@@ -308,7 +484,7 @@ pub fn render(report: &Report) -> String {
             Status::Skip => "skip",
         };
         out.push_str(&format!(
-            "{mark} {:<8} {:>6.1}s  {}\n",
+            "{mark} {:<9} {:>6.1}s  {}\n",
             s.name,
             s.ms as f64 / 1000.0,
             s.cmd
@@ -343,6 +519,29 @@ mod tests {
         let t = tail(&text, 3);
         assert_eq!(t, "… 47 earlier lines omitted\nline 48\nline 49\nline 50");
         assert_eq!(tail("a\n\n b \n", 5), "a\n b ");
-        assert_eq!(tail("\u{1b}[31m-x\u{1b}[m\n", 5), "-x");
+    }
+
+    #[test]
+    fn sanitize_strips_escapes_and_controls() {
+        assert_eq!(sanitize("\u{1b}[31m-x\u{1b}[m"), "-x");
+        assert_eq!(
+            sanitize("a\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{1b}\\b"),
+            "alinkb"
+        );
+        assert_eq!(sanitize("p\r\u{8}q\tr\n"), "pq\tr\n");
+    }
+
+    #[test]
+    fn attributes_fmt_and_clippy_output() {
+        let root = Path::new("/w");
+        let out = "Diff in /w/src/a.rs:12:\n-x\n+y\n\
+                   src/b.rs:3:5: warning: unused variable\n\
+                   src/c.rs:1:1: error[E0308]: mismatched types\n\
+                   error: could not compile `x`\n\
+                   /elsewhere/d.rs:1:1: warning: outside\n";
+        assert_eq!(
+            attributed_files(root, out),
+            ["src/a.rs", "src/b.rs", "src/c.rs"]
+        );
     }
 }

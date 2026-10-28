@@ -135,6 +135,9 @@ enum Cmd {
         /// Machine-readable report.
         #[arg(long)]
         json: bool,
+        /// Time budget in seconds for all steps; a step still running is killed and fails.
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
     },
     /// Suggested read-deny rules so AI agents skip bulky, low-value paths.
     AgentIgnore {
@@ -492,11 +495,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
             mode,
             strict,
             json,
+            timeout,
         } => {
             let root = verify::workspace_root(&path)?;
             let exe = std::env::current_exe().context("locating the fsmap binary")?;
-            let steps = verify::plan(&root, mode, &exe)?;
-            let report = verify::run(&root, mode, &steps, |r| {
+            let cfg = verify::config(&root)?;
+            let steps = verify::plan(&root, mode, &exe, &cfg);
+            let budget = Duration::from_secs(timeout);
+            let report = verify::run(&root, mode, &steps, &cfg, budget, |r| {
                 if !json {
                     let _ = writeln!(
                         std::io::stderr(),
