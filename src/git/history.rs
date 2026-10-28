@@ -11,10 +11,59 @@ use serde::Serialize;
 use super::{PathIndex, Repo, git, run};
 use crate::model::{Category, Flags, NodeId, Tree};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Window {
+    All,
+    /// Seconds before the repository's newest commit.
+    Relative(i64),
+    /// `YYYY-MM-DD`.
+    Since(String),
+}
+
+impl Window {
+    /// `all`, `2y`, `18m`, `6w`, `90d`, or a `YYYY-MM-DD` date.
+    pub fn parse(s: &str) -> Result<Window, String> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("all") {
+            return Ok(Window::All);
+        }
+        let bytes = s.as_bytes();
+        if bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && s.replace('-', "").chars().all(|c| c.is_ascii_digit())
+        {
+            return Ok(Window::Since(s.to_string()));
+        }
+        let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+        let n: i64 = num
+            .parse()
+            .map_err(|_| format!("bad window {s:?}: use all, 2y, 18m, 6w, 90d or YYYY-MM-DD"))?;
+        let day = 86_400;
+        let secs = match unit {
+            "y" => n * 365 * day,
+            "m" => n * 30 * day,
+            "w" => n * 7 * day,
+            "d" => n * day,
+            _ => return Err(format!("bad window unit in {s:?}: use y, m, w or d")),
+        };
+        Ok(Window::Relative(secs))
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Window::All => "all history".into(),
+            Window::Relative(s) => format!("{} days before the newest commit", s / 86_400),
+            Window::Since(d) => format!("since {d}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// `git log --since` value, e.g. `2 years ago`. `None` = no time limit.
-    pub since: Option<String>,
+    /// History window. Relative windows are measured back from each repository's newest
+    /// commit, not from today, so an archived project still gets its history analysed.
+    pub window: Window,
     /// Safety cap on commits read per repository.
     pub max_commits: u32,
     /// Commits touching more files than this don't count as revisions.
@@ -31,7 +80,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            since: Some("2 years ago".into()),
+            window: Window::Relative(2 * 365 * 86_400),
             max_commits: 30_000,
             large_commit: 50,
             coupling_max_files: 30,
@@ -243,7 +292,23 @@ fn collect(repo: &Repo, opts: &Options) -> Result<RepoLog> {
         "--format=%x1e%H%x1f%ct%x1f%aN%x1f%aE",
     ]);
     c.arg(format!("--max-count={}", opts.max_commits));
-    if let Some(since) = &opts.since {
+    let since = match &opts.window {
+        Window::All => None,
+        Window::Since(d) => Some(d.clone()),
+        Window::Relative(secs) => {
+            let mut last = git(top);
+            last.args(["log", "-1", "--no-show-signature", "--format=%ct"]);
+            if let Some(prefix) = &repo.prefix {
+                last.arg("--").arg(prefix);
+            }
+            String::from_utf8_lossy(&run(last)?)
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .map(|newest| crate::util::date(newest - secs))
+        }
+    };
+    if let Some(since) = since {
         c.arg(format!("--since={since}"));
     }
     if let Some(prefix) = &repo.prefix {
@@ -753,6 +818,18 @@ mod tests {
         let g = [vec![1], vec![1], vec![1], vec![2]];
         let refs: Vec<&Vec<u32>> = g.iter().collect();
         assert_eq!(truck_factor(&refs), (1, vec![1]));
+    }
+
+    #[test]
+    fn windows() {
+        assert_eq!(Window::parse("all"), Ok(Window::All));
+        assert_eq!(Window::parse("2y"), Ok(Window::Relative(2 * 365 * 86_400)));
+        assert_eq!(Window::parse("90d"), Ok(Window::Relative(90 * 86_400)));
+        assert_eq!(
+            Window::parse("2024-01-31"),
+            Ok(Window::Since("2024-01-31".into()))
+        );
+        assert!(Window::parse("2 years ago").is_err());
     }
 
     #[test]

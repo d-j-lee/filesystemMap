@@ -190,7 +190,7 @@ pub struct PruneInfo {
 #[serde(rename_all = "camelCase")]
 pub struct OptionsSummary {
     pub git: bool,
-    pub since: Option<String>,
+    pub window: String,
     pub max_commits: u32,
     pub deps: bool,
     pub duplicates: bool,
@@ -293,7 +293,7 @@ impl<'a> Snapshot<'a> {
             generated_at: a.generated_at,
             options: OptionsSummary {
                 git: a.git_available,
-                since: o.history.since.clone(),
+                window: o.history.window.describe(),
                 max_commits: o.history.max_commits,
                 deps: o.deps,
                 duplicates: o.dupes.is_some(),

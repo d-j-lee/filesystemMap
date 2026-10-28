@@ -16,6 +16,7 @@ use globset::{Glob, GlobSetBuilder};
 
 use fsmap::analysis::{self, Analysis, AuthorMode, Progress};
 use fsmap::brief::{self, CodeOwners, Index};
+use fsmap::git::history::Window;
 use fsmap::insights::{self, Finding, Severity};
 use fsmap::report::{context, html, sarif, terminal};
 use fsmap::snapshot::{Parts, PruneInfo, Snapshot};
@@ -161,9 +162,9 @@ struct AnalyzeArgs {
     /// Skip duplicate-file detection.
     #[arg(long)]
     no_dupes: bool,
-    /// History window passed to `git log --since` (`all` for no limit).
-    #[arg(long, default_value = "2 years ago")]
-    since: String,
+    /// History window back from each repo's newest commit: `2y`, `18m`, `90d`, `all`, or a `YYYY-MM-DD` date.
+    #[arg(long, default_value = "2y", value_parser = parse_window)]
+    since: Window,
     /// Safety cap on commits read per repository.
     #[arg(long, default_value_t = 30_000)]
     git_max_commits: u32,
@@ -201,7 +202,7 @@ impl AnalyzeArgs {
             authors: self.authors,
             ..Default::default()
         };
-        o.history.since = (self.since != "all").then(|| self.since.clone());
+        o.history.window = self.since.clone();
         o.history.max_commits = self.git_max_commits;
         o.scan.cross_fs = self.cross_fs;
         o.content.max_file_size = self.max_file_mib * 1024 * 1024;
@@ -215,6 +216,10 @@ impl AnalyzeArgs {
         }
         Ok(o)
     }
+}
+
+fn parse_window(s: &str) -> Result<Window, String> {
+    Window::parse(s)
 }
 
 fn main() -> ExitCode {
