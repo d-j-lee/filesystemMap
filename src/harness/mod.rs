@@ -8,5 +8,6 @@
 pub mod hooks;
 pub mod integrity;
 pub mod proc;
+pub mod shell;
 pub mod state;
 pub mod verify;

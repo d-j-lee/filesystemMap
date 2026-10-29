@@ -110,6 +110,43 @@ fn blocked(v: &Value) -> bool {
     v["decision"] == "block"
 }
 
+fn push(d: &Path) -> Value {
+    hook(
+        d,
+        "pre-bash",
+        &json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}}),
+    )
+}
+
+/// `fsmap verify <d> <args>`: exit code and stdout followed by stderr.
+fn verify(d: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_fsmap"))
+        .arg("verify")
+        .arg(d)
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn host_triple() -> String {
+    let out = Command::new("rustc").arg("-vV").output().unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn post_edit_returns_compile_errors() {
     let repo = fixture();
@@ -235,7 +272,8 @@ fn cargo_config_that_weakens_the_gate_fails_it() {
         d,
         ".cargo/config.toml",
         "[build]\nrustflags = [\"--cap-lints\", \"allow\"]\n\
-         [target.x86_64-unknown-linux-gnu]\nrunner = \"true\"\n",
+         [target.x86_64-unknown-linux-gnu]\nrunner = \"true\"\n\
+         [alias]\nclippy = \"check\"\n",
     );
     write(d, ".git/info/exclude", "/.cargo\n");
     write(d, "src/lib.rs", FAILING_TEST);
@@ -243,10 +281,9 @@ fn cargo_config_that_weakens_the_gate_fails_it() {
     assert!(blocked(&v), "{v}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.contains("integrity"), "{reason}");
-    assert!(
-        reason.contains("cap-lints") && reason.contains("runner"),
-        "{reason}"
-    );
+    for kind in ["cap-lints", "runner", "alias"] {
+        assert!(reason.contains(kind), "{kind}: {reason}");
+    }
 }
 
 /// The same bypass through the environment: the variables are removed for the steps.
@@ -330,10 +367,12 @@ fn push_is_denied_while_the_gate_fails() {
     assert!(bash("git push origin main").is_null());
 }
 
-/// Review finding M7: a failure only in files this session never touched (here an
-/// unformatted file from before the session) is reported, not blocked on.
+/// Final review M1: the gate passes only when every step passes. A failure only in files
+/// this session did not change (here an unformatted file from before the session) blocks
+/// once, so Claude sees it, then lets the turn end with a report; the user is told the gate
+/// did NOT pass, and a push stays denied.
 #[test]
-fn pre_existing_failures_in_untouched_files_do_not_block() {
+fn failures_in_untouched_files_block_once_then_ask_for_a_report() {
     let repo = fixture();
     let d = repo.path();
     write(d, "src/lib.rs", &format!("mod other;\n{GOOD}"));
@@ -346,9 +385,244 @@ fn pre_existing_failures_in_untouched_files_do_not_block() {
         &format!("mod other;\n{}", GOOD.replace("a + b", "b + a")),
     );
     let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("src/other.rs (not changed in this session)"),
+        "{reason}"
+    );
+    let v = stop(d, true);
     assert!(!blocked(&v), "{v}");
     let msg = v["systemMessage"].as_str().unwrap();
-    assert!(msg.contains("src/other.rs (fmt)"), "{msg}");
+    assert!(msg.contains("gate NOT passed"), "{msg}");
+    assert_eq!(push(d)["hookSpecificOutput"]["permissionDecision"], "deny");
+}
+
+/// Final review M1(a): a change can break a file it never touched. Removing the only
+/// caller of a helper makes it dead code in the untouched file; that is not a pass.
+#[test]
+fn breaking_an_untouched_file_is_not_a_pass() {
+    let repo = fixture();
+    let d = repo.path();
+    write(
+        d,
+        "src/other.rs",
+        "pub(crate) fn one() -> u32 {\n    1\n}\n",
+    );
+    write(
+        d,
+        "src/lib.rs",
+        &format!(
+            "mod other;\n{}",
+            GOOD.replace("a + b", "a + b + other::one() - 1")
+        ),
+    );
+    commit(d, "A", "helper", T0 + 10);
+    start(d, "startup");
+    write(d, "src/lib.rs", &format!("mod other;\n{GOOD}"));
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    assert!(
+        v["reason"].as_str().unwrap().contains("src/other.rs"),
+        "{v}"
+    );
+}
+
+/// Final review M2: a session that starts on a broken commit changed nothing, so its turn
+/// may end, but pushing that commit is still gated.
+#[test]
+fn pushing_a_broken_commit_from_a_fresh_session_is_denied() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "A", "broken", T0 + 10);
+    start(d, "startup");
+    assert!(stop(d, false).is_null(), "the session changed nothing");
+    assert_eq!(push(d)["hookSpecificOutput"]["permissionDecision"], "deny");
+}
+
+/// Final review B2: when cargo cannot read the project, the gate cannot run, and that
+/// must not look like a pass.
+#[test]
+fn a_project_cargo_cannot_read_blocks_instead_of_passing() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    write(d, "Cargo.toml", &format!("{CARGO_TOML}this is not toml\n"));
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("cannot run"), "{v}");
+    assert_eq!(push(d)["hookSpecificOutput"]["permissionDecision"], "deny");
+}
+
+/// Final review B2: a malformed verify table used to drop every extra step silently in
+/// the hooks. It is an error for the hooks and the CLI alike.
+#[test]
+fn a_malformed_verify_table_is_an_error() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(
+        d,
+        "Cargo.toml",
+        &format!("{CARGO_TOML}\n[package.metadata.fsmap.verify]\nextra = [[\"false\"], []]\n"),
+    );
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("extra"), "{v}");
+    assert_eq!(verify(d, &[]).0, Some(2));
+    write(
+        d,
+        "Cargo.toml",
+        &format!("{CARGO_TOML}\n[package.metadata.fsmap.verify]\nextra = \"false\"\n"),
+    );
+    assert_eq!(verify(d, &[]).0, Some(2));
+}
+
+/// The fingerprint covers configuration git cannot see: a hidden cargo config added after
+/// a pass makes the gate run again (and its integrity step fail). The setting here breaks
+/// no other step, so the integrity failure is the only one, and it must keep all three
+/// strikes: a weakening setting is never "someone else's failure".
+#[test]
+fn a_hidden_config_added_after_a_pass_reruns_the_gate() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(!blocked(&stop(d, false)));
+    write(d, ".git/info/exclude", "/.cargo\n");
+    write(d, ".cargo/config.toml", "[env]\nINSTA_FORCE_PASS = \"1\"\n");
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("## integrity") && !reason.contains("## clippy"),
+        "{reason}"
+    );
+    assert!(
+        blocked(&stop(d, true)),
+        "integrity failures are not released early"
+    );
+}
+
+/// Final review: the end-to-end test of RUSTFLAGS did not prove that runners are removed.
+/// Here a runner that exits 0 would make a failing test pass.
+#[cfg(unix)]
+#[test]
+fn a_runner_from_the_environment_cannot_pass_failing_tests() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    let var = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        host_triple().to_uppercase().replace(['-', '.'], "_")
+    );
+    let v = hook_env(
+        d,
+        "stop",
+        &json!({"session_id": "s1", "stop_hook_active": false}),
+        &[(var.as_str(), "true")],
+    );
+    assert!(blocked(&v), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("adds"), "{v}");
+}
+
+/// Final review B1: rustup obeys a toolchain `path` as soon as cargo runs, so the check
+/// must come before the gate's first cargo call. The fake toolchain's cargo would leave a
+/// marker (with rustup installed; without it the file is ignored either way).
+#[cfg(unix)]
+#[test]
+fn a_toolchain_path_is_refused_before_any_cargo_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    let tc = tempfile::tempdir().unwrap();
+    let marker = tc.path().join("ran");
+    for tool in ["cargo", "rustc"] {
+        let bin = tc.path().join("bin").join(tool);
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    write(
+        d,
+        "rust-toolchain.toml",
+        &format!("[toolchain]\npath = \"{}\"\n", tc.path().display()),
+    );
+    write(d, ".git/info/exclude", "/rust-toolchain.toml\n");
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("toolchain"), "{v}");
+    assert!(!marker.exists(), "the repository's toolchain ran");
+}
+
+/// `fsmap verify` itself: steps, JSON report and exit codes (0 pass, 1 failure, 2 error).
+#[test]
+fn verify_cli_reports_steps_and_exit_codes() {
+    let repo = fixture();
+    let d = repo.path();
+    let (code, out) = verify(d, &["--json"]);
+    assert_eq!(code, Some(0), "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let names: Vec<&str> = v["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["integrity", "fmt", "clippy", "test"]);
+    write(d, "src/lib.rs", FAILING_TEST);
+    let (code, out) = verify(d, &["--json"]);
+    assert_eq!(code, Some(1));
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let test = &v["steps"][3];
+    assert_eq!(test["status"], "fail");
+    assert!(test["tail"].as_str().unwrap().contains("adds"), "{test}");
+    write(d, "src/lib.rs", GOOD);
+    write(
+        d,
+        "Cargo.toml",
+        &format!(
+            "{CARGO_TOML}\n[package.metadata.fsmap.verify]\nextra = [[\"definitely-not-a-command-xyz\"]]\n"
+        ),
+    );
+    let (code, out) = verify(d, &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("could not start"), "{out}");
+}
+
+/// A step that overruns the budget is killed, and the report says so.
+#[cfg(unix)]
+#[test]
+fn verify_cli_enforces_its_time_budget() {
+    let repo = fixture();
+    let d = repo.path();
+    write(
+        d,
+        "Cargo.toml",
+        &format!(
+            "{CARGO_TOML}\n[package.metadata.fsmap.verify]\nextra = [[\"sh\", \"-c\", \"sleep 60\"]]\n"
+        ),
+    );
+    let started = std::time::Instant::now();
+    let (code, out) = verify(d, &["--timeout", "25"]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(40),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        out.contains("killed after") || out.contains("time budget"),
+        "{out}"
+    );
 }
 
 /// Suppressions and removed assertions are shown to the user even when the gate passes.
@@ -390,27 +664,68 @@ fn concurrent_sessions_are_announced() {
     );
 }
 
-/// The shipped settings announce a missing fsmap instead of running without a gate.
+/// The shipped settings with fsmap missing, or too old to have `fsmap hook` (an older
+/// install answers with a usage error and exit 2, which Claude Code would treat as
+/// "block": final review M3). Session start says the harness is OFF; every other hook
+/// exits 0 and stays out of the way.
 #[cfg(unix)]
 #[test]
-fn template_session_start_is_loud_without_fsmap() {
+fn template_hooks_tolerate_a_missing_or_old_fsmap() {
+    use std::os::unix::fs::PermissionsExt;
     let settings: Value = serde_json::from_str(include_str!("../harness/settings.json")).unwrap();
-    let cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap();
-    let out = Command::new("sh")
-        .args(["-c", cmd])
-        .env("PATH", "/usr/bin:/bin")
-        .output()
-        .unwrap();
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(v["systemMessage"].as_str().unwrap().contains("OFF"));
-    assert!(
-        v["hookSpecificOutput"]["additionalContext"]
+    let command = |event: &str| {
+        settings["hooks"][event][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("cargo clippy")
-    );
+            .to_string()
+    };
+    let old = tempfile::tempdir().unwrap();
+    let fake = old.path().join("fsmap");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho \"error: unrecognized subcommand 'hook'\" >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for path in [
+        "/usr/bin:/bin".to_string(),
+        format!("{}:/usr/bin:/bin", old.path().display()),
+    ] {
+        let run = |cmd: &str| {
+            let mut child = Command::new("sh")
+                .args(["-c", cmd])
+                .env("PATH", &path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // A hook that exits without reading its input closes the pipe first.
+            let _ = child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"session_id":"s1","tool_input":{"command":"git push"}}"#);
+            child.wait_with_output().unwrap()
+        };
+        let out = run(&command("SessionStart"));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            v["systemMessage"].as_str().unwrap().contains("OFF"),
+            "{path}"
+        );
+        assert!(
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("cargo clippy")
+        );
+        for event in ["UserPromptSubmit", "PostToolUse", "PreToolUse", "Stop"] {
+            let out = run(&command(event));
+            assert!(out.status.success(), "{event} with PATH={path}");
+            assert!(out.stdout.is_empty(), "{event} with PATH={path}");
+        }
+    }
 }
 
 /// This repository uses the shipped templates verbatim (one source of truth).

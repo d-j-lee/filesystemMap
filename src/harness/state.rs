@@ -8,7 +8,6 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,10 +20,12 @@ const HASH_LIMIT: u64 = 4 << 20;
 const SESSION_TTL_SECS: i64 = 14 * 86_400;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Session {
-    /// Fingerprint and HEAD when the session started. Written once, on `startup`; never
+    /// Fingerprint when the session started. Written once, on `startup`; never
     /// overwritten by resume, compact or clear (review finding B3).
     pub start_fp: Option<String>,
+    /// HEAD when the session was first seen, for telling which files it changed.
     pub start_head: Option<String>,
     /// Consecutive blocking gate failures since the user last wrote.
     pub failures: u32,
@@ -35,12 +36,15 @@ pub struct Session {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct State {
     /// Fingerprint of the last tree the gate passed on.
     pub last_pass_fp: Option<String>,
     /// The last blocking failure: re-blocking on an unchanged tree needs no re-run.
     pub last_fail_fp: Option<String>,
     pub last_fail_reason: Option<String>,
+    /// Every failure of that run was in files the session did not change.
+    pub last_fail_untouched_only: bool,
     pub sessions: BTreeMap<String, Session>,
 }
 
@@ -89,27 +93,88 @@ pub fn dir(root: &Path) -> PathBuf {
 }
 
 pub fn load(root: &Path) -> State {
-    std::fs::read(dir(root).join("state.json"))
+    load_in(&dir(root))
+}
+
+fn load_in(d: &Path) -> State {
+    std::fs::read(d.join("state.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-/// Atomic replace (write a temp file, rename). Returns false when the state could not be
-/// written; callers say so instead of failing silently.
-pub fn save(root: &Path, state: &mut State) -> bool {
+/// Apply `f` to the freshest state and save it, under a short lock. Hooks run the gate on
+/// a snapshot, which can take minutes, and record the outcome through this, so a record
+/// another hook wrote meanwhile survives (final review M5). Returns false when the state
+/// could not be written; callers say so instead of failing silently.
+pub fn update(root: &Path, f: impl FnOnce(&mut State)) -> bool {
+    update_in(&dir(root), f)
+}
+
+fn update_in(d: &Path, f: impl FnOnce(&mut State)) -> bool {
+    if std::fs::create_dir_all(d).is_err() {
+        return false;
+    }
+    let _lock = Lock::acquire(&d.join("state.lock"));
+    let mut st = load_in(d);
+    f(&mut st);
+    save_in(d, &mut st)
+}
+
+/// An exclusive lock file. Held for a read-modify-write only, so a hook never waits
+/// long; one left behind by a crashed hook goes stale after 30 s, and after 5 s of
+/// waiting the update proceeds unlocked rather than hang the hook.
+struct Lock(Option<PathBuf>);
+
+impl Lock {
+    fn acquire(path: &Path) -> Lock {
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .is_ok()
+            {
+                return Lock(Some(path.to_path_buf()));
+            }
+            let stale = std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(30));
+            if stale {
+                let _ = std::fs::remove_file(path);
+                continue;
+            }
+            if std::time::Instant::now() >= give_up {
+                return Lock(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Atomic replace (write a temp file, rename).
+fn save_in(d: &Path, state: &mut State) -> bool {
     let now = now();
     state
         .sessions
         .retain(|_, s| now - s.last_seen < SESSION_TTL_SECS);
-    let d = dir(root);
-    if std::fs::create_dir_all(&d).is_err() {
-        return false;
-    }
     let Ok(json) = serde_json::to_vec_pretty(state) else {
         return false;
     };
-    let tmp = d.join(format!("state.json.{}.tmp", std::process::id()));
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = d.join(format!("state.json.{}.{n}.tmp", std::process::id()));
     std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, d.join("state.json")).is_ok()
 }
 
@@ -168,7 +233,10 @@ pub fn fingerprint(root: &Path, trust: &[String]) -> Option<String> {
             h.update(format!("{name}={v}\n").as_bytes());
         }
     }
-    if let Ok(o) = Command::new("rustc").arg("-vV").current_dir(root).output() {
+    if let Ok(o) = super::verify::clean_command(root, "rustc")
+        .arg("-vV")
+        .output()
+    {
         h.update(&o.stdout);
     }
     h.update(env!("CARGO_PKG_VERSION").as_bytes());
@@ -312,6 +380,32 @@ fn hash_file(h: &mut xxhash_rust::xxh3::Xxh3, path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Final review M5: hooks of two sessions updating at once must not drop each other's
+    /// records.
+    #[test]
+    fn concurrent_updates_keep_every_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().to_path_buf();
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let d = d.clone();
+                std::thread::spawn(move || {
+                    for i in 0..15 {
+                        update_in(&d, |st| {
+                            st.session(&format!("s{t}-{i}")).last_seen = now();
+                        });
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let st: State =
+            serde_json::from_slice(&std::fs::read(d.join("state.json")).unwrap()).unwrap();
+        assert_eq!(st.sessions.len(), 8 * 15);
+    }
 
     #[test]
     fn porcelain_v2_paths() {

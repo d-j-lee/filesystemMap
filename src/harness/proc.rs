@@ -1,12 +1,17 @@
 //! Run a tool with a deadline and bounded output. On expiry the whole process tree is
-//! killed, so an orphaned `cargo` cannot keep holding the build directory lock.
+//! killed, so an orphaned `cargo` cannot keep holding the build directory lock. A
+//! background process that outlives the tool and keeps its output open cannot hold the
+//! caller either: the output readers get a short grace period and are then abandoned.
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Bytes of output kept per stream (the tail; earlier output is dropped).
 const KEEP: usize = 256 * 1024;
+/// How long to wait for the output streams to close after the tool has ended.
+const READER_GRACE: Duration = Duration::from_secs(2);
 
 pub struct Outcome {
     /// Exit code; `None` when killed by a signal or on timeout.
@@ -47,12 +52,12 @@ pub fn run(mut cmd: Command, deadline: Duration) -> Outcome {
             };
         }
     };
+    let (tx, rx) = mpsc::channel();
     let out = child.stdout.take();
     let err = child.stderr.take();
-    let readers = [
-        std::thread::spawn(move || read_tail(out)),
-        std::thread::spawn(move || read_tail(err)),
-    ];
+    let tx_err = tx.clone();
+    std::thread::spawn(move || tx.send((0, read_tail(out))));
+    std::thread::spawn(move || tx_err.send((1, read_tail(err))));
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
@@ -66,7 +71,27 @@ pub fn run(mut cmd: Command, deadline: Duration) -> Outcome {
             Err(_) => break None,
         }
     };
-    let output = readers.map(|r| r.join().unwrap_or_default()).concat();
+    // Background processes the tool left in its group would keep the pipes open.
+    #[cfg(unix)]
+    kill_group(child.id());
+    let mut parts = [String::new(), String::new()];
+    let mut pending = 2;
+    let until = Instant::now() + READER_GRACE;
+    while pending > 0 {
+        match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            Ok((i, text)) => {
+                parts[i] = text;
+                pending -= 1;
+            }
+            // A process outside the group (its own session) still holds a pipe: give up
+            // on the rest of the output rather than wait for it.
+            Err(_) => break,
+        }
+    }
+    let mut output = parts.concat();
+    if pending > 0 {
+        output.push_str("\n[fsmap: output cut, a background process kept it open]\n");
+    }
     Outcome {
         code: status.and_then(|s| s.code()),
         timed_out,
@@ -98,26 +123,28 @@ fn read_tail(stream: Option<impl Read>) -> String {
 }
 
 fn kill_tree(child: &mut Child) {
-    let id = child.id().to_string();
     #[cfg(unix)]
-    {
-        // The child leads its own process group (process_group(0) above). `--` matters:
-        // procps `kill -KILL -<pgid>` reads the group id as an option and kills nothing.
-        let _ = Command::new("kill")
-            .args(["-s", "KILL", "--", &format!("-{id}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+    kill_group(child.id());
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &id])
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
     let _ = child.kill();
+}
+
+/// Kill every process in the group the child leads (process_group(0) above). `--`
+/// matters: procps `kill -KILL -<pgid>` reads the group id as an option and kills nothing.
+#[cfg(unix)]
+fn kill_group(id: u32) {
+    let _ = Command::new("kill")
+        .args(["-s", "KILL", "--", &format!("-{id}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 #[cfg(all(test, unix))]
@@ -138,6 +165,56 @@ mod tests {
         assert!(o.timed_out && !o.success());
         std::thread::sleep(Duration::from_millis(2500));
         assert!(!file.exists(), "grandchild survived the kill");
+    }
+
+    /// Review finding (final review M4): a background grandchild that keeps the output
+    /// pipe open must not hold the caller past the deadline.
+    #[test]
+    fn a_background_grandchild_does_not_extend_the_deadline() {
+        let started = Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 25 & exit 0"]);
+        let o = run(cmd, Duration::from_secs(10));
+        assert_eq!(o.code, Some(0));
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let started = Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 25 & sleep 30"]);
+        let o = run(cmd, Duration::from_secs(1));
+        assert!(o.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A grandchild in its own session escapes the process group; the caller still
+    /// returns shortly after the deadline instead of waiting for its pipe.
+    #[test]
+    fn an_escaped_grandchild_does_not_extend_the_deadline() {
+        if Command::new("sh")
+            .args(["-c", "command -v setsid"])
+            .output()
+            .map_or(true, |o| !o.status.success())
+        {
+            return; // no setsid (macOS): nothing to check
+        }
+        let started = Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "setsid sleep 25 & sleep 30"]);
+        let o = run(cmd, Duration::from_secs(1));
+        assert!(o.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

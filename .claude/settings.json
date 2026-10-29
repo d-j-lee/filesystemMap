@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "command -v fsmap >/dev/null 2>&1 && exec fsmap hook session-start; printf '%s\\n' '{\"systemMessage\":\"[harness] fsmap is not installed: the Rust verification hooks are OFF in this session. Install: cargo install --locked --git https://github.com/d-j-lee/filesystemMap fsmap\",\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"[harness] OFF: fsmap is not installed, so nothing checks your edits or gates the end of a turn. Before calling a change done, run cargo fmt --check, cargo clippy --all-targets -- -D warnings and cargo test yourself, and tell the user that the harness is not active.\"}}'",
+            "command": "fsmap hook session-start 2>/dev/null || printf '%s\\n' '{\"systemMessage\": \"[harness] fsmap is not installed, or too old to have `fsmap hook`: the Rust verification hooks are OFF in this session. Install: cargo install --locked --git https://github.com/d-j-lee/filesystemMap fsmap\", \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": \"[harness] OFF: fsmap is missing or too old, so nothing checks your edits or gates the end of a turn. Before calling a change done, run cargo fmt --check, cargo clippy --all-targets -- -D warnings and cargo test yourself, and tell the user that the harness is not active.\"}}'",
             "timeout": 120
           }
         ]
@@ -40,7 +40,11 @@
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "fsmap", "args": ["hook", "prompt"], "timeout": 30 }
+          {
+            "type": "command",
+            "command": "fsmap hook prompt 2>/dev/null || true",
+            "timeout": 30
+          }
         ]
       }
     ],
@@ -48,7 +52,11 @@
       {
         "matcher": "Edit|Write",
         "hooks": [
-          { "type": "command", "command": "fsmap", "args": ["hook", "post-edit"], "timeout": 120 }
+          {
+            "type": "command",
+            "command": "fsmap hook post-edit 2>/dev/null || true",
+            "timeout": 120
+          }
         ]
       }
     ],
@@ -56,14 +64,22 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "fsmap", "args": ["hook", "pre-bash"], "timeout": 900 }
+          {
+            "type": "command",
+            "command": "fsmap hook pre-bash 2>/dev/null || true",
+            "timeout": 900
+          }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "fsmap", "args": ["hook", "stop"], "timeout": 900 }
+          {
+            "type": "command",
+            "command": "fsmap hook stop 2>/dev/null || true",
+            "timeout": 900
+          }
         ]
       }
     ]

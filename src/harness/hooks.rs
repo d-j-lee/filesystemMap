@@ -1,7 +1,7 @@
 //! Claude Code hooks (decision D-15). Each reads the hook's JSON from stdin and prints at
-//! most one JSON object; the exit code is always 0. Any problem that keeps a hook from
-//! doing its job becomes a `systemMessage` the user sees: the gate never fails open
-//! silently (review finding M3).
+//! most one JSON object; the exit code is always 0. A problem that keeps a hook from doing
+//! its job becomes a `systemMessage` the user sees, a panic included; when the gate cannot
+//! run, the stop is blocked and a push is denied (review findings M3, final review B2).
 //!
 //! | Hook | Event | What it does |
 //! |---|---|---|
@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use super::verify::{self, Config, Mode, Report};
-use super::{proc, state};
+use super::{proc, shell, state};
 use crate::brief;
 
 /// Budget for the stop and pre-push gates; the settings give the hook 900 s.
@@ -27,6 +27,11 @@ const GATE_BUDGET: Duration = Duration::from_secs(600);
 const CHECK_BUDGET: Duration = Duration::from_secs(60);
 /// Consecutive blocking failures before the gate lets go and asks for a report.
 const MAX_STRIKES: u32 = 3;
+/// The same when every failure is in files the session did not change: one block, so
+/// Claude sees the failures, then a report instead of edits to unrelated files.
+const UNTOUCHED_STRIKES: u32 = 2;
+/// How long a post-edit check waits for one already running in the same worktree.
+const CHECK_WAIT: Duration = Duration::from_secs(30);
 /// Background task types that edit the tree; the gate waits for them.
 const AGENT_TASKS: &[&str] = &["subagent", "workflow", "teammate", "cloud session"];
 
@@ -106,15 +111,30 @@ impl Out {
 /// Run one hook on its stdin; returns what to print (nothing for "no opinion").
 pub fn run(event: Event, stdin: &str) -> Option<String> {
     let input: Value = serde_json::from_str(stdin).unwrap_or(Value::Null);
-    let out = match handle(event, &input) {
-        Ok(out) => out,
-        Err(e) => Out {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(event, &input)));
+    let out = match result {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => Out {
             system: vec![format!(
                 "[harness] {} hook did not run: {e:#}",
                 event.name()
             )],
             ..Out::default()
         },
+        Err(panic) => {
+            let what = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            Out {
+                system: vec![format!(
+                    "[harness] {} hook crashed ({what}); its check did not run",
+                    event.name()
+                )],
+                ..Out::default()
+            }
+        }
     };
     out.render(event)
 }
@@ -147,11 +167,30 @@ fn session_id(input: &Value) -> String {
         .to_string()
 }
 
-/// The Cargo workspace for the project, with its verify configuration.
-fn workspace(project: &Path) -> Option<(PathBuf, Config)> {
-    let ws = verify::workspace_root(project).ok()?;
-    let cfg = verify::config(&ws).unwrap_or_default();
-    Some((ws, cfg))
+/// The project as the gate sees it.
+enum Ws {
+    /// No Cargo.toml at or above the project: not a Rust project, nothing to gate.
+    NotRust,
+    Ready(PathBuf, Config),
+    /// There is a Cargo.toml, but cargo cannot locate the workspace, the toolchain settings
+    /// are unsafe, or the verify configuration is malformed: the gate cannot run, which
+    /// must not look like a pass (final review B2).
+    Broken(String),
+}
+
+fn workspace(project: &Path) -> Ws {
+    match verify::workspace_root(project) {
+        Ok(ws) => match verify::config(&ws) {
+            Ok(cfg) => Ws::Ready(ws, cfg),
+            Err(e) => Ws::Broken(format!("{e:#}")),
+        },
+        Err(e) if verify::nearest_manifest(project).is_some() => Ws::Broken(format!("{e:#}")),
+        Err(_) => Ws::NotRust,
+    }
+}
+
+fn broken_message(e: &str) -> String {
+    format!("[harness] the gate cannot run, so nothing is verified until this is fixed: {e}")
 }
 
 // ---------------------------------------------------------------- session-start
@@ -160,26 +199,42 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
     let mut out = Out::default();
     let source = input["source"].as_str().unwrap_or("startup");
     let sid = session_id(input);
-    let Some((ws, cfg)) = workspace(project) else {
-        out.system.push(format!(
-            "[harness] no Cargo workspace at {}: the Rust gate is inactive in this session",
-            project.display()
-        ));
-        return Ok(out);
+    let (ws, cfg) = match workspace(project) {
+        Ws::Ready(ws, cfg) => (ws, cfg),
+        Ws::NotRust => {
+            out.system.push(format!(
+                "[harness] no Cargo workspace at {}: the Rust gate is inactive in this session",
+                project.display()
+            ));
+            return Ok(out);
+        }
+        Ws::Broken(e) => {
+            let msg = broken_message(&e);
+            out.system.push(msg.clone());
+            out.context.push(msg);
+            return Ok(out);
+        }
     };
-    let mut st = state::load(&ws);
+    let snapshot = state::load(&ws);
     let fp = state::fingerprint(&ws, &cfg.trust);
+    let head = state::head(&ws);
     let now = state::now();
-    let others = st.live_others(&sid, now);
-    {
+    let others = snapshot.live_others(&sid, now);
+    let saved = state::update(&ws, |st| {
         let s = st.session(&sid);
         s.last_seen = now;
+        // The baseline that lets a session which changed nothing finish: only on startup,
+        // never re-recorded by resume, compact or clear (review finding B3).
         if source == "startup" && s.start_fp.is_none() {
             s.start_fp.clone_from(&fp);
-            s.start_head = state::head(&ws);
         }
-    }
-    if fp.is_some() && fp != st.last_pass_fp && source != "startup" {
+        // Which files the session changed is judged from here; recorded the first time the
+        // session is seen, whatever the source (final review M1).
+        if s.start_head.is_none() {
+            s.start_head.clone_from(&head);
+        }
+    });
+    if fp.is_some() && fp != snapshot.last_pass_fp && source != "startup" {
         out.context.push(
             "[harness] the working tree has changes the gate has not passed yet; it runs when \
              you finish this turn."
@@ -195,7 +250,7 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
         out.system.push(msg.clone());
         out.context.push(msg);
     }
-    if !state::save(&ws, &mut st) {
+    if !saved {
         out.system.push(
             "[harness] cannot write the harness state: the gate will run on every stop".into(),
         );
@@ -205,7 +260,7 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
     if !findings.is_empty() {
         let list: Vec<String> = findings
             .iter()
-            .map(|f| format!("{}:{} {}", f.file, f.line, f.kind))
+            .map(|f| format!("{} ({})", f.file, f.kind))
             .collect();
         out.system.push(format!(
             "[harness] settings that weaken the gate (it will fail until they are removed or \
@@ -239,8 +294,8 @@ fn briefing(ws: &Path, cfg: &Config) -> String {
         }
     )];
     let version = |prog: &str| {
-        let mut c = std::process::Command::new(prog);
-        c.arg("-V").current_dir(ws);
+        let mut c = verify::clean_command(ws, prog);
+        c.arg("-V");
         let o = proc::run(c, Duration::from_secs(20));
         o.success().then(|| o.output.trim().to_string())
     };
@@ -268,9 +323,8 @@ fn briefing(ws: &Path, cfg: &Config) -> String {
 fn dependency_sources(ws: &Path) -> Vec<String> {
     // The whole graph is needed (it is larger than proc::run keeps), and --offline cannot
     // hang on the network, so this reads the full output directly.
-    let Ok(o) = std::process::Command::new("cargo")
+    let Ok(o) = verify::clean_command(ws, "cargo")
         .args(["metadata", "--format-version", "1", "--offline"])
-        .current_dir(ws)
         .stderr(std::process::Stdio::null())
         .output()
     else {
@@ -346,14 +400,25 @@ fn post_edit(project: &Path, input: &Value) -> Result<Out> {
     if !is_rust {
         return Ok(out);
     }
-    let Some((ws, cfg)) = workspace(project) else {
-        return Ok(out);
+    let (ws, cfg) = match workspace(project) {
+        Ws::Ready(ws, cfg) => (ws, cfg),
+        Ws::NotRust => return Ok(out),
+        Ws::Broken(e) => {
+            out.context.push(broken_message(&e));
+            return Ok(out);
+        }
     };
     let Some(manifest) = package_manifest(&ws, &path) else {
         return Ok(out);
     };
-    let Some(_lock) = CheckLock::acquire(&ws) else {
-        // A check is already running; its result covers this edit too.
+    let Some(_lock) = CheckLock::acquire(&ws, CHECK_WAIT) else {
+        // Another edit's check has held the lock for the whole wait: say so instead of
+        // pretending this edit was checked (final review).
+        out.context.push(
+            "[harness] cargo check was busy with another edit; this edit's errors will show \
+             at the next check or when the turn ends."
+                .into(),
+        );
         return Ok(out);
     };
     let mut c = verify::step_command(&ws, "cargo", &cfg);
@@ -460,28 +525,38 @@ fn error_lines(output: &str, ws: &Path) -> Vec<String> {
         .collect()
 }
 
-/// At most one post-edit check per worktree at a time (parallel edits queue on cargo's
-/// build lock otherwise). Stale after two minutes.
+/// At most one post-edit check per worktree at a time (parallel edits would queue on
+/// cargo's build lock anyway). A later edit waits for the running check, then checks the
+/// tree as it is by then. Stale after two minutes.
 struct CheckLock(PathBuf);
 
 impl CheckLock {
-    fn acquire(ws: &Path) -> Option<CheckLock> {
+    fn acquire(ws: &Path, wait: Duration) -> Option<CheckLock> {
         let path = state::dir(ws).join("check.lock");
-        if let Ok(meta) = std::fs::metadata(&path)
-            && meta
-                .modified()
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .is_some_and(|age| age > Duration::from_secs(120))
-        {
-            let _ = std::fs::remove_file(&path);
+        let give_up = std::time::Instant::now() + wait;
+        loop {
+            if let Ok(meta) = std::fs::metadata(&path)
+                && meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(120))
+            {
+                let _ = std::fs::remove_file(&path);
+            }
+            if std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .is_ok()
+            {
+                return Some(CheckLock(path));
+            }
+            if std::time::Instant::now() >= give_up {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .ok()
-            .map(|_| CheckLock(path))
     }
 }
 
@@ -493,70 +568,115 @@ impl Drop for CheckLock {
 
 // ---------------------------------------------------------------- stop / pre-bash
 
-/// The result of running the gate for one hook call.
+/// The result of running the gate for one hook call. Computed on a snapshot of the state
+/// and recorded afterwards with `state::update`.
 enum Gate {
-    /// Nothing to do: the tree is unchanged since the session started or last passed.
+    /// Nothing to do: the tree already passed, or (for a stop) the session changed nothing.
     Unchanged,
-    /// Passed, with notes for the user (pre-existing failures, added suppressions).
-    Pass(Vec<String>),
-    /// New failures: the reason to give Claude.
-    Fail(String),
+    /// Every step passed; notes for the user (added suppressions).
+    Pass { fp: String, notes: Vec<String> },
+    /// Something failed. `untouched_only`: every failure is in files the session did not
+    /// change, so after one block Claude reports instead of editing unrelated files.
+    Fail {
+        fp: String,
+        reason: String,
+        untouched_only: bool,
+    },
 }
 
-fn gate(ws: &Path, cfg: &Config, st: &mut state::State, sid: &str) -> Result<Gate> {
+/// Run the gate unless the tree's fingerprint already has a verdict. The gate passes only
+/// when every step passes: failures in files the session did not change still fail it,
+/// because a change can break code it never touched (final review M1). For a push
+/// (`publishing`) only a recorded pass counts, not "unchanged since the session started"
+/// (final review M2).
+fn gate(
+    ws: &Path,
+    cfg: &Config,
+    snapshot: &state::State,
+    me: &state::Session,
+    publishing: bool,
+) -> Result<Gate> {
     let fp = state::fingerprint(ws, &cfg.trust)
         .context("could not read the git status of the working tree")?;
-    let session = st.session(sid).clone();
-    if st.last_pass_fp.as_deref() == Some(fp.as_str())
-        || session.start_fp.as_deref() == Some(fp.as_str())
+    if snapshot.last_pass_fp.as_deref() == Some(fp.as_str())
+        || (!publishing && me.start_fp.as_deref() == Some(fp.as_str()))
     {
         return Ok(Gate::Unchanged);
     }
-    if st.last_fail_fp.as_deref() == Some(fp.as_str())
-        && let Some(reason) = st.last_fail_reason.clone()
+    if snapshot.last_fail_fp.as_deref() == Some(fp.as_str())
+        && let Some(reason) = &snapshot.last_fail_reason
     {
-        return Ok(Gate::Fail(reason));
+        return Ok(Gate::Fail {
+            fp,
+            reason: reason.clone(),
+            untouched_only: snapshot.last_fail_untouched_only,
+        });
     }
     let exe = std::env::current_exe().context("locating the fsmap binary")?;
     let steps = verify::plan(ws, Mode::Quick, &exe, cfg);
     let report = verify::run(ws, Mode::Quick, &steps, cfg, GATE_BUDGET, |_| {});
-    let touched = touched_files(ws, session.start_head.as_deref());
-    let (blocking, preexisting) = split_failures(&report, &touched);
-    if blocking.is_empty() {
-        st.last_pass_fp = Some(fp);
-        st.last_fail_fp = None;
-        st.last_fail_reason = None;
-        let mut notes = Vec::new();
-        if !preexisting.is_empty() {
-            notes.push(format!(
-                "[harness] gate passed for this session's changes; still failing in files it \
-                 did not touch: {}",
-                preexisting.join(", ")
-            ));
-        }
-        if let Some(s) = suppression_summary(ws, session.start_head.as_deref()) {
-            notes.push(s);
-        }
-        return Ok(Gate::Pass(notes));
+    let touched = touched_files(ws, me.start_head.as_deref());
+    if report.passed() {
+        let notes = suppression_summary(ws, me.start_head.as_deref())
+            .into_iter()
+            .collect();
+        return Ok(Gate::Pass { fp, notes });
     }
-    let reason = failure_reason(&report, &blocking);
-    st.last_fail_fp = Some(fp);
-    st.last_fail_reason = Some(reason.clone());
-    Ok(Gate::Fail(reason))
+    // Integrity and unattributable failures (tests, extra steps) never count as someone
+    // else's.
+    let untouched_only = report.failures().all(|f| {
+        f.name != "integrity"
+            && !f.files.is_empty()
+            && f.files.iter().all(|file| !touched.contains(file))
+    });
+    Ok(Gate::Fail {
+        fp,
+        reason: failure_reason(&report, &touched),
+        untouched_only,
+    })
 }
 
 fn stop(project: &Path, input: &Value) -> Result<Out> {
     let mut out = Out::default();
     let sid = session_id(input);
-    let Some((ws, cfg)) = workspace(project) else {
-        return Ok(out);
-    };
-    let mut st = state::load(&ws);
     let now = state::now();
-    st.session(&sid).last_seen = now;
     let active = input["stop_hook_active"].as_bool().unwrap_or(false);
-    if active && st.session(&sid).released {
-        state::save(&ws, &mut st);
+    let (ws, cfg) = match workspace(project) {
+        Ws::Ready(ws, cfg) => (ws, cfg),
+        Ws::NotRust => return Ok(out),
+        Ws::Broken(e) => {
+            // The gate cannot run: block like a failure, with the same three strikes.
+            let reason = broken_message(&e);
+            let mut released = false;
+            let mut failures = 0;
+            state::update(project, |st| {
+                let s = st.session(&sid);
+                s.last_seen = now;
+                released = active && s.released;
+                if !released {
+                    s.failures += 1;
+                    failures = s.failures;
+                    s.released = failures >= MAX_STRIKES;
+                }
+            });
+            if released {
+                return Ok(out);
+            }
+            if failures >= MAX_STRIKES {
+                out.context.push(release_text(failures, &reason));
+                out.system.push(format!(
+                    "[harness] gate NOT run after {failures} attempts: {e}"
+                ));
+            } else {
+                out.block = Some(reason);
+            }
+            return Ok(out);
+        }
+    };
+    let snapshot = state::load(&ws);
+    let me = snapshot.sessions.get(&sid).cloned().unwrap_or_default();
+    if active && me.released {
+        touch(&ws, &sid, now);
         return Ok(out);
     }
     let agents: Vec<&str> = input["background_tasks"]
@@ -575,45 +695,75 @@ fn stop(project: &Path, input: &Value) -> Result<Out> {
             agents.join(", ")
         ));
         log_gate(&ws, &sid, "skip-background", 0);
-        state::save(&ws, &mut st);
+        touch(&ws, &sid, now);
         return Ok(out);
     }
     let started = std::time::Instant::now();
-    let result = gate(&ws, &cfg, &mut st, &sid)?;
+    let verdict = gate(&ws, &cfg, &snapshot, &me, false)?;
     let ms = started.elapsed().as_millis() as u64;
-    match result {
-        Gate::Unchanged => log_gate(&ws, &sid, "unchanged", ms),
-        Gate::Pass(notes) => {
-            let s = st.session(&sid);
-            s.failures = 0;
-            s.released = false;
+    let saved = match verdict {
+        Gate::Unchanged => {
+            log_gate(&ws, &sid, "unchanged", ms);
+            touch(&ws, &sid, now)
+        }
+        Gate::Pass { fp, notes } => {
             out.system.extend(notes);
             log_gate(&ws, &sid, "pass", ms);
+            state::update(&ws, |st| {
+                record_pass(st, fp);
+                let s = st.session(&sid);
+                s.failures = 0;
+                s.released = false;
+                s.last_seen = now;
+            })
         }
-        Gate::Fail(reason) => {
-            let s = st.session(&sid);
-            s.failures += 1;
-            if s.failures >= MAX_STRIKES {
-                s.released = true;
-                out.context.push(format!(
-                    "[harness] the gate failed {} times in a row. Stop trying to fix it now. \
-                     Tell the user exactly what fails, what you tried, and what you think \
-                     the cause is.\n\n{reason}",
-                    s.failures
-                ));
-                out.system.push(format!(
-                    "[harness] gate still failing after {} attempts: Claude was asked to stop \
-                     and report",
-                    s.failures
-                ));
+        Gate::Fail {
+            fp,
+            reason,
+            untouched_only,
+        } => {
+            let limit = if untouched_only {
+                UNTOUCHED_STRIKES
+            } else {
+                MAX_STRIKES
+            };
+            let mut failures = 0;
+            let saved = state::update(&ws, |st| {
+                record_fail(st, fp, &reason, untouched_only);
+                let s = st.session(&sid);
+                s.last_seen = now;
+                s.failures += 1;
+                failures = s.failures;
+                s.released = failures >= limit;
+            });
+            if failures >= limit {
+                if untouched_only {
+                    out.context.push(format!(
+                        "[harness] the gate still fails, only in files this session did not \
+                         change. Do not edit unrelated files to get green. Tell the user what \
+                         fails and whether your change could have caused it.\n\n{reason}"
+                    ));
+                    out.system.push(
+                        "[harness] gate NOT passed: failures remain in files this session did \
+                         not change; Claude was asked to report them (a push stays blocked)"
+                            .into(),
+                    );
+                } else {
+                    out.context.push(release_text(failures, &reason));
+                    out.system.push(format!(
+                        "[harness] gate still failing after {failures} attempts: Claude was \
+                         asked to stop and report"
+                    ));
+                }
                 log_gate(&ws, &sid, "released", ms);
             } else {
                 out.block = Some(reason);
                 log_gate(&ws, &sid, "block", ms);
             }
+            saved
         }
-    }
-    if !state::save(&ws, &mut st) {
+    };
+    if !saved {
         out.system.push(
             "[harness] cannot write the harness state: the gate will run on every stop".into(),
         );
@@ -621,63 +771,98 @@ fn stop(project: &Path, input: &Value) -> Result<Out> {
     Ok(out)
 }
 
+fn release_text(failures: u32, reason: &str) -> String {
+    format!(
+        "[harness] the gate failed {failures} times in a row. Stop trying to fix it now. Tell \
+         the user exactly what fails, what you tried, and what you think the cause is.\n\n\
+         {reason}"
+    )
+}
+
+fn record_pass(st: &mut state::State, fp: String) {
+    st.last_pass_fp = Some(fp);
+    st.last_fail_fp = None;
+    st.last_fail_reason = None;
+    st.last_fail_untouched_only = false;
+}
+
+fn record_fail(st: &mut state::State, fp: String, reason: &str, untouched_only: bool) {
+    st.last_fail_fp = Some(fp);
+    st.last_fail_reason = Some(reason.to_string());
+    st.last_fail_untouched_only = untouched_only;
+}
+
+/// Note that the session was active; returns whether the state could be written.
+fn touch(ws: &Path, sid: &str, now: i64) -> bool {
+    state::update(ws, |st| st.session(sid).last_seen = now)
+}
+
 fn pre_bash(project: &Path, input: &Value) -> Result<Out> {
     let mut out = Out::default();
     let Some(cmd) = input["tool_input"]["command"].as_str() else {
         return Ok(out);
     };
-    if !publishes(cmd) {
+    if !shell::publishes(cmd) {
         return Ok(out);
     }
-    let Some((ws, cfg)) = workspace(project) else {
-        return Ok(out);
+    let deny = |why: String| Out {
+        deny: Some(format!(
+            "fsmap verify must pass before this is pushed or opened as a PR.\n\n{why}"
+        )),
+        ..Out::default()
+    };
+    let (ws, cfg) = match workspace(project) {
+        Ws::Ready(ws, cfg) => (ws, cfg),
+        Ws::NotRust => return Ok(out),
+        Ws::Broken(e) => return Ok(deny(broken_message(&e))),
     };
     let sid = session_id(input);
-    let mut st = state::load(&ws);
+    let snapshot = state::load(&ws);
+    let me = snapshot.sessions.get(&sid).cloned().unwrap_or_default();
     let started = std::time::Instant::now();
-    let result = gate(&ws, &cfg, &mut st, &sid)?;
+    // Publishing is the irreversible step: a gate that cannot run denies it.
+    let verdict = match gate(&ws, &cfg, &snapshot, &me, true) {
+        Ok(v) => v,
+        Err(e) => {
+            log_gate(&ws, &sid, "push-error", 0);
+            return Ok(deny(format!("[harness] the gate could not run: {e:#}")));
+        }
+    };
     let ms = started.elapsed().as_millis() as u64;
-    match result {
-        Gate::Unchanged | Gate::Pass(_) => log_gate(&ws, &sid, "push-pass", ms),
-        Gate::Fail(reason) => {
-            out.deny = Some(format!(
-                "fsmap verify must pass before this is pushed or opened as a PR.\n\n{reason}"
-            ));
+    match verdict {
+        Gate::Unchanged => log_gate(&ws, &sid, "push-pass", ms),
+        Gate::Pass { fp, .. } => {
+            log_gate(&ws, &sid, "push-pass", ms);
+            state::update(&ws, |st| record_pass(st, fp));
+        }
+        Gate::Fail {
+            fp,
+            reason,
+            untouched_only,
+        } => {
             log_gate(&ws, &sid, "push-block", ms);
+            state::update(&ws, |st| record_fail(st, fp, &reason, untouched_only));
+            out = deny(reason);
         }
     }
-    state::save(&ws, &mut st);
     Ok(out)
 }
 
-/// Commands that publish work: `git push`, `gh pr create|merge`.
-fn publishes(cmd: &str) -> bool {
-    cmd.split(['\n', ';', '&', '|']).any(|part| {
-        let words: Vec<&str> = part.split_whitespace().collect();
-        let git_push = words
-            .iter()
-            .position(|w| *w == "git" || w.ends_with("/git"))
-            .is_some_and(|i| words[i + 1..].contains(&"push"));
-        let gh_pr = words.windows(3).any(|w| {
-            (w[0] == "gh" || w[0].ends_with("/gh"))
-                && w[1] == "pr"
-                && (w[2] == "create" || w[2] == "merge")
-        });
-        git_push || gh_pr
-    })
-}
-
 fn prompt(project: &Path, input: &Value) -> Result<Out> {
-    let Some((ws, _)) = workspace(project) else {
+    let Ws::Ready(ws, _) = workspace(project) else {
+        // A broken project keeps its strikes in the project's state directory.
+        state::update(project, |st| reset(st, &session_id(input)));
         return Ok(Out::default());
     };
-    let mut st = state::load(&ws);
-    let s = st.session(&session_id(input));
+    state::update(&ws, |st| reset(st, &session_id(input)));
+    Ok(Out::default())
+}
+
+fn reset(st: &mut state::State, sid: &str) {
+    let s = st.session(sid);
     s.failures = 0;
     s.released = false;
     s.last_seen = state::now();
-    state::save(&ws, &mut st);
-    Ok(Out::default())
 }
 
 fn log_gate(ws: &Path, sid: &str, result: &str, ms: u64) {
@@ -709,38 +894,34 @@ fn touched_files(ws: &Path, start_head: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Failing steps that block (integrity, unattributable, or pointing at a touched file) and the files
-/// of failures that only concern untouched files (pre-existing, review finding M7).
-fn split_failures<'a>(report: &'a Report, touched: &[String]) -> (Vec<&'a str>, Vec<String>) {
-    let mut blocking = Vec::new();
-    let mut preexisting = Vec::new();
-    for f in report.failures() {
-        // A weakening setting makes every other result meaningless, wherever it lives (a
-        // git-ignored .cargo/config.toml is never "touched"); trusting it is explicit.
-        let mine = f.name == "integrity"
-            || f.files.is_empty()
-            || f.files.iter().any(|file| touched.contains(file));
-        if mine {
-            blocking.push(f.name.as_str());
-        } else {
-            preexisting.extend(f.files.iter().map(|file| format!("{} ({})", file, f.name)));
-        }
-    }
-    (blocking, preexisting)
-}
-
-fn failure_reason(report: &Report, blocking: &[&str]) -> String {
+/// The block reason: every failing step with the end of its output, and, where the
+/// failure names files, whether this session changed them.
+fn failure_reason(report: &Report, touched: &[String]) -> String {
     let mut text = String::from(
         "fsmap verify failed. Fix the cause, then finish again. Do not add #[allow] or \
          #[expect], skip, ignore or weaken tests, or change cargo, rustfmt or toolchain \
-         settings to get green. If a failure predates your change or is out of scope, say so \
-         to the user instead.\n",
+         settings to get green. If a failure is in a file you did not change and your change \
+         did not cause it, tell the user instead of editing unrelated files.\n",
     );
-    for f in report
-        .failures()
-        .filter(|f| blocking.contains(&f.name.as_str()))
-    {
-        text.push_str(&format!("\n## {} — `{}`\n{}\n", f.name, f.cmd, f.tail));
+    for f in report.failures() {
+        text.push_str(&format!("\n## {} — `{}`\n", f.name, f.cmd));
+        if !f.files.is_empty() {
+            let files: Vec<String> = f
+                .files
+                .iter()
+                .map(|file| {
+                    let state = if touched.contains(file) {
+                        "changed in this session"
+                    } else {
+                        "not changed in this session"
+                    };
+                    format!("{file} ({state})")
+                })
+                .collect();
+            text.push_str(&format!("Files: {}\n", files.join(", ")));
+        }
+        text.push_str(&f.tail);
+        text.push('\n');
     }
     if text.len() > 8000 {
         let mut cut = 8000;
@@ -753,43 +934,86 @@ fn failure_reason(report: &Report, blocking: &[&str]) -> String {
     text
 }
 
-/// What the change adds that weakens checks: lint suppressions, ignored or should-panic
-/// tests, `cfg(any())`, and removed assertions (review finding m6). Shown to the user.
+/// What the change adds that weakens checks, shown to the user on a pass (review finding
+/// m6): lint suppressions (`cfg_attr` forms included), `rustfmt::skip`, ignored or
+/// should-panic tests, `cfg(any())`, removed assertions, lints allowed in a manifest, and
+/// changed lint or format configuration. New untracked files count as added lines.
 fn suppression_summary(ws: &Path, start_head: Option<&str>) -> Option<String> {
     let (root, _) = brief::locate(ws)?;
+    let pathspecs = [
+        "*.rs",
+        ":(glob)**/Cargo.toml",
+        ":(glob)**/clippy.toml",
+        ":(glob)**/.clippy.toml",
+        ":(glob)**/rustfmt.toml",
+        ":(glob)**/.rustfmt.toml",
+        ":(glob)**/.cargo/config",
+        ":(glob)**/.cargo/config.toml",
+    ];
     let diff = crate::git::run({
         let mut c = crate::git::git_worktree(&root);
         c.args([
             "diff",
             "--unified=0",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             "--ignore-submodules=dirty",
             start_head.unwrap_or("HEAD"),
             "--",
-            "*.rs",
-        ]);
+        ])
+        .args(pathspecs);
         c
     })
     .ok()?;
-    let diff = String::from_utf8_lossy(&diff);
+    let mut lines: Vec<(String, char, String)> = Vec::new();
     let mut file = String::new();
-    let mut hits: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
-    for line in diff.lines() {
+    for line in String::from_utf8_lossy(&diff).lines() {
         if let Some(f) = line.strip_prefix("+++ b/") {
             file = f.to_string();
+        } else if line.starts_with("+++") || line.starts_with("---") {
             continue;
+        } else if let Some(t) = line.strip_prefix('+') {
+            lines.push((file.clone(), '+', t.to_string()));
+        } else if let Some(t) = line.strip_prefix('-') {
+            lines.push((file.clone(), '-', t.to_string()));
         }
-        let (added, text) = match line.as_bytes().first() {
-            Some(b'+') if !line.starts_with("+++") => (true, &line[1..]),
-            Some(b'-') if !line.starts_with("---") => (false, &line[1..]),
-            _ => continue,
-        };
-        let kind = if added {
-            if text.contains("#[allow(") || text.contains("#![allow(") {
+    }
+    // Untracked files are not in the diff; all their lines are new.
+    let untracked = crate::git::run({
+        let mut c = crate::git::git(&root);
+        c.args(["ls-files", "-z", "--others", "--exclude-standard", "--"])
+            .args(pathspecs);
+        c
+    })
+    .unwrap_or_default();
+    for f in untracked.split(|&b| b == 0).filter(|f| !f.is_empty()) {
+        let rel = String::from_utf8_lossy(f).into_owned();
+        if let Ok(text) = std::fs::read_to_string(root.join(&rel)) {
+            lines.extend(text.lines().map(|l| (rel.clone(), '+', l.to_string())));
+        }
+    }
+    let mut hits: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    for (file, sign, text) in &lines {
+        let name = file.rsplit('/').next().unwrap_or(file);
+        let kind = if !file.ends_with(".rs") && name != "Cargo.toml" {
+            "lint or format configuration changed"
+        } else if name == "Cargo.toml" {
+            if *sign == '+' && text.contains("\"allow\"") {
+                "lint allowed in a manifest"
+            } else {
+                continue;
+            }
+        } else if *sign == '+' {
+            let attr = text.contains("#[") || text.contains("#![");
+            if attr && (text.contains("allow(") && !text.contains("expect(")) {
                 "allow"
-            } else if text.contains("#[expect(") || text.contains("#![expect(") {
+            } else if attr && text.contains("expect(") {
                 "expect"
+            } else if text.contains("rustfmt::skip") {
+                "rustfmt::skip"
             } else if text.contains("#[ignore") {
                 "ignored test"
             } else if text.contains("#[should_panic") {
@@ -828,7 +1052,8 @@ fn suppression_summary(ws: &Path, start_head: Option<&str>) -> Option<String> {
 
 /// A summary of the outcome log for the project at `dir`.
 pub fn stats(dir: &Path) -> Result<String> {
-    let ws = verify::workspace_root(dir)?;
+    // The log lives with the git directory; cargo is not needed to read it.
+    let ws = verify::workspace_root(dir).unwrap_or_else(|_| dir.to_path_buf());
     let log = state::read_log(&ws);
     let mut counts: std::collections::BTreeMap<String, (usize, Vec<u64>)> = Default::default();
     for e in &log {
@@ -873,17 +1098,6 @@ pub fn stats(dir: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn publish_commands() {
-        assert!(publishes("git push origin main"));
-        assert!(publishes("cargo test && git push -u origin x"));
-        assert!(publishes("/usr/bin/git -C . push"));
-        assert!(publishes("gh pr create --draft"));
-        assert!(!publishes("git status; git log --oneline"));
-        assert!(!publishes("echo push"));
-        assert!(!publishes("gh pr view 1"));
-    }
 
     #[test]
     fn error_lines_dedupe_and_relativise() {

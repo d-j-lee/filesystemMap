@@ -2,8 +2,11 @@
 
 #![allow(
     dead_code,
+    reason = "each test crate uses a different subset of these helpers"
+)]
+#![expect(
     clippy::unwrap_used,
-    reason = "each test crate uses a subset; in tests a failed unwrap is a failed test"
+    reason = "in tests a failed unwrap is a failed test; allow-unwrap-in-tests does not reach helpers"
 )]
 
 use std::path::Path;

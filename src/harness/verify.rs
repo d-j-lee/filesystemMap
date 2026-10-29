@@ -101,11 +101,29 @@ pub struct Config {
     pub trust: Vec<String>,
 }
 
-/// The Cargo workspace root containing `dir`.
+/// The Cargo workspace root containing `dir`. Toolchain files are checked first: rustup
+/// obeys them as soon as cargo runs, so a `path` override would run its own `cargo`
+/// before any other check (final review B1).
 pub fn workspace_root(dir: &Path) -> Result<PathBuf> {
-    let out = Command::new("cargo")
+    let trust = nearest_manifest(dir)
+        .and_then(|m| config_of(&m).ok())
+        .map(|c| c.trust)
+        .unwrap_or_default();
+    let unsafe_toolchain = integrity::toolchain_scan(dir, &trust);
+    if !unsafe_toolchain.is_empty() {
+        let list: Vec<String> = unsafe_toolchain
+            .iter()
+            .map(|f| format!("{}: {} ({})", f.file, f.text, f.kind))
+            .collect();
+        bail!(
+            "refusing to run cargo: the toolchain settings would run binaries of the \
+             repository's choosing: {}. Remove them, or list the kind under \
+             [*.metadata.fsmap.verify] trust if the repository needs it",
+            list.join("; ")
+        );
+    }
+    let out = clean_command(dir, "cargo")
         .args(["locate-project", "--workspace", "--message-format", "plain"])
-        .current_dir(dir)
         .stderr(Stdio::piped())
         .output()
         .context("failed to run cargo (is it installed and on PATH?)")?;
@@ -123,65 +141,63 @@ pub fn workspace_root(dir: &Path) -> Result<PathBuf> {
         .context("manifest path has no parent")
 }
 
-/// Read the workspace's verify configuration through `cargo metadata`, so no TOML parser
-/// is needed. A broken manifest yields the default; the clippy and test steps report it.
+/// The nearest `Cargo.toml` at or above `dir`.
+pub fn nearest_manifest(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .map(|d| d.join("Cargo.toml"))
+        .find(|m| m.is_file())
+}
+
+/// The workspace's verify configuration, from `[workspace.metadata.fsmap.verify]` or
+/// `[package.metadata.fsmap.verify]` of the root manifest.
 pub fn config(root: &Path) -> Result<Config> {
-    let out = Command::new("cargo")
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--offline",
-        ])
-        .current_dir(root)
-        .stderr(Stdio::null())
-        .output()
-        .context("failed to run cargo metadata")?;
-    if !out.status.success() {
-        return Ok(Config::default());
-    }
-    let meta: serde_json::Value =
-        serde_json::from_slice(&out.stdout).context("cargo metadata output")?;
-    let root_manifest = root.join("Cargo.toml");
-    let package_meta = meta["packages"].as_array().and_then(|ps| {
-        ps.iter().find(|p| {
-            p["manifest_path"]
-                .as_str()
-                .is_some_and(|m| Path::new(m) == root_manifest)
-        })
-    });
-    let table = [
-        Some(&meta["metadata"]),
-        package_meta.map(|p| &p["metadata"]),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|m| &m["fsmap"]["verify"])
-    .find(|v| v.is_object());
+    config_of(&root.join("Cargo.toml"))
+}
+
+/// Read a manifest's verify table directly, so that no cargo runs before the toolchain
+/// check and a malformed entry is an error rather than silently dropped (final review B2).
+fn config_of(manifest: &Path) -> Result<Config> {
+    let text = std::fs::read_to_string(manifest)
+        .with_context(|| format!("reading {}", manifest.display()))?;
+    let doc: toml::Table = text
+        .parse()
+        .with_context(|| format!("parsing {}", manifest.display()))?;
+    let table = ["workspace", "package"]
+        .iter()
+        .filter_map(|k| doc.get(*k))
+        .filter_map(|t| t.get("metadata")?.get("fsmap")?.get("verify"))
+        .next();
     let Some(table) = table else {
         return Ok(Config::default());
     };
-    let strings = |v: &serde_json::Value| -> Option<Vec<String>> {
-        let a = v.as_array()?;
-        let s: Vec<String> = a
+    let table = table.as_table().context("fsmap.verify must be a table")?;
+    let strings = |v: &toml::Value| -> Option<Vec<String>> {
+        v.as_array()?
             .iter()
-            .filter_map(|x| x.as_str().map(String::from))
-            .collect();
-        (s.len() == a.len()).then_some(s)
+            .map(|x| x.as_str().map(String::from))
+            .collect()
     };
     let mut cfg = Config::default();
-    if let Some(list) = table["extra"].as_array() {
-        for cmd in list {
-            match strings(cmd) {
-                Some(v) if !v.is_empty() => cfg.extra.push(v),
-                _ => bail!("fsmap.verify.extra entries must be non-empty arrays of strings: {cmd}"),
+    for (key, v) in table {
+        match key.as_str() {
+            "extra" => {
+                let list = v
+                    .as_array()
+                    .context("fsmap.verify.extra must be an array of commands")?;
+                for cmd in list {
+                    match strings(cmd) {
+                        Some(argv) if !argv.is_empty() => cfg.extra.push(argv),
+                        _ => bail!(
+                            "fsmap.verify.extra entries must be non-empty arrays of strings: {cmd}"
+                        ),
+                    }
+                }
             }
+            "trust" => {
+                cfg.trust = strings(v).context("fsmap.verify.trust must be an array of strings")?;
+            }
+            other => bail!("unknown key fsmap.verify.{other} (expected extra, trust)"),
         }
-    }
-    if !table["trust"].is_null() {
-        cfg.trust =
-            strings(&table["trust"]).context("fsmap.verify.trust must be an array of strings")?;
     }
     Ok(cfg)
 }
@@ -294,6 +310,17 @@ pub fn step_command(root: &Path, program: &str, cfg: &Config) -> Command {
     c
 }
 
+/// A command for the gate's own cargo and rustc calls (finding the workspace, reading
+/// metadata, the toolchain version): in `dir`, without the weakening variables.
+pub fn clean_command(dir: &Path, program: &str) -> Command {
+    let mut c = Command::new(program);
+    c.current_dir(dir);
+    for k in removed_env(&[]) {
+        c.env_remove(k);
+    }
+    c
+}
+
 /// The build directory the steps use: inside the repository, unless the repository trusts
 /// `target-dir`. Sharing one across copies lets a copy pass on another copy's artefacts.
 fn target_dir(root: &Path, trust: &[String]) -> Option<PathBuf> {
@@ -314,7 +341,7 @@ fn integrity_step(root: &Path, trust: &[String]) -> StepResult {
     files.dedup();
     let tail = findings
         .iter()
-        .map(|f| format!("{}:{}: {} — {}", f.file, f.line, f.kind, sanitize(&f.text)))
+        .map(|f| format!("{}: {} — {}", f.file, f.kind, sanitize(&f.text)))
         .collect::<Vec<_>>()
         .join("\n");
     StepResult {
