@@ -466,10 +466,11 @@ fn a_change_pending_before_the_session_is_not_the_sessions() {
     );
 }
 
-/// A suppression already pending when the session started is not reported as the
-/// session's; one the session adds is.
+/// A suppression already pending when the session started is reported apart from the
+/// session's own (the threat model promises tracked weakening is reported on every pass,
+/// also across sessions; fourth review, M3); one the session adds is its own.
 #[test]
-fn suppressions_pending_before_the_session_are_not_reported() {
+fn suppressions_pending_before_the_session_are_reported_apart() {
     let repo = fixture();
     let d = repo.path();
     write(d, "src/lib.rs", &format!("mod extra;\n{GOOD}"));
@@ -482,9 +483,13 @@ fn suppressions_pending_before_the_session_are_not_reported() {
     );
     let v = stop(d, false);
     assert!(!blocked(&v), "{v}");
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    let (own, pending) = msg
+        .split_once("already changed when this session started")
+        .unwrap_or((msg, ""));
     assert!(
-        !v.to_string().contains("src/extra.rs"),
-        "pending before the session: {v}"
+        !own.contains("src/extra.rs") && pending.contains("allow (src/extra.rs)"),
+        "{msg}"
     );
     hook(d, "prompt", &json!({"session_id": "s1"}));
     write(
@@ -493,7 +498,75 @@ fn suppressions_pending_before_the_session_are_not_reported() {
         "#[allow(dead_code)]\nfn unused() {}\n#[allow(dead_code)]\nfn other() {}\n",
     );
     let v = stop(d, false);
-    assert!(v.to_string().contains("allow (src/extra.rs"), "{v}");
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    let own = msg.split("already changed").next().unwrap_or_default();
+    assert!(own.contains("allow (src/extra.rs"), "{msg}");
+}
+
+/// Fourth review, M2: narrowing the push check to the directories targets read must not
+/// let tracked sources through: a rename, a deletion, or a file git was told to ignore
+/// changes of (`--skip-worktree`, M4) all change what HEAD builds.
+#[test]
+fn tracked_source_changes_always_count_for_a_push() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "tests/extra.rs", "#[test]\nfn extra() {}\n");
+    write(d, "scratch/try.rs", "fn main() {}\n");
+    commit(d, "A", "more files", T0 + 10);
+    start(d, "startup");
+    let reason = |v: &Value| {
+        v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    git(d, &["mv", "tests/extra.rs", "extra_old.rs"], T0 + 20);
+    let v = push(d);
+    assert!(reason(&v).contains("tests/extra.rs"), "rename: {v}");
+    git(d, &["reset", "-q", "--hard"], T0 + 20);
+    std::fs::remove_file(d.join("tests/extra.rs")).unwrap();
+    let v = push(d);
+    assert!(reason(&v).contains("tests/extra.rs"), "deletion: {v}");
+    git(d, &["checkout", "-q", "--", "tests/extra.rs"], T0 + 20);
+    write(d, "scratch/try.rs", "fn main() { let _ = 1; }\n");
+    let v = push(d);
+    assert!(
+        reason(&v).contains("scratch/try.rs"),
+        "tracked, outside targets: {v}"
+    );
+    git(d, &["checkout", "-q", "--", "scratch/try.rs"], T0 + 20);
+    // A passing edit, so that only the uncommitted-input check can deny it.
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    git(
+        d,
+        &["update-index", "--skip-worktree", "src/lib.rs"],
+        T0 + 20,
+    );
+    let v = push(d);
+    let why = reason(&v);
+    assert!(
+        why.contains("not committed") && why.contains("src/lib.rs"),
+        "skip-worktree: {v}"
+    );
+}
+
+/// An edit git was told not to show (`--skip-worktree`) still changes the fingerprint, so
+/// the gate runs again (fourth review, M4).
+#[test]
+fn a_skip_worktree_edit_reruns_the_gate() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    commit(d, "Agent", "swap", T0 + 30);
+    assert!(!blocked(&stop(d, false)));
+    git(
+        d,
+        &["update-index", "--skip-worktree", "src/lib.rs"],
+        T0 + 40,
+    );
+    write(d, "src/lib.rs", FAILING_TEST);
+    assert!(blocked(&stop(d, false)), "the hidden edit must be checked");
 }
 
 /// The threat model: configuration git does not track fails the gate whatever it says

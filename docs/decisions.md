@@ -381,8 +381,36 @@ its tracked config held only a variable the rules accept anyway; it now also hol
 A live check in this container: a `rustup override set` to a linked toolchain made `fsmap verify`
 refuse before any cargo call (exit 2); rustup's settings were restored byte for byte afterwards.
 
-**Costs.** Every turn that changed the tree pays one gate run: on this repository 43 s with nothing
-to rebuild (4-core container, 129 tests, three runs). Nearly all of it is `cargo test`, whose 38 end-to-end
+**Fourth implementation review (convergence check).** A fifth fresh agent checked whether the
+third round's fixes closed their findings: six closed, three partly. It also found that the
+round had opened new paths, each reproduced against both commits. The worst came from the new
+quote-aware heredoc scan. Claude Code's own commit form, `git commit -m "$(cat <<'EOF' …
+EOF)" && git push`, got past the push gate whenever the message held an apostrophe.
+
+| Finding | Fix | Alternative and why not |
+|---|---|---|
+| B1. A heredoc inside `"$(…)"` was taken for quoted text; an apostrophe in its body opened a quote that swallowed the `&& git push` after it. | The heredoc scan keeps a stack of quoting contexts (`'…'`, `$'…'`, `"…"`, `$(…)`, backticks, `$((…))`). A command line that does not parse to its end, or nests past 16 levels, counts as publishing when it mentions a push, and a heredoc that never ends is not removed as data. | A real shell parser crate: a dependency for one guardrail, and its errors would need the same fallback. |
+| M1. A tracked `.cargo/config.toml` could `include` an ignored file (stable in cargo 1.97, checked here), which was neither judged nor fingerprinted. | Includes are followed transitively; each file is placed and judged on its own and hashed into the fingerprint. | Fail every `include`: legitimate for machine-local settings. |
+| M2. Narrowing the push check to target directories let a renamed, deleted or tracked-but-outside source through. | Every change to a tracked `.rs` file counts, a rename's original path included; only untracked files are filtered by target directory. | — |
+| M3. Hiding changes that were pending at session start dropped them from the pass report, so a weakening made in an earlier session was never shown. | Listed apart ("already changed when this session started") instead of dropped. | — |
+| M4. A tracked config marked `--skip-worktree` was neither judged nor reported. | `git ls-files -v` tags: skip-worktree and assume-unchanged files count as hidden. They are also hashed into the fingerprint and counted as uncommitted for a push. | — |
+| M5. The target filter read `build.target` only as a string in the same file. | Build targets come from every configuration file (string or list) and `CARGO_BUILD_TARGET`; a hidden file has every `[target.*]` table judged. | — |
+| M6. A `#` comment with an apostrophe hid the next line's push (from before this round). | Comments are skipped; the open-quote fallback covers what remains. | — |
+| M7. A hidden `--cfg miri` with `#[cfg(not(miri))]` on a failing test passed (from before this round). | In a hidden file any rustflag fails. | Judge `--cfg` names: any name can gate a test. |
+| Minor | A symlink inside the repository is placed where the link is. A hidden toolchain file fails whatever channel it pins. Nesting is bounded (20 000 levels overflowed the stack, and the wrapper let the crashed hook's command through). In single quotes inside `$(…)` a backslash is an ordinary character. `git push -o --delete` is a push. | — |
+
+**Mutation check, after the fourth round.** 96 guards removed one at a time; each matching test
+failed. The first pass showed why the check matters: the open-quote fallback can mask a guard
+(a mis-parse still reports a push when the text mentions one), so four parser guards needed cases
+where the fallback cannot save them (a delimiter line after the swallowed push, a non-push command
+that mentions one). The skip-worktree push test was denied for the wrong reason (its edit also
+failed the tests) and now uses a passing edit. While the run was going, a turn ended and the live
+stop hook ran the gate on a tree with a mutant in place; it blocked. It also caught a real
+regression in the same run: a rename's original path had leaked into `dirty_paths`, which an
+existing test pinned. That was fixed in the code; the test is unchanged.
+
+**Costs.** Every turn that changed the tree pays one gate run: on this repository 44–45 s with nothing
+to rebuild (4-core container, 136 tests, three runs). Nearly all of it is `cargo test`, whose 40 end-to-end
 hook tests each build a small Cargo project. Every Rust edit
 pays a `cargo check` (median 1.1 s in the session that wired the hooks). The hooks run build scripts, proc macros and tests without asking, so they
 are for repositories you trust. The ask rules add prompts when the agent edits manifests, lint

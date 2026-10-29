@@ -39,9 +39,9 @@ is the gate of record.
 |---|---|---|---|
 | Session starts | `SessionStart` → `fsmap hook session-start` | Records the baseline (only on `startup`, never on resume or compact). Tells Claude the real `rustc`/`cargo` versions and where each direct dependency's source is, and warns about settings that weaken the gate and about other sessions in the same worktree. Warms the brief index. | 0.4 s |
 | After each `Edit`/`Write` | `PostToolUse` → `fsmap hook post-edit` | For `.rs`, `Cargo.toml` and `build.rs`: `cargo check --all-targets --offline` on the edited package. Errors go back to Claude as a block reason (first 20, de-duplicated); the fsmap brief for notable files goes along as context. One check at a time per worktree: a later edit waits up to 30 s for the running one, then checks the tree as it is. 60 s budget. | 1.1 s median |
-| Claude ends a turn | `Stop` → `fsmap hook stop` | If the tree changed since the session started or last passed, runs the gate in quick mode. The gate passes only when every step passes. A failure blocks the stop with the failing steps' output, marking which files the session changed. After three blocked stops in a row it lets go and asks Claude to report; when every failure is in files the session did not change, it lets go after one block instead, telling the user the gate did **not** pass. A pass shows the user any added suppressions, ignored tests, removed assertions, and changed lint, format, cargo or toolchain configuration. While background agents (subagents, workflows) are still working, it waits for the real end of the turn. | 43 s |
+| Claude ends a turn | `Stop` → `fsmap hook stop` | If the tree changed since the session started or last passed, runs the gate in quick mode. The gate passes only when every step passes. A failure blocks the stop with the failing steps' output, marking which files the session changed. After three blocked stops in a row it lets go and asks Claude to report; when every failure is in files the session did not change, it lets go after one block instead, telling the user the gate did **not** pass. A pass shows the user any added suppressions, ignored tests, removed assertions, and changed lint, format, cargo or toolchain configuration; those already pending when the session started are listed apart. While background agents (subagents, workflows) are still working, it waits for the real end of the turn. | 45 s |
 | The user writes | `UserPromptSubmit` → `fsmap hook prompt` | Resets the failure streak. | ms |
-| Before `git push`, `gh pr create` | `PreToolUse` (Bash) → `fsmap hook pre-bash` | Denies the command while build inputs are uncommitted (the gate checks the working tree; a push sends HEAD): manifests, `Cargo.lock`, cargo, rustfmt, clippy and toolchain configuration, and `.rs` files in a directory a target reads (a scratch file elsewhere does not count). Otherwise runs the quick gate unless this exact tree already passed, and denies on failure, when the gate cannot run, or when the hook itself fails. Commands are read with their quoting, command substitutions (inside double quotes too), reserved words, wrappers and their options (`env -u`, `sudo -u`, `timeout -k` …), `sh -c`/`eval`/`env -S` scripts, here-strings, git's and gh's global options, `git -c alias.x=…` and `git subtree`; a shell reading its script from stdin is gated when the command line mentions publishing. Not publishing: heredoc bodies fed to other programs, `--dry-run`, `--help`, pushes that only delete remote refs, and `gh pr merge` (it merges what was already pushed). | 5 ms for other commands |
+| Before `git push`, `gh pr create` | `PreToolUse` (Bash) → `fsmap hook pre-bash` | Denies the command while build inputs are uncommitted (the gate checks the working tree; a push sends HEAD): manifests, `Cargo.lock`, cargo, rustfmt, clippy and toolchain configuration, every change to a tracked `.rs` file (renames, deletions and `--skip-worktree` edits included), and untracked `.rs` files in a directory a target reads (a scratch file elsewhere does not count). Otherwise runs the quick gate unless this exact tree already passed, and denies on failure, when the gate cannot run, or when the hook itself fails. Commands are read with their quoting (`$'…'` too), comments, command substitutions (inside double quotes too), heredocs inside them (Claude Code's own `git commit -m "$(cat <<'EOF' … EOF)"`), reserved words, wrappers and their options (`env -u`, `sudo -u`, `timeout -k` …), `sh -c`/`eval`/`env -S` scripts, here-strings, git's and gh's global options, `git -c alias.x=…` and `git subtree`. When the reading is unsure (a quote or substitution left open, nesting past 16 levels, a shell reading its script from stdin), mentioning a push is enough; a heredoc that never ends is not taken as data. Not publishing: heredoc bodies fed to other programs, `--dry-run`, `--help`, pushes that only delete remote refs, and `gh pr merge` (it merges what was already pushed). | 5 ms for other commands |
 
 When cargo cannot read the project (a broken manifest, a malformed verify table, an unsafe
 toolchain setting), the gate cannot run: the stop is blocked and a push denied with the reason,
@@ -71,12 +71,13 @@ for tools.
 tree, git-ignored ones included, since rustfmt looks upward from each source file; in the
 ancestors; in the home directory and rustfmt's user configuration directory), but not a vendored
 crate's own; `rust-toolchain(.toml)` in the ancestors; directory overrides in rustup's
-`settings.toml` (`rustup override set`). Where a file is decides how it is judged:
+`settings.toml` (`rustup override set`); and every file a cargo configuration `include`s,
+followed transitively. Where a file is decides how it is judged:
 
 | Where | Judged | `trust` applies |
 |---|---|---|
 | Tracked by git | No: it is in the diff and CI reads it too. Changes are reported on pass. | — |
-| Inside the repository, untracked or ignored | Yes; any rustfmt or clippy file, and any `[env]` entry, fails whatever it says | No: the agent is told to remove it and leave committing it to the user |
+| Inside the repository, untracked, ignored, or tracked but marked `--skip-worktree`/`--assume-unchanged` (git hides its changes) | Yes; any rustfmt, clippy or toolchain file fails whatever it says, and so does any `[env]` entry, any rustflag (`--cfg` too: `#[cfg(not(x))]` compiles a failing test out) and any `[target.*]` table | No: the agent is told to remove it and leave committing it to the user |
 | Outside the repository (ancestors, `CARGO_HOME`, the home directory, rustup overrides) | Yes | Yes: this is the machine's own setup |
 | A project without git | Yes | Yes |
 
@@ -84,13 +85,13 @@ What fails, by kind:
 
 | Kind | Setting |
 |---|---|
-| `runner`, `linker` | for the host, the configured build target or a `cfg(…)` selector (a `wasm32` runner or an embedded target's link script does not apply to the gate's build): a runner; a linker that is not a known one (`cc`, `gcc`, `clang`, `mold`, `lld` …, named or outside the repository), and linker flags other than `-fuse-ld=` with mold, lld, gold or bfd, by name or by a path outside the repository (a fake linker can replace the test binary) |
+| `runner`, `linker` | for the host, a build target any configuration file or `CARGO_BUILD_TARGET` names, or a `cfg(…)` selector (a `wasm32` runner or an embedded target's link script does not apply to the gate's build); in a hidden file, for every target: a runner; a linker that is not a known one (`cc`, `gcc`, `clang`, `mold`, `lld` …, named or outside the repository), and linker flags other than `-fuse-ld=` with mold, lld, gold or bfd, by name or by a path outside the repository (a fake linker can replace the test binary) |
 | `rustc-wrapper` | `build.rustc`, `build.rustdoc`, and a `rustc-wrapper` other than `sccache`/`cachepot` |
 | `cap-lints`, `allow-flag`, `rustflag` | `--cap-lints`; `-A`/`--allow` and `--force-warn` (a force-warned lint stays a warning under `-D warnings`); any other rustflag outside a short safe list (`-C target-cpu`, `-C opt-level=0`, `--cfg`, `-W`/`-D` …), reported once per kind with the flags and their values. `-C opt-level` above 0 counts: it switches debug assertions and overflow checks off unless they are turned on explicitly. |
 | `env`, `alias` | in a hidden file, any `[env]` entry (cargo passes them to rustc, clippy and the tests, `LD_PRELOAD` included); elsewhere, one the gate would remove from its own environment; an `[alias]` named after a command the gate runs (`fmt`, `clippy`, `deny` …) |
 | `source` | replacing a source with a local directory or local registry (`cargo vendor` output), which can swap in modified dependencies; a registry mirror is fine |
 | `config:<table>` | any other cargo key outside the allowlist (`[patch]`, `[unstable]`, `profile.*.debug-assertions` …) |
-| `untracked-rustfmt-config`, `untracked-clippy-config` | a rustfmt or clippy file git does not track inside the repository; a clippy file above it |
+| `untracked-rustfmt-config`, `untracked-clippy-config`, `untracked-toolchain-config` | a rustfmt, clippy or toolchain file git does not track inside the repository (a toolchain pin to an official channel still changes which clippy runs); a clippy file above it |
 | `rustfmt-outside` | a rustfmt file outside the repository (above it, in the home directory) when the repository has none of its own: CI formats without it |
 | `fmt-disabled`, `fmt-ignore` | in a project without git: `disable_all_formatting`, a non-empty `ignore`, `skip_children` |
 | `toolchain-path`, `toolchain-custom` | a toolchain `path`, or a channel that is not an official one or whose rustup directory is a link (`rustup toolchain link`, even under an official-looking name), in a toolchain file or a rustup directory override. Checked before the gate runs cargo at all. |
@@ -108,16 +109,16 @@ target directory stay); and always `RUSTC`, `RUSTDOC`, `RUSTFMT`, `RUSTUP_TOOLCH
 (600 s for the hooks). A step that overruns has its process tree killed; background processes it
 left behind cannot hold the gate past the budget.
 
-Timings: a 4-core cloud container, 2026-10-29, this repository (129 tests). Session start and
+Timings: a 4-core cloud container, 2026-10-29, this repository (136 tests). Session start and
 pre-bash on a clean clone, three runs each; post-edit from the live session's log; the gate is
-`fsmap verify` run by hand with nothing to rebuild, three runs: 43 s each. Nearly all of it is
-`cargo test`, whose 38 end-to-end hook tests each build a small Cargo project; a repository
+`fsmap verify` run by hand with nothing to rebuild, three runs: 44.4–44.7 s. Nearly all of it is
+`cargo test`, whose 40 end-to-end hook tests each build a small Cargo project; a repository
 without such tests pays its own test time.
 
 ## What it catches
 
 Each row has an end-to-end test in [`tests/harness.rs`](../tests/harness.rs) or a unit test next
-to the guard. 75 guards were checked by removing each and watching its test fail (D-15 lists
+to the guard. 96 guards were checked by removing each and watching its test fail (D-15 lists
 them); the rows below without one are noted.
 
 | Shortcut or failure | Guard |
@@ -130,12 +131,13 @@ them); the rows below without one are noted.
 | A toolchain file or a `rustup override` that runs the repository's own `cargo` | Refused before the first cargo call |
 | Auto-compaction re-recording a broken tree as the baseline | Baseline written once, on `startup` |
 | A session that started before the first commit, or before the Cargo project, or was first seen at a compaction, treating its own commits as someone else's | Changes are judged from where the session was first seen, or from the empty tree |
-| A change already pending when the session started counted as the session's | Pending files are hashed at first sight; unchanged since, they are someone else's (also for the pass report) |
+| A change already pending when the session started counted as the session's | Pending files are hashed at first sight; unchanged since, they are someone else's, and listed apart in the pass report |
+| A tracked config that `include`s an ignored one; a config marked `--skip-worktree`; an edit to a skip-worktree source | The included file is judged by its own place; skip-worktree files are hidden ones, hashed into the fingerprint and counted as uncommitted for a push |
 | A dev server running in the background switching the gate off | Only background *agents* postpone it |
 | The gate failing forever, or never again after one release | Three strikes then a report; the next user prompt resets |
 | Pushing a broken commit, also from a session that started on it | The pre-push gate; only a recorded pass counts |
 | Pushing HEAD while the gate checked uncommitted files (a module left untracked) | Push denied while build inputs are uncommitted |
-| Pushing through `if … then`, `sudo -u`, `sh -c --`, `… \| sh`, `git -c alias.p=push p`, `"$(git push)"`, a line after `echo "<<X"` | Push detection (unit tests per form) |
+| Pushing through `if … then`, `sudo -u`, `sh -c --`, `… \| sh`, `git -c alias.p=push p`, `"$(git push)"`, a line after `echo "<<X"`, a commit message with an apostrophe in `"$(cat <<'EOF' …)"`, a comment with an apostrophe | Push detection (unit tests per form; a parse left open falls back to "mentions a push") |
 | The pre-push hook crashing on a push | The push is denied |
 | A change that breaks a file it never touched (a helper left without a caller) | The gate passes only when everything passes |
 | Failures from before the session in files nobody touched | Blocked once, then a report; the user is told the gate did not pass |
@@ -192,8 +194,9 @@ log in `<git-dir>/fsmap-harness/log.jsonl`.
   write them. Review the note.
 - **What the pre-push check cannot see.** A git alias for `push` in the git configuration, a
   script file or a shell function that pushes, and a push of a ref other than the checked-out
-  one. An uncommitted source outside every target's directory (`#[path]`, `include!`) is not
-  counted as a build input. The stop gate still runs at the end of the turn.
+  one. A new untracked source outside every target's directory (`#[path]`, `include!`, a path
+  dependency that is not a workspace member) is not counted as a build input. The stop gate
+  still runs at the end of the turn.
 - **clippy.toml is not judged.** Raising a lint threshold there is a legitimate choice as often
   as a shortcut. An untracked one fails the gate; changes to a tracked one are shown on pass.
 - **Where hooks run.** In Claude Code cloud sessions, a repository's `.claude/settings.json` hooks
@@ -213,9 +216,10 @@ log in `<git-dir>/fsmap-harness/log.jsonl`.
 ## Evidence
 
 The design was reviewed by an independent agent before implementation (3 blockers, 8 major
-findings), and the implementation three times after it, each time by a fresh agent: 2 blockers
+findings), and the implementation four times after it, each time by a fresh agent: 2 blockers
 and 6 major findings, then 1 blocker and 10 major findings, then 8 findings and a list of minor
-ones from a review scoped to whether the code matched the threat model above. Among them were
+ones from a review scoped to whether the code matched the threat model above, then 1 blocker
+and 7 major findings from a convergence check of that round's fixes. Among them were
 bypasses of the integrity check, legitimate configurations it failed, fixes whose tests did not
 fail without them, and claims in this guide that were not true. What was adopted, and what was
 not, is in D-15.

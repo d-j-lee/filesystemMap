@@ -1008,9 +1008,10 @@ fn diff_base(ws: &Path, start_head: Option<&str>) -> String {
 
 /// Changed or untracked files that can change what the gate checks, relative to the work
 /// tree top: manifests, the lock file, cargo, rustfmt, clippy and toolchain configuration,
-/// and Rust sources where a target reads them. A push sends HEAD; with these pending, the
-/// gate's verdict on the work tree says nothing about HEAD (second review M7). A scratch
-/// `.rs` file or a `book.toml` elsewhere does not count (third review, finding 3).
+/// and Rust sources. A push sends HEAD; with these pending, the gate's verdict on the work
+/// tree says nothing about HEAD (second review M7). Every change to a tracked `.rs` file
+/// counts (renames, deletions, `--skip-worktree` included); an untracked one only where a
+/// target reads it, so a scratch file does not (third review, finding 3; fourth, M2).
 fn uncommitted_inputs(ws: &Path) -> Result<Vec<String>> {
     let top = toplevel(ws).context("finding the work tree")?;
     let top = std::fs::canonicalize(&top).unwrap_or(top);
@@ -1039,9 +1040,18 @@ fn uncommitted_inputs(ws: &Path) -> Result<Vec<String>> {
             })
         })
     };
-    let mut out: Vec<String> = state::dirty_paths(&status)
+    let mut entries: Vec<(String, bool)> = state::status_entries(&status)
         .into_iter()
-        .filter(|p| {
+        .map(|e| (e.path, e.untracked))
+        .collect();
+    entries.extend(
+        state::hidden_index_entries(ws)
+            .into_iter()
+            .map(|p| (p, false)),
+    );
+    let mut out: Vec<String> = entries
+        .into_iter()
+        .filter(|(p, untracked)| {
             let name = p.rsplit('/').next().unwrap_or(p);
             matches!(
                 name,
@@ -1055,10 +1065,12 @@ fn uncommitted_inputs(ws: &Path) -> Result<Vec<String>> {
                     | ".clippy.toml"
             ) || p.ends_with(".cargo/config")
                 || p.ends_with(".cargo/config.toml")
-                || (p.ends_with(".rs") && read_by_a_target(p))
+                || (p.ends_with(".rs") && (!*untracked || read_by_a_target(p)))
         })
+        .map(|(p, _)| p)
         .collect();
     out.sort();
+    out.dedup();
     Ok(out)
 }
 
@@ -1193,8 +1205,10 @@ fn suppression_summary(ws: &Path, me: &state::Session) -> Option<String> {
             lines.extend(text.lines().map(|l| (rel.clone(), '+', l.to_string())));
         }
     }
-    lines.retain(|(file, _, _)| !preexisting(&root, me, file));
+    // Hits in files already changed when the session started (and untouched since) are
+    // reported apart: still reported, since nothing else will (fourth review, M3).
     let mut hits: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    let mut pending: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
     for (file, sign, text) in &lines {
         let name = file.rsplit('/').next().unwrap_or(file);
         let kind = if file.contains(".cargo/config") || name.starts_with("rust-toolchain") {
@@ -1230,24 +1244,38 @@ fn suppression_summary(ws: &Path, me: &state::Session) -> Option<String> {
         } else {
             continue;
         };
-        hits.entry(kind).or_default().push(file.clone());
+        let bucket = if preexisting(&root, me, file) {
+            &mut pending
+        } else {
+            &mut hits
+        };
+        bucket.entry(kind).or_default().push(file.clone());
     }
-    if hits.is_empty() {
+    if hits.is_empty() && pending.is_empty() {
         return None;
     }
-    let parts: Vec<String> = hits
-        .iter()
-        .map(|(k, files)| {
-            let mut f = files.clone();
-            f.sort();
-            f.dedup();
-            format!("{} {k} ({})", files.len(), f.join(", "))
-        })
-        .collect();
-    Some(format!(
-        "[harness] this change weakens checks — review before accepting: {}",
-        parts.join("; ")
-    ))
+    let list = |hits: &std::collections::BTreeMap<&str, Vec<String>>| {
+        hits.iter()
+            .map(|(k, files)| {
+                let mut f = files.clone();
+                f.sort();
+                f.dedup();
+                format!("{} {k} ({})", files.len(), f.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let mut text = String::from("[harness] this change weakens checks — review before accepting:");
+    if !hits.is_empty() {
+        text.push(' ');
+        text.push_str(&list(&hits));
+    }
+    if !pending.is_empty() {
+        text.push_str(if hits.is_empty() { " " } else { ". " });
+        text.push_str("Files already changed when this session started: ");
+        text.push_str(&list(&pending));
+    }
+    Some(text)
 }
 
 // ---------------------------------------------------------------- stats

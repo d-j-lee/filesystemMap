@@ -16,11 +16,21 @@ pub fn publishes(cmd: &str) -> bool {
     publishes_at(&cmd, &cmd, 0)
 }
 
+/// How deep `sh -c` scripts and command substitutions are followed. Past it, and when the
+/// text does not parse to its end (an open quote or substitution), mentioning a push is
+/// enough: the parser is unsure, and gating a tree that already passed is cheap.
+const MAX_DEPTH: usize = 16;
+
 fn publishes_at(cmd: &str, whole: &str, depth: usize) -> bool {
-    depth <= 3
-        && commands(cmd)
-            .iter()
-            .any(|words| simple_publishes(words, whole, depth))
+    if depth > 3 {
+        return mentions_publish(cmd);
+    }
+    let parsed = parse(cmd, 0);
+    parsed
+        .commands
+        .iter()
+        .any(|words| simple_publishes(words, whole, depth))
+        || (!parsed.complete && mentions_publish(cmd))
 }
 
 /// Whether the text mentions a publishing command anywhere.
@@ -32,13 +42,15 @@ pub fn mentions_publish(text: &str) -> bool {
     RE.is_match(text)
 }
 
-/// Remove the bodies of heredocs whose command is not a shell (`cat > notes.md <<'X'`):
-/// they are data. A heredoc fed to a shell is a script and stays. A `<<` inside quotes is
-/// text, not an operator (third review: `echo "<<X"` swallowed the lines after it).
+/// Remove the bodies of heredocs whose command is not a shell (`cat > notes.md <<'X'`,
+/// `git commit -m "$(cat <<'EOF' … EOF)"`): they are data. A heredoc fed to a shell is a
+/// script and stays. Operators are found with the quoting context: `echo "<<X"` is text,
+/// `"$(cat <<X …)"` is a heredoc. A body that never ends means the reading was wrong (or
+/// the script is), so nothing is removed.
 fn strip_data_heredocs(cmd: &str) -> String {
     let mut out = String::new();
     let mut pending: Vec<(String, bool)> = Vec::new(); // (delimiter, keep body)
-    let mut quote = Quote::None;
+    let mut stack: Vec<Ctx> = Vec::new();
     for line in cmd.split_inclusive('\n') {
         if let Some((delim, keep)) = pending.first().cloned() {
             if line.trim() == delim {
@@ -50,79 +62,162 @@ fn strip_data_heredocs(cmd: &str) -> String {
             continue;
         }
         out.push_str(line);
-        for (at, delim) in heredoc_operators(line, &mut quote) {
-            let shell = commands(&line[..at]).last().is_some_and(|w| {
+        for (at, delim) in heredoc_operators(line, &mut stack) {
+            let shell = parse(&line[..at], 0).commands.last().is_some_and(|w| {
                 w.first()
                     .is_some_and(|p| matches!(program(p), "sh" | "bash" | "zsh" | "dash" | "ksh"))
             });
             pending.push((delim, shell));
         }
     }
-    out
+    if pending.is_empty() {
+        out
+    } else {
+        cmd.to_string()
+    }
 }
 
+/// Quoting context while scanning for heredoc operators.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Quote {
-    None,
+enum Ctx {
     Single,
+    /// `$'…'`, where a backslash escapes the next character.
+    Ansi,
     Double,
+    /// `$( … )`, or a parenthesis inside one.
+    Subst,
+    Backtick,
+    /// `$(( … ))`, where `<<` is a shift.
+    Arith,
 }
 
-/// The unquoted heredoc operators (`<<X`, `<<-'X'`, not `<<<`) in `line`: where each
-/// starts, and its delimiter. `quote` carries the quoting state across lines.
-fn heredoc_operators(line: &str, quote: &mut Quote) -> Vec<(usize, String)> {
+/// The heredoc operators (`<<X`, `<<-'X'`, not `<<<`) in `line` that the shell would see
+/// as operators: where each starts, and its delimiter. `stack` carries the quoting context
+/// across lines.
+fn heredoc_operators(line: &str, stack: &mut Vec<Ctx>) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let b = line.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        match (*quote, b[i]) {
-            (Quote::Single, b'\'') | (Quote::Double, b'"') => *quote = Quote::None,
-            (Quote::Double, b'\\') | (Quote::None, b'\\') => i += 1,
-            (Quote::None, b'\'') => *quote = Quote::Single,
-            (Quote::None, b'"') => *quote = Quote::Double,
-            (Quote::None, b'#') if i == 0 || b[i - 1].is_ascii_whitespace() => break,
-            (Quote::None, b'<') if b.get(i + 1) == Some(&b'<') && b.get(i + 2) != Some(&b'<') => {
-                let start = i;
-                let mut j = i + 2;
-                if b.get(j) == Some(&b'-') {
-                    j += 1;
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        match stack.last().copied() {
+            Some(Ctx::Single) => {
+                if c == b'\'' {
+                    stack.pop();
                 }
-                while matches!(b.get(j), Some(b' ' | b'\t')) {
-                    j += 1;
+            }
+            Some(Ctx::Ansi) => match c {
+                b'\\' => i += 1,
+                b'\'' => {
+                    stack.pop();
                 }
-                let quoted = matches!(b.get(j), Some(b'\'' | b'"'));
-                if quoted {
-                    j += 1;
+                _ => {}
+            },
+            Some(Ctx::Double) => match c {
+                b'\\' => i += 1,
+                b'"' => {
+                    stack.pop();
                 }
-                let from = j;
-                // A delimiter starts like a name: `$((1<<2))` is a shift.
-                if b.get(j)
-                    .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
-                {
-                    while b
-                        .get(j)
-                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
-                    {
+                b'$' if next == Some(b'(') => {
+                    stack.push(Ctx::Subst);
+                    i += 1;
+                }
+                b'`' => stack.push(Ctx::Backtick),
+                _ => {}
+            },
+            Some(Ctx::Arith) => {
+                if c == b')' && next == Some(b')') {
+                    stack.pop();
+                    i += 1;
+                }
+            }
+            top @ (None | Some(Ctx::Subst) | Some(Ctx::Backtick)) => match c {
+                b'\\' => i += 1,
+                b'\'' => stack.push(Ctx::Single),
+                b'"' => stack.push(Ctx::Double),
+                b'$' if next == Some(b'\'') => {
+                    stack.push(Ctx::Ansi);
+                    i += 1;
+                }
+                b'$' if next == Some(b'(') && b.get(i + 2) == Some(&b'(') => {
+                    stack.push(Ctx::Arith);
+                    i += 2;
+                }
+                b'$' if next == Some(b'(') => {
+                    stack.push(Ctx::Subst);
+                    i += 1;
+                }
+                b'(' if top == Some(Ctx::Subst) => stack.push(Ctx::Subst),
+                b')' if top == Some(Ctx::Subst) => {
+                    stack.pop();
+                }
+                b'`' if top == Some(Ctx::Backtick) => {
+                    stack.pop();
+                }
+                b'`' => stack.push(Ctx::Backtick),
+                b'#' if i == 0 || matches!(b[i - 1], b' ' | b'\t' | b';' | b'&' | b'|' | b'(') => {
+                    break;
+                }
+                b'<' if next == Some(b'<') && b.get(i + 2) != Some(&b'<') => {
+                    let start = i;
+                    let mut j = i + 2;
+                    if b.get(j) == Some(&b'-') {
                         j += 1;
                     }
+                    while matches!(b.get(j), Some(b' ' | b'\t')) {
+                        j += 1;
+                    }
+                    let quoted = matches!(b.get(j), Some(b'\'' | b'"'));
+                    if quoted {
+                        j += 1;
+                    }
+                    let from = j;
+                    // A delimiter starts like a name.
+                    if b.get(j)
+                        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                    {
+                        while b
+                            .get(j)
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                        {
+                            j += 1;
+                        }
+                    }
+                    if j > from {
+                        out.push((start, line[from..j].to_string()));
+                    }
+                    i = j + usize::from(quoted);
+                    continue;
                 }
-                if j > from {
-                    out.push((start, line[from..j].to_string()));
-                }
-                i = j + usize::from(quoted);
-                continue;
-            }
-            _ => {}
+                _ => {}
+            },
         }
         i += 1;
     }
     out
 }
 
-/// Split a command line into simple commands (lists of words). Quotes and backslashes are
-/// honoured; `;`, `&`, `|`, newlines, parentheses and backticks end a command.
-fn commands(s: &str) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
+/// Simple commands (lists of words) and whether the text parsed to its end.
+struct Parsed {
+    commands: Vec<Vec<String>>,
+    /// No quote or substitution was left open, and nesting stayed within `MAX_DEPTH`.
+    complete: bool,
+}
+
+type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+
+/// Split a command line into simple commands. Quotes (`'…'`, `"…"`, `$'…'`), backslashes
+/// and comments are honoured; `;`, `&`, `|`, newlines, parentheses and backticks end a
+/// command; command substitutions inside double quotes are parsed as commands of their own.
+fn parse(s: &str, depth: usize) -> Parsed {
+    let mut p = Parsed {
+        commands: Vec::new(),
+        complete: depth <= MAX_DEPTH,
+    };
+    if !p.complete {
+        return p;
+    }
     let mut nested: Vec<Vec<String>> = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
@@ -138,18 +233,22 @@ fn commands(s: &str) -> Vec<Vec<String>> {
         match c {
             '\'' => {
                 in_word = true;
-                for q in chars.by_ref() {
-                    if q == '\'' {
-                        break;
-                    }
-                    word.push(q);
-                }
+                p.complete &= read_until(&mut chars, &mut word, '\'', false);
+            }
+            '$' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                in_word = true;
+                p.complete &= read_until(&mut chars, &mut word, '\'', true);
             }
             '"' => {
                 in_word = true;
+                let mut closed = false;
                 while let Some(q) = chars.next() {
                     match q {
-                        '"' => break,
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
                         '\\' => {
                             if let Some(n) = chars.next() {
                                 if !matches!(n, '"' | '\\' | '$' | '`') {
@@ -161,22 +260,23 @@ fn commands(s: &str) -> Vec<Vec<String>> {
                         // Command substitutions run inside double quotes too.
                         '$' if chars.peek() == Some(&'(') => {
                             chars.next();
-                            let inner = substitution(&mut chars, ')');
-                            word.push_str("$(");
+                            let (inner, done) = substitution(&mut chars, ')');
+                            let sub = parse(&inner, depth + 1);
+                            p.complete &= done && sub.complete;
                             word.push_str(&inner);
-                            word.push(')');
-                            nested.extend(commands(&inner));
+                            nested.extend(sub.commands);
                         }
                         '`' => {
-                            let inner = substitution(&mut chars, '`');
-                            word.push('`');
+                            let (inner, done) = substitution(&mut chars, '`');
+                            let sub = parse(&inner, depth + 1);
+                            p.complete &= done && sub.complete;
                             word.push_str(&inner);
-                            word.push('`');
-                            nested.extend(commands(&inner));
+                            nested.extend(sub.commands);
                         }
                         _ => word.push(q),
                     }
                 }
+                p.complete &= closed;
             }
             '\\' => {
                 in_word = true;
@@ -186,16 +286,17 @@ fn commands(s: &str) -> Vec<Vec<String>> {
                     word.push(n);
                 }
             }
+            '#' if !in_word => while chars.next_if(|&c| c != '\n').is_some() {},
             ';' | '&' | '|' | '\n' | '(' | ')' | '`' => {
                 end_word(&mut word, &mut in_word, &mut words);
                 if !words.is_empty() {
-                    out.push(std::mem::take(&mut words));
+                    p.commands.push(std::mem::take(&mut words));
                 }
             }
             '$' if chars.peek() == Some(&'(') => {
                 end_word(&mut word, &mut in_word, &mut words);
                 if !words.is_empty() {
-                    out.push(std::mem::take(&mut words));
+                    p.commands.push(std::mem::take(&mut words));
                 }
             }
             c if c.is_whitespace() => end_word(&mut word, &mut in_word, &mut words),
@@ -207,21 +308,41 @@ fn commands(s: &str) -> Vec<Vec<String>> {
     }
     end_word(&mut word, &mut in_word, &mut words);
     if !words.is_empty() {
-        out.push(words);
+        p.commands.push(words);
     }
-    out.extend(nested);
-    out
+    p.commands.extend(nested);
+    p
+}
+
+/// Append the text up to the closing `close` to `word`; `escapes`: a backslash escapes the
+/// next character (`$'…'`). Returns whether the closing character was found.
+fn read_until(chars: &mut Chars<'_>, word: &mut String, close: char, escapes: bool) -> bool {
+    while let Some(c) = chars.next() {
+        if c == close {
+            return true;
+        }
+        if escapes && c == '\\' {
+            if let Some(n) = chars.next() {
+                word.push(n);
+            }
+            continue;
+        }
+        word.push(c);
+    }
+    false
 }
 
 /// The text of a command substitution up to its closing `close` (`)` with nesting, or a
-/// backtick), consumed from `chars`; quotes inside are kept as they are.
-fn substitution(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, close: char) -> String {
+/// backtick), consumed from `chars`, and whether it was closed. Quotes inside are kept as
+/// they are; in single quotes a backslash is an ordinary character.
+fn substitution(chars: &mut Chars<'_>, close: char) -> (String, bool) {
     let mut inner = String::new();
     let mut depth = 0usize;
-    let mut quote: Option<char> = None;
+    let mut quote: Option<char> = None; // '\'', '"', or 'a' for `$'…'`
     while let Some(c) = chars.next() {
         match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
+            (Some('\''), '\'') | (Some('"'), '"') | (Some('a'), '\'') => quote = None,
+            (Some('\''), _) => {}
             (_, '\\') => {
                 inner.push(c);
                 if let Some(n) = chars.next() {
@@ -229,11 +350,20 @@ fn substitution(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, close: cha
                 }
                 continue;
             }
+            (Some(_), _) => {}
+            (None, '$') if close == ')' && chars.peek() == Some(&'\'') => {
+                inner.push(c);
+                if let Some(n) = chars.next() {
+                    inner.push(n);
+                }
+                quote = Some('a');
+                continue;
+            }
             (None, '\'' | '"') if close == ')' => quote = Some(c),
             (None, '(') if close == ')' => depth += 1,
             (None, c) if c == close => {
                 if depth == 0 {
-                    return inner;
+                    return (inner, true);
                 }
                 depth -= 1;
             }
@@ -241,7 +371,7 @@ fn substitution(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, close: cha
         }
         inner.push(c);
     }
-    inner
+    (inner, false)
 }
 
 /// Shell words that can precede a command without being it.
@@ -424,8 +554,16 @@ fn push_publishes(args: &[String]) -> bool {
     if help(args) || args.iter().any(|a| a == "--dry-run" || a == "-n") {
         return false;
     }
-    if args.iter().any(|a| a == "--delete" || a == "-d") {
-        return false;
+    let mut skip = false;
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if PUSH_VALUE_OPTIONS.contains(&a.as_str()) {
+            skip = true;
+        } else if a == "--delete" || a == "-d" {
+            return false;
+        }
     }
     let operands = non_options(args, PUSH_VALUE_OPTIONS);
     let refspecs = operands.get(1..).unwrap_or_default();
@@ -501,9 +639,39 @@ mod tests {
             "git push -o ci.skip origin main",
             "git -c alias.p=push p origin main",
             "echo $((1<<2))\ngit push origin main",
+            // The fourth review: Claude Code's own commit idiom with an apostrophe in the
+            // message, comments, and quoting the parser got wrong.
+            "git commit -m \"$(cat <<'EOF'\nFix the parser\n\nIt's quote-aware now.\nEOF\n)\" && git push origin main",
+            "gh pr create --title x --body \"$(cat <<'EOF'\nIt's done\nEOF\n)\"",
+            "# Push so it's on the remote\ngit push origin main",
+            "cargo test # make sure it's green\ngit push",
+            "echo \"$(echo 'a\\')\"; git push origin main",
+            "x=\"$(echo \"$p\" | tr '\\' '/')\"; git push origin main",
+            "git push -o --delete origin main",
+            "echo $'it\\'s <<EOF'\ngit push origin main",
+            "echo $((x<<y))\ngit push origin main",
+            "echo 'never closed\ngit push origin main",
+            // A `<<` that is not a heredoc must not swallow a push before a line that
+            // looks like its delimiter; an unterminated heredoc keeps everything.
+            "echo $((x<<y))\ngit push origin main\ny",
+            "echo $'it\\'s <<EOF'\ngit push origin main\nEOF",
+            "cat <<EOF\ngit push origin main",
+            "true;# a comment <<EOF\ngit push origin main\nEOF",
+            "echo \"<<X\"\ngit push origin main\nX",
+            "(( a = 1<<2 ))\ngit push origin main\n2",
         ] {
             assert!(publishes(cmd), "{cmd}");
         }
+    }
+
+    /// Deep nesting must not overflow the stack (the hook would die and the wrapper would
+    /// let the command through); past the limit, mentioning a push is enough.
+    #[test]
+    fn deep_nesting_is_bounded() {
+        let cmd = format!("{}git push origin main", "echo \"$(".repeat(20_000));
+        assert!(publishes(&cmd));
+        let quiet = format!("{}true", "echo \"$(".repeat(20_000));
+        assert!(!publishes(&quiet));
     }
 
     #[test]
@@ -533,6 +701,10 @@ mod tests {
             "gh --repo o/r pr merge 1",
             "echo \"$(git log -1)\"",
             "git -c alias.p=push p --delete origin x",
+            "git commit -m \"$(cat <<'EOF'\nIt's ready for git push later\nEOF\n)\"",
+            "echo 'git push' # it's only text",
+            "true;# it's a comment <<EOF\ngit status",
+            "echo \"$(echo 'a\\')\" && echo 'remember: git push'",
         ] {
             assert!(!publishes(cmd), "{cmd}");
         }

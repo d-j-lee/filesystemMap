@@ -214,7 +214,7 @@ fn configs(root: &Path) -> Vec<ConfigFile> {
     // macOS), while `root` is spelled as given.
     let (croot, ctop) = (canon(root), top.as_deref().map(canon));
     let place_of = |path: &Path| -> Place {
-        let path = canon(path);
+        let path = canon_file(path);
         let Some(top) = ctop.as_deref() else {
             return if path.starts_with(&croot) {
                 Place::Unversioned
@@ -270,7 +270,7 @@ fn configs(root: &Path) -> Vec<ConfigFile> {
         if !path.is_file() {
             continue;
         }
-        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let key = canon_file(&path);
         if seen.contains(&key) {
             continue;
         }
@@ -278,7 +278,63 @@ fn configs(root: &Path) -> Vec<ConfigFile> {
         let place = place_of(&path);
         out.push(ConfigFile { path, kind, place });
     }
+    // Files a cargo configuration includes, each placed on its own: a tracked config can
+    // include an ignored one (fourth review, M1). Appended entries are followed in turn.
+    let mut i = 0;
+    while i < out.len() {
+        if out[i].kind == Kind::Cargo {
+            for path in includes(&out[i].path) {
+                let key = canon_file(&path);
+                if !path.is_file() || seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                let place = place_of(&path);
+                out.push(ConfigFile {
+                    path,
+                    kind: Kind::Cargo,
+                    place,
+                });
+            }
+        }
+        i += 1;
+    }
     out
+}
+
+/// The files a cargo configuration file includes (`include = "a.toml"`, a list of paths,
+/// or of `{ path, optional }` tables), relative to its directory.
+fn includes(config: &Path) -> Vec<PathBuf> {
+    let Some(dir) = config.parent() else {
+        return Vec::new();
+    };
+    let table = std::fs::read_to_string(config)
+        .ok()
+        .and_then(|t| t.parse::<toml::Table>().ok());
+    let Some(v) = table.as_ref().and_then(|t| t.get("include")) else {
+        return Vec::new();
+    };
+    let entries: Vec<&toml::Value> = match v {
+        toml::Value::Array(a) => a.iter().collect(),
+        other => vec![other],
+    };
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            e.as_str()
+                .or_else(|| e.get("path").and_then(toml::Value::as_str))
+        })
+        .map(|p| dir.join(p))
+        .collect()
+}
+
+/// A file's path with its directory resolved but not the file itself: a link inside the
+/// repository is placed where the link is, not where it points (fourth review, m1).
+fn canon_file(p: &Path) -> PathBuf {
+    match (p.parent(), p.file_name()) {
+        (Some(d), Some(n)) => canon(d).join(n),
+        _ => canon(p),
+    }
 }
 
 fn canon(p: &Path) -> PathBuf {
@@ -293,10 +349,10 @@ fn place_of_file(path: &Path) -> Place {
     };
     match git::run({
         let mut c = git::git(dir);
-        c.args(["ls-files", "-z", "--"]).arg(name);
+        c.args(["ls-files", "-v", "-z", "--"]).arg(name);
         c
     }) {
-        Ok(o) if !o.is_empty() => Place::Tracked,
+        Ok(o) if o.first().is_some_and(|t| index_tag_tracked(*t)) => Place::Tracked,
         Ok(_) => Place::Hidden,
         Err(_) => Place::Outside,
     }
@@ -310,6 +366,13 @@ fn toplevel(root: &Path) -> Option<PathBuf> {
     })
     .ok()
     .map(|o| PathBuf::from(String::from_utf8_lossy(&o).trim()))
+}
+
+/// Whether a `git ls-files -v` tag means git sees the file's changes: not for
+/// skip-worktree (`S`) or assume-unchanged (lower case), which hide them (fourth review,
+/// M4).
+fn index_tag_tracked(tag: u8) -> bool {
+    tag.is_ascii_uppercase() && tag != b'S'
 }
 
 /// Configuration files inside the work tree at `top`, relative to it, with whether git
@@ -326,10 +389,11 @@ fn listed_files(top: &Path) -> Vec<(String, bool)> {
         ":(glob)**/rust-toolchain.toml",
         ":(exclude)target/",
     ];
-    let list = |others: bool| -> Vec<String> {
+    // `-v` prefixes each entry with a tag and a space.
+    let list = |others: bool| -> Vec<(String, bool)> {
         git::run({
             let mut c = git::git(top);
-            c.args(["ls-files", "-z"]);
+            c.args(["ls-files", "-v", "-z"]);
             if others {
                 c.arg("--others");
             }
@@ -338,14 +402,17 @@ fn listed_files(top: &Path) -> Vec<(String, bool)> {
         })
         .map(|o| {
             o.split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .filter(|s| s.len() > 2)
+                .map(|s| {
+                    let tracked = !others && index_tag_tracked(s[0]);
+                    (String::from_utf8_lossy(&s[2..]).into_owned(), tracked)
+                })
                 .collect()
         })
         .unwrap_or_default()
     };
-    let mut out: Vec<(String, bool)> = list(false).into_iter().map(|p| (p, true)).collect();
-    out.extend(list(true).into_iter().map(|p| (p, false)));
+    let mut out = list(false);
+    out.extend(list(true));
     out
 }
 
@@ -385,6 +452,34 @@ fn user_rustfmt_dirs() -> Vec<PathBuf> {
     out
 }
 
+/// The build targets the configuration files and the environment name (`build.target` as
+/// a string or a list, `CARGO_BUILD_TARGET`): their `[target.<triple>]` tables apply too
+/// (fourth review, M5).
+fn build_targets(files: &[ConfigFile]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in files.iter().filter(|c| c.kind == Kind::Cargo) {
+        let table = std::fs::read_to_string(&c.path)
+            .ok()
+            .and_then(|t| t.parse::<toml::Table>().ok());
+        match table.as_ref().and_then(|t| t.get("build")?.get("target")) {
+            Some(toml::Value::String(t)) => out.push(t.clone()),
+            Some(toml::Value::Array(a)) => {
+                out.extend(a.iter().filter_map(|t| t.as_str().map(String::from)));
+            }
+            _ => {}
+        }
+    }
+    if let Some(v) = std::env::var_os("CARGO_BUILD_TARGET") {
+        out.extend(
+            v.to_string_lossy()
+                .split([',', ' '])
+                .filter(|t| !t.is_empty())
+                .map(String::from),
+        );
+    }
+    out
+}
+
 /// The host triple, for deciding which `[target.<triple>]` tables apply.
 fn host_triple(dir: &Path) -> Option<String> {
     let out = super::verify::clean_command(dir, "rustc")
@@ -412,6 +507,7 @@ pub fn scan(root: &Path, members: &[PathBuf], trust: &[String]) -> Vec<Finding> 
             && matches!(c.place, Place::Tracked | Place::Unversioned)
             && c.path.parent().is_some_and(|d| root.starts_with(d))
     });
+    let targets = build_targets(&files);
     let mut out = Vec::new();
     for c in files {
         if c.place == Place::Tracked {
@@ -471,10 +567,15 @@ pub fn scan(root: &Path, members: &[PathBuf], trust: &[String]) -> Vec<Finding> 
                     root,
                     c.place == Place::Hidden,
                     host.as_deref(),
+                    &targets,
                     &mut push,
                 ),
                 Err(e) => push("unreadable", format!("not valid TOML: {}", e.message())),
             },
+            Kind::Toolchain if c.place == Place::Hidden => push(
+                "untracked-toolchain-config",
+                format!("a toolchain pin git does not track: {}", text.trim()),
+            ),
             Kind::Toolchain => match text.parse::<toml::Table>() {
                 Ok(t) => toolchain_findings(&t, rustup.as_deref(), &mut push),
                 // The legacy `rust-toolchain` file may hold just a channel name.
@@ -516,6 +617,14 @@ fn toolchain_scan_with(dir: &Path, trust: &[String], rustup: Option<&Path>) -> V
                     trustable: place != Place::Hidden,
                 });
             };
+            if place == Place::Hidden {
+                // Even an official channel changes which clippy and rustfmt run.
+                push(
+                    "untracked-toolchain-config",
+                    format!("a toolchain pin git does not track: {}", text.trim()),
+                );
+                continue;
+            }
             match text.parse::<toml::Table>() {
                 Ok(t) => toolchain_findings(&t, rustup, &mut push),
                 Err(_) if !text.trim().contains(['=', '[']) => {
@@ -625,27 +734,27 @@ fn known_tool(v: &toml::Value, root: &Path, known: &[&str]) -> bool {
 const GATE_SUBCOMMANDS: &[&str] = &["fmt", "clippy", "deny", "test", "check", "build"];
 
 /// Judge a parsed cargo configuration. `hidden`: inside the repository but untracked, where
-/// every `[env]` entry fails (cargo hands them to rustc, clippy and the test binaries).
-/// `[target.<triple>]` tables apply only to the host, the configured build target and
-/// `cfg(...)` selectors.
+/// every `[env]` entry, every flag and every `[target.<triple>]` table counts (cargo hands
+/// `[env]` to rustc, clippy and the test binaries; `--cfg` can compile a failing test out).
+/// Elsewhere `[target.<triple>]` tables apply only to the host, the `targets` the
+/// configuration builds for, and `cfg(...)` selectors.
 fn cargo_findings(
     t: &toml::Table,
     root: &Path,
     hidden: bool,
     host: Option<&str>,
+    targets: &[String],
     push: &mut Push<'_>,
 ) {
-    let build_target = t
-        .get("build")
-        .and_then(|b| b.get("target"))
-        .and_then(toml::Value::as_str);
     for (key, v) in t {
         match key.as_str() {
             "build" => {
                 for (k, v) in entries(v) {
                     let path = format!("build.{k}");
                     match k.as_str() {
-                        "rustflags" | "rustdocflags" => flag_findings(&path, v, Some(root), push),
+                        "rustflags" | "rustdocflags" => {
+                            flag_findings(&path, v, Some(root), hidden, push);
+                        }
                         "rustc-wrapper" | "rustc-workspace-wrapper"
                             if known_tool(v, root, KNOWN_WRAPPERS) => {}
                         "rustc" | "rustc-wrapper" | "rustc-workspace-wrapper" | "rustdoc" => {
@@ -658,9 +767,10 @@ fn cargo_findings(
             }
             "target" => {
                 for (selector, tv) in entries(v) {
-                    let applies = selector.starts_with("cfg(")
+                    let applies = hidden
+                        || selector.starts_with("cfg(")
                         || Some(selector.as_str()) == host
-                        || Some(selector.as_str()) == build_target
+                        || targets.contains(selector)
                         || host.is_none();
                     if !applies {
                         continue;
@@ -672,7 +782,7 @@ fn cargo_findings(
                             "linker" if known_tool(v, root, KNOWN_LINKERS) => {}
                             "linker" | "ar" => push("linker", show(&path, v)),
                             "rustflags" | "rustdocflags" => {
-                                flag_findings(&path, v, Some(root), push);
+                                flag_findings(&path, v, Some(root), hidden, push);
                             }
                             // `[target.<triple>.<lib>]` build-script overrides.
                             _ => push("config:target", show(&path, v)),
@@ -710,6 +820,8 @@ fn cargo_findings(
                 }
             }
             "profile" => profile_findings("profile", v, push),
+            // Followed by `configs`, each included file judged by its own place.
+            "include" => {}
             k if CARGO_SAFE_TABLES.contains(&k) => {}
             k => push(&format!("config:{k}"), show(k, v)),
         }
@@ -764,8 +876,15 @@ const LINK_CODEGEN: &[&str] = &[
 ];
 
 /// Judge a `rustflags` value (an array, or a string split at whitespace): one finding per
-/// kind, naming the flags (a flag's value is not reported as a flag of its own).
-fn flag_findings(path: &str, v: &toml::Value, root: Option<&Path>, push: &mut Push<'_>) {
+/// kind, naming the flags (a flag's value is not reported as a flag of its own). In a
+/// hidden file any flag counts.
+fn flag_findings(
+    path: &str,
+    v: &toml::Value,
+    root: Option<&Path>,
+    hidden: bool,
+    push: &mut Push<'_>,
+) {
     let tokens: Vec<String> = match v {
         toml::Value::Array(a) => a
             .iter()
@@ -780,6 +899,9 @@ fn flag_findings(path: &str, v: &toml::Value, root: Option<&Path>, push: &mut Pu
             Some((_, flags)) => flags.push(flag),
             None => by_kind.push((kind, vec![flag])),
         }
+    }
+    if hidden && by_kind.is_empty() && !tokens.is_empty() {
+        by_kind.push(("rustflag", tokens));
     }
     for (kind, flags) in by_kind {
         push(kind, format!("{path}: {}", flags.join(" ")));
@@ -1358,6 +1480,104 @@ mod tests {
         assert!(f.len() == 1 && !f[0].trustable, "{f:?}");
         git(dir.path(), &["add", "rust-toolchain.toml"]);
         assert!(toolchain_scan(&sub, &[]).is_empty());
+    }
+
+    /// A tracked config can `include` an ignored one; the included file is judged by its
+    /// own place and is part of the fingerprint (fourth review, M1).
+    #[test]
+    fn included_configs_are_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "-q"]);
+        write(r, ".gitignore", "/.cargo/local.toml\n");
+        write(
+            r,
+            ".cargo/config.toml",
+            "include = [{ path = \"local.toml\", optional = true }]\n",
+        );
+        git(r, &["add", ".gitignore", ".cargo/config.toml"]);
+        write(
+            r,
+            ".cargo/local.toml",
+            &format!("[target.{}]\nrunner = \"true\"\n", host()),
+        );
+        assert_eq!(kinds_trusting(r, &["runner".into()]), ["runner"]);
+        assert!(config_files(r).iter().any(|p| p.ends_with("local.toml")));
+    }
+
+    /// `git update-index --skip-worktree` hides a tracked file's changes from git; it is
+    /// judged as hidden (fourth review, M4).
+    #[test]
+    fn skip_worktree_configs_are_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "-q"]);
+        write(r, ".cargo/config.toml", "[build]\njobs = 2\n");
+        git(r, &["add", ".cargo/config.toml"]);
+        write(
+            r,
+            ".cargo/config.toml",
+            &format!("[target.{}]\nrunner = \"true\"\n", host()),
+        );
+        assert!(kinds(r).is_empty(), "tracked, not judged");
+        git(
+            r,
+            &["update-index", "--skip-worktree", ".cargo/config.toml"],
+        );
+        assert_eq!(kinds(r), ["runner"]);
+    }
+
+    /// The build target can be an array or come from another file; a hidden file has every
+    /// target table judged (fourth review, M5). A hidden file's flags all count, `--cfg`
+    /// included, since `#[cfg(not(x))]` can compile a failing test out (M7).
+    #[test]
+    fn target_tables_and_flags_in_hidden_and_outside_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(
+            r,
+            ".cargo/config.toml",
+            "[build]\ntarget = [\"thumbv7em-none-eabihf\"]\n\
+             [target.thumbv7em-none-eabihf]\nrunner = \"true\"\n",
+        );
+        assert_eq!(kinds(r), ["runner"], "array build target, no git");
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "-q"]);
+        write(
+            r,
+            ".cargo/config.toml",
+            "[target.wasm32-unknown-unknown]\nrunner = \"true\"\n\
+             [build]\nrustflags = [\"--cfg\", \"miri\"]\n",
+        );
+        assert_eq!(kinds(r), ["runner", "rustflag"]);
+    }
+
+    /// A symlink inside the repository is placed where the link is, not where it points
+    /// (fourth review, m1); a hidden toolchain file fails whatever channel it pins (m2).
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_and_hidden_toolchain_files_are_hidden() {
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "fmt.toml", "tab_spaces = 8\n");
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "-q"]);
+        write(r, "rustfmt.toml", "edition = \"2021\"\n");
+        git(r, &["add", "rustfmt.toml"]);
+        std::fs::create_dir_all(r.join("src")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("fmt.toml"), r.join("src/rustfmt.toml"))
+            .unwrap();
+        assert_eq!(kinds(r), ["untracked-rustfmt-config"]);
+        std::fs::remove_file(r.join("src/rustfmt.toml")).unwrap();
+        write(
+            r,
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = \"1.80.0\"\n",
+        );
+        assert_eq!(kinds(r), ["untracked-toolchain-config"]);
+        let f = toolchain_scan(r, &["untracked-toolchain-config".into()]);
+        assert!(f.len() == 1 && !f[0].trustable, "{f:?}");
     }
 
     /// Variables are judged by value where that is safe (third review, finding 8).

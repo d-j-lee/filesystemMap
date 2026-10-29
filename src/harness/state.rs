@@ -272,6 +272,9 @@ fn hash_tree(h: &mut xxhash_rust::xxh3::Xxh3, root: &Path, depth: usize) -> Opti
     for path in dirty_paths(&status) {
         hash_file(h, &root.join(&path));
     }
+    for path in hidden_index_entries(root) {
+        hash_file(h, &root.join(&path));
+    }
     if depth < 2 {
         for sub in submodules(root) {
             let p = root.join(&sub);
@@ -391,7 +394,26 @@ pub fn content_hash(path: &Path) -> String {
     )
 }
 
+/// The current paths in `git status --porcelain=v2 -z` output (a rename's new path).
 pub fn dirty_paths(status: &[u8]) -> Vec<String> {
+    status_entries(status)
+        .into_iter()
+        .filter(|e| !e.origin)
+        .map(|e| e.path)
+        .collect()
+}
+
+/// One path in `git status` output.
+pub struct StatusEntry {
+    pub path: String,
+    pub untracked: bool,
+    /// The original path of a rename or copy.
+    pub origin: bool,
+}
+
+/// The paths in `git status --porcelain=v2 -z` output; a rename's original path is listed
+/// too, as a tracked change (fourth review, M2).
+pub fn status_entries(status: &[u8]) -> Vec<StatusEntry> {
     let mut out = Vec::new();
     let mut fields = status.split(|&b| b == 0);
     while let Some(entry) = fields.next() {
@@ -409,13 +431,41 @@ pub fn dirty_paths(status: &[u8]) -> Vec<String> {
             _ => continue,
         };
         if let Some(path) = rest.splitn(skip + 1, ' ').nth(skip) {
-            out.push(path.to_string());
+            out.push(StatusEntry {
+                path: path.to_string(),
+                untracked: kind == "?",
+                origin: false,
+            });
         }
-        if kind == "2" {
-            fields.next();
+        if kind == "2"
+            && let Some(origin) = fields.next()
+        {
+            out.push(StatusEntry {
+                path: String::from_utf8_lossy(origin).into_owned(),
+                untracked: false,
+                origin: true,
+            });
         }
     }
     out
+}
+
+/// Tracked files whose changes git was told not to show (`--skip-worktree`,
+/// `--assume-unchanged`), relative to the work tree top: `git status` cannot see their
+/// edits, so they are hashed and treated as uncommitted (fourth review, M4).
+pub fn hidden_index_entries(dir: &Path) -> Vec<String> {
+    git::run({
+        let mut c = git::git(dir);
+        c.args(["ls-files", "-v", "-z", "--full-name"]);
+        c
+    })
+    .map(|o| {
+        o.split(|&b| b == 0)
+            .filter(|e| e.len() > 2 && (e[0] == b'S' || e[0].is_ascii_lowercase()))
+            .map(|e| String::from_utf8_lossy(&e[2..]).into_owned())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn hash_file(h: &mut xxhash_rust::xxh3::Xxh3, path: &Path) {
