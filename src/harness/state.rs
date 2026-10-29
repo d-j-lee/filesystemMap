@@ -27,6 +27,10 @@ pub struct Session {
     pub start_fp: Option<String>,
     /// HEAD when the session was first seen, for telling which files it changed.
     pub start_head: Option<String>,
+    /// Files already changed or untracked when the session was first seen, relative to
+    /// the work tree top, with a hash of their contents: unchanged since, they are not the
+    /// session's (third review, finding 7).
+    pub start_dirty: BTreeMap<String, String>,
     /// Consecutive blocking gate failures since the user last wrote.
     pub failures: u32,
     /// The "stop and report" message was given for the current failure streak.
@@ -227,8 +231,12 @@ pub fn fingerprint(root: &Path, trust: &[String]) -> Option<String> {
     for path in integrity::config_files(root) {
         hash_file(&mut h, &path);
     }
-    let vars: Vec<(String, String)> = std::env::vars().collect();
-    for name in integrity::weakening_env(vars.iter().map(|(k, _)| k.as_str()), trust) {
+    let vars = super::verify::env_vars();
+    for name in integrity::weakening_env(
+        vars.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        trust,
+        root,
+    ) {
         if let Some((_, v)) = vars.iter().find(|(k, _)| *k == name) {
             h.update(format!("{name}={v}\n").as_bytes());
         }
@@ -325,6 +333,64 @@ fn ignored_build_inputs(root: &Path) -> Vec<String> {
 }
 
 /// Paths named by `git status --porcelain=v2 -z` (renames give their new path).
+/// The changed and untracked files of the work tree around `dir` with a hash of each one's
+/// contents, relative to the work tree top; empty without git or when there are more than
+/// `MAX_DIRTY` (then every change counts as the session's, the strict reading).
+pub fn dirty_snapshot(dir: &Path) -> BTreeMap<String, String> {
+    const MAX_DIRTY: usize = 2000;
+    let Ok(top) = git::run({
+        let mut c = git::git(dir);
+        c.args(["rev-parse", "--show-toplevel"]);
+        c
+    }) else {
+        return BTreeMap::new();
+    };
+    let top = PathBuf::from(String::from_utf8_lossy(&top).trim());
+    let status = git::run({
+        let mut c = git::git_worktree(dir);
+        c.args([
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=dirty",
+        ]);
+        c
+    })
+    .unwrap_or_default();
+    let paths = dirty_paths(&status);
+    if paths.len() > MAX_DIRTY {
+        return BTreeMap::new();
+    }
+    paths
+        .into_iter()
+        .map(|p| {
+            let hash = content_hash(&top.join(&p));
+            (p, hash)
+        })
+        .collect()
+}
+
+/// A hash of a file's contents, `-` when it cannot be read (deleted, a directory). Files
+/// over 16 MiB are identified by size and modification time instead of being read.
+pub fn content_hash(path: &Path) -> String {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return "-".into();
+    };
+    if meta.len() > 16 << 20 {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        return format!("{}:{mtime}", meta.len());
+    }
+    std::fs::read(path).map_or_else(
+        |_| "-".into(),
+        |b| format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&b)),
+    )
+}
+
 pub fn dirty_paths(status: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut fields = status.split(|&b| b == 0);

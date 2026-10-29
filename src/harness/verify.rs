@@ -115,10 +115,16 @@ pub fn workspace_root(dir: &Path) -> Result<PathBuf> {
             .iter()
             .map(|f| format!("{}: {} ({})", f.file, f.text, f.kind))
             .collect();
+        let remedy = if unsafe_toolchain.iter().all(|f| f.trustable) {
+            "Remove them, or list the kind under [*.metadata.fsmap.verify] trust if this \
+             machine needs them"
+        } else {
+            "A toolchain file git does not track is what CI never sees: remove it, and leave \
+             committing one to the user"
+        };
         bail!(
             "refusing to run cargo: the toolchain settings would run binaries of the \
-             repository's choosing: {}. Remove them, or list the kind under \
-             [*.metadata.fsmap.verify] trust if the repository needs it",
+             repository's choosing: {}. {remedy}",
             list.join("; ")
         );
     }
@@ -144,19 +150,7 @@ pub fn workspace_root(dir: &Path) -> Result<PathBuf> {
 /// The directories of the workspace's member packages (`cargo metadata --no-deps`), or the
 /// root alone when cargo cannot say.
 pub fn members(root: &Path) -> Vec<PathBuf> {
-    let found: Vec<PathBuf> = clean_command(root, "cargo")
-        .args([
-            "metadata",
-            "--no-deps",
-            "--format-version",
-            "1",
-            "--offline",
-        ])
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+    let found: Vec<PathBuf> = metadata(root)
         .and_then(|meta| {
             meta["packages"].as_array().map(|ps| {
                 ps.iter()
@@ -176,6 +170,45 @@ pub fn members(root: &Path) -> Vec<PathBuf> {
     } else {
         found
     }
+}
+
+/// Where the workspace's targets read Rust sources from, canonical: each target's root
+/// file's directory with everything below it (`src/`, `tests/`, `examples/`), and for a
+/// build script only the files beside it (`true` marks the recursive ones). `None` when
+/// cargo cannot tell.
+pub fn source_dirs(root: &Path) -> Option<Vec<(PathBuf, bool)>> {
+    let meta = metadata(root)?;
+    let mut out = Vec::new();
+    for t in meta["packages"]
+        .as_array()?
+        .iter()
+        .filter_map(|p| p["targets"].as_array())
+        .flatten()
+    {
+        let src = Path::new(t["src_path"].as_str()?);
+        let dir = std::fs::canonicalize(src.parent()?).ok()?;
+        let build_script = t["kind"]
+            .as_array()
+            .is_some_and(|k| k.iter().any(|k| k == "custom-build"));
+        out.push((dir, !build_script));
+    }
+    Some(out)
+}
+
+fn metadata(root: &Path) -> Option<serde_json::Value> {
+    clean_command(root, "cargo")
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--offline",
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_slice(&o.stdout).ok())
 }
 
 /// The nearest `Cargo.toml` at or above `dir`.
@@ -299,7 +332,7 @@ pub fn run(
     mut progress: impl FnMut(&StepResult),
 ) -> Report {
     let started = Instant::now();
-    let removed_env = removed_env(&cfg.trust);
+    let removed_env = removed_env(root, &cfg.trust);
     let mut results = Vec::with_capacity(steps.len() + 1);
     let integrity = integrity_step(root, &cfg.trust);
     progress(&integrity);
@@ -321,12 +354,21 @@ pub fn run(
     }
 }
 
-/// Weakening environment variables set right now, minus trusted ones.
-fn removed_env(trust: &[String]) -> Vec<String> {
-    let names: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .collect();
-    integrity::weakening_env(names.iter().map(String::as_str), trust)
+/// The environment as text (values lossily: a weakening value stays weakening).
+pub fn env_vars() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
+        .collect()
+}
+
+/// Weakening environment variables set right now for work in `root`, minus trusted ones.
+fn removed_env(root: &Path, trust: &[String]) -> Vec<String> {
+    let vars = env_vars();
+    integrity::weakening_env(
+        vars.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        trust,
+        root,
+    )
 }
 
 /// A command that runs like a gate step: in `root`, without the weakening environment
@@ -338,7 +380,7 @@ pub fn step_command(root: &Path, program: &str, cfg: &Config) -> Command {
     c.current_dir(root)
         .env("CARGO_TERM_COLOR", "never")
         .env("RUST_BACKTRACE", "0");
-    for k in removed_env(&cfg.trust) {
+    for k in removed_env(root, &cfg.trust) {
         c.env_remove(k);
     }
     if let Some(t) = target_dir(root, &cfg.trust) {
@@ -352,7 +394,7 @@ pub fn step_command(root: &Path, program: &str, cfg: &Config) -> Command {
 pub fn clean_command(dir: &Path, program: &str) -> Command {
     let mut c = Command::new(program);
     c.current_dir(dir);
-    for k in removed_env(&[]) {
+    for k in removed_env(dir, &[]) {
         c.env_remove(k);
     }
     c
@@ -390,13 +432,22 @@ fn integrity_step(root: &Path, trust: &[String]) -> StepResult {
             Status::Fail
         },
         ms: started.elapsed().as_millis() as u64,
-        tail: if findings.is_empty() {
+        tail: {
+            let mut tail = tail;
+            if findings.iter().any(|f| !f.trustable) {
+                tail.push_str(
+                    "\nFiles inside the repository that git does not track are what CI never \
+                     sees: remove them. If the project needs one, committing it is the user's \
+                     decision; ask them.",
+                );
+            }
+            if findings.iter().any(|f| f.trustable) {
+                tail.push_str(
+                    "\nSettings outside the repository: remove them, or list the kind under \
+                     [*.metadata.fsmap.verify] trust if this machine needs them.",
+                );
+            }
             tail
-        } else {
-            format!(
-                "{tail}\nRemove these settings, or list the kind under \
-                 [*.metadata.fsmap.verify] trust if the repository needs it."
-            )
         },
         files,
     }

@@ -122,7 +122,7 @@ Measured 2026-10-28 on a 4-core cloud container, release build.
 | `/usr`, 93 k entries, `--no-git` | scan 0.14 s; content 1.6 s warm / 10.8 s cold (456 MiB text); peak RSS 88 MB |
 | `/usr --sizes-only` → HTML | 0.57 s, 6.6 MiB report |
 | `brief --hook` on ripgrep with a warm cache (one git call) | 8 ms (median of 30) |
-| `verify` (quick gate) on this repository, 2026-10-29, 120 tests | 41 s with nothing to rebuild; nearly all `cargo test` (34 end-to-end hook tests) |
+| `verify` (quick gate) on this repository, 2026-10-29, 129 tests | 43 s with nothing to rebuild, three runs; nearly all `cargo test` (38 end-to-end hook tests) |
 | `hook session-start` / `hook pre-bash` (non-publishing command) on a clean clone | 0.4 s / 5 ms (3 runs each) |
 
 ## 7. Safety and privacy
@@ -153,10 +153,10 @@ loop. Usage and limits: [agent-harness.md](agent-harness.md); decision record: D
 | Module | Role |
 |---|---|
 | `verify` | The gate: plan the steps, run each in the workspace root with weakening variables removed and `CARGO_TARGET_DIR` inside the repository, attribute fmt/clippy failures to files, render text or JSON |
-| `integrity` | Parse every cargo, rustfmt, clippy and rustup file that applies (ancestors, `CARGO_HOME`, every nested `rustfmt.toml`/`clippy.toml`, ignored ones included) as TOML and judge it against an allowlist; check toolchain files before any cargo runs; list the variables removed from the steps |
+| `integrity` | Find every cargo, rustfmt, clippy and rustup file that applies (ancestors, `CARGO_HOME`, the user's rustfmt files, rustup directory overrides, every nested `rustfmt.toml`/`clippy.toml`, ignored ones included) and place it: tracked files are not judged, hidden ones inside the repository are judged and never trusted, ones outside it are judged and trustable. Judging parses TOML against an allowlist (target tables only for the host). Toolchain settings are checked before any cargo runs; environment variables are judged by name and value |
 | `proc` | Run a command with a deadline; kill its process group on expiry and after exit; stop waiting for output a background process keeps open; keep the last 256 KiB |
 | `state` | Per-worktree state (per-session baseline, last pass and failure); hooks record outcomes through a locked read-modify-write; the outcome log; the work-tree fingerprint |
-| `shell` | Recognise publishing commands (`git push`, `gh pr create\|merge`) through quoting, wrappers, `sh -c` and global options |
+| `shell` | Recognise publishing commands (`git push`, `gh pr create`) through quoting, substitutions, wrappers, `sh -c` and global options; deleting refs, `--help` and `--dry-run` are not publishing |
 | `hooks` | The five Claude Code hooks and `stats`: JSON in, one JSON answer out, exit 0; panics become a message |
 
 The stop gate keys on a **fingerprint** of what the gate depends on: HEAD, `git status`
@@ -164,12 +164,15 @@ The stop gate keys on a **fingerprint** of what the gate depends on: HEAD, `git 
 git-ignored files cargo still compiles, the config files and weakening variables above,
 `rustc -vV` and the fsmap version. A tree whose fingerprint already passed, or equals the
 session's starting point, is not checked again (for a push, only a recorded pass counts). The
-gate passes only when every step passes. Failures are attributed to files; when all of them are
-in files the session did not change (never integrity failures), the stop is blocked once and then
-released with a report, and the user is told the gate did not pass. When cargo cannot read the
+gate passes only when every step passes. Failures are attributed to files; a file counts as the
+session's when it changed since the session was first seen, unless it was already changed then
+and is byte-identical now (hashes taken at first sight). When all failures are in files the
+session did not change (never integrity failures), the stop is blocked once and then released
+with a report, and the user is told the gate did not pass. When cargo cannot read the
 project, the gate cannot run: the stop is blocked and a push denied. Without a fingerprint (no
-git) the gate runs every time. A push is denied while build inputs are uncommitted, since the
-gate checks the work tree and the push sends HEAD. The threat model (hidden configuration fails,
+git) the gate runs every time. A push is denied while build inputs are uncommitted (manifests,
+configuration, and sources in a directory a target reads, from `cargo metadata`), since the gate
+checks the work tree and the push sends HEAD; a pre-push hook that fails denies the push. The threat model (hidden configuration fails,
 tracked changes are reported) is in [agent-harness.md](agent-harness.md).
 
 Templates for other repositories are in `harness/`; this repository uses copies of them in

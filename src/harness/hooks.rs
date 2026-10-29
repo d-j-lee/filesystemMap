@@ -116,31 +116,49 @@ impl Out {
 pub fn run(event: Event, stdin: &str) -> Option<String> {
     let input: Value = serde_json::from_str(stdin).unwrap_or(Value::Null);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(event, &input)));
+    let failed = |what: String| failure_out(event, &input, &what);
     let out = match result {
         Ok(Ok(out)) => out,
-        Ok(Err(e)) => Out {
-            system: vec![format!(
-                "[harness] {} hook did not run: {e:#}",
-                event.name()
-            )],
-            ..Out::default()
-        },
+        Ok(Err(e)) => failed(format!("did not run: {e:#}")),
         Err(panic) => {
             let what = panic
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_default();
-            Out {
-                system: vec![format!(
-                    "[harness] {} hook crashed ({what}); its check did not run",
-                    event.name()
-                )],
-                ..Out::default()
-            }
+            failed(format!("crashed ({what}); its check did not run"))
         }
     };
     out.render(event)
+}
+
+/// What a hook that failed or crashed prints. Publishing is the irreversible step: a
+/// pre-push check that could not run denies the push (third review).
+fn failure_out(event: Event, input: &Value, what: &str) -> Out {
+    if event == Event::PreBash && publishing_command(input) {
+        Out {
+            deny: Some(format!(
+                "fsmap verify must pass before this is pushed or opened as a PR.\n\n\
+                 [harness] the pre-push check {what}. Run `fsmap verify`, and tell the user \
+                 the hook failed."
+            )),
+            ..Out::default()
+        }
+    } else {
+        Out {
+            system: vec![format!("[harness] {} hook {what}", event.name())],
+            ..Out::default()
+        }
+    }
+}
+
+/// Whether a pre-bash input's command publishes; a detector that crashes falls back to
+/// whether the command mentions a push at all.
+fn publishing_command(input: &Value) -> bool {
+    input["tool_input"]["command"].as_str().is_some_and(|cmd| {
+        std::panic::catch_unwind(|| shell::publishes(cmd))
+            .unwrap_or_else(|_| shell::mentions_publish(cmd))
+    })
 }
 
 fn handle(event: Event, input: &Value) -> Result<Out> {
@@ -199,6 +217,15 @@ fn broken_message(e: &str) -> String {
 
 // ---------------------------------------------------------------- session-start
 
+/// Whether the session has no baseline in `dir`'s state yet (reading the state is cheap;
+/// the snapshot of pre-existing changes is taken only then).
+fn first_sight(dir: &Path, sid: &str) -> bool {
+    state::load(dir)
+        .sessions
+        .get(sid)
+        .is_none_or(|s| s.start_head.is_none())
+}
+
 fn session_start(project: &Path, input: &Value) -> Result<Out> {
     let mut out = Out::default();
     let source = input["source"].as_str().unwrap_or("startup");
@@ -209,11 +236,14 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
             // The agent may create the Cargo project later in this session: remember where
             // the session started so that what it commits is judged as its own.
             let head = state::head(project);
+            let dirty = first_sight(project, &sid).then(|| state::dirty_snapshot(project));
+            let dirty = dirty.unwrap_or_default();
             state::update(project, |st| {
                 let s = st.session(&sid);
                 s.last_seen = state::now();
                 if s.start_head.is_none() {
                     s.start_head = Some(head.unwrap_or_else(|| UNBORN.to_string()));
+                    s.start_dirty = dirty;
                 }
             });
             out.system.push(format!(
@@ -232,6 +262,8 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
     let snapshot = state::load(&ws);
     let fp = state::fingerprint(&ws, &cfg.trust);
     let head = state::head(&ws);
+    let dirty = first_sight(&ws, &sid).then(|| state::dirty_snapshot(&ws));
+    let dirty = dirty.unwrap_or_default();
     let now = state::now();
     let others = snapshot.live_others(&sid, now);
     let saved = state::update(&ws, |st| {
@@ -246,6 +278,7 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
         // session is seen, whatever the source (final review M1).
         if s.start_head.is_none() {
             s.start_head = Some(head.clone().unwrap_or_else(|| UNBORN.to_string()));
+            s.start_dirty = dirty;
         }
     });
     if fp.is_some() && fp != snapshot.last_pass_fp && source != "startup" {
@@ -636,11 +669,9 @@ fn gate(
     let exe = std::env::current_exe().context("locating the fsmap binary")?;
     let steps = verify::plan(ws, Mode::Quick, &exe, cfg);
     let report = verify::run(ws, Mode::Quick, &steps, cfg, GATE_BUDGET, |_| {});
-    let touched = touched_files(ws, me.start_head.as_deref());
+    let touched = touched_files(ws, me);
     if report.passed() {
-        let notes = suppression_summary(ws, me.start_head.as_deref())
-            .into_iter()
-            .collect();
+        let notes = suppression_summary(ws, me).into_iter().collect();
         return Ok(Gate::Pass { fp, notes });
     }
     // Integrity and unattributable failures (tests, extra steps) never count as someone
@@ -842,7 +873,15 @@ fn pre_bash(project: &Path, input: &Value) -> Result<Out> {
         Ws::Broken(e) => return Ok(deny(broken_message(&e))),
     };
     let sid = session_id(input);
-    let pending = uncommitted_inputs(&ws);
+    let pending = match uncommitted_inputs(&ws) {
+        Ok(p) => p,
+        Err(e) => {
+            log_gate(&ws, &sid, "push-error", 0);
+            return Ok(deny(format!(
+                "[harness] could not list uncommitted build inputs: {e:#}"
+            )));
+        }
+    };
     if !pending.is_empty() {
         log_gate(&ws, &sid, "push-uncommitted", 0);
         return Ok(deny(format!(
@@ -908,10 +947,11 @@ fn log_gate(ws: &Path, sid: &str, result: &str, ms: u64) {
 }
 
 /// Files changed since the session started (or since HEAD), untracked ones included,
-/// relative to the workspace root with forward slashes. Compared as strings: absolute
-/// paths differ in form (Windows `\\?\` canonical paths vs cargo's), and a mismatch would
-/// turn a new failure into a "pre-existing" one.
-fn touched_files(ws: &Path, start_head: Option<&str>) -> Vec<String> {
+/// minus those already changed then and untouched since, relative to the workspace root
+/// with forward slashes. Compared as strings: absolute paths differ in form (Windows
+/// `\\?\` canonical paths vs cargo's), and a mismatch would turn a new failure into a
+/// "pre-existing" one.
+fn touched_files(ws: &Path, me: &state::Session) -> Vec<String> {
     let Some(root) = toplevel(ws) else {
         return Vec::new();
     };
@@ -922,11 +962,20 @@ fn touched_files(ws: &Path, start_head: Option<&str>) -> Vec<String> {
     })
     .map(|o| String::from_utf8_lossy(&o).trim().to_string())
     .unwrap_or_default();
-    brief::changed_files(&root, &diff_base(ws, start_head))
+    brief::changed_files(&root, &diff_base(ws, me.start_head.as_deref()))
         .unwrap_or_default()
         .into_iter()
+        .filter(|f| !preexisting(&root, me, f))
         .filter_map(|f| f.strip_prefix(&prefix).map(String::from))
         .collect()
+}
+
+/// `rel` (relative to the work tree top at `root`) was already changed when the session
+/// started and has not changed since.
+fn preexisting(root: &Path, me: &state::Session, rel: &str) -> bool {
+    me.start_dirty
+        .get(rel)
+        .is_some_and(|h| *h == state::content_hash(&root.join(rel)))
 }
 
 /// The work tree's top directory (works before the first commit, unlike `brief::locate`).
@@ -957,10 +1006,14 @@ fn diff_base(ws: &Path, start_head: Option<&str>) -> String {
     }
 }
 
-/// Changed or untracked files that can change what the gate checks (Rust sources,
-/// manifests, the lock file), relative to the work tree top. A push sends HEAD; with these
-/// pending, the gate's verdict on the work tree says nothing about HEAD (second review M7).
-fn uncommitted_inputs(ws: &Path) -> Vec<String> {
+/// Changed or untracked files that can change what the gate checks, relative to the work
+/// tree top: manifests, the lock file, cargo, rustfmt, clippy and toolchain configuration,
+/// and Rust sources where a target reads them. A push sends HEAD; with these pending, the
+/// gate's verdict on the work tree says nothing about HEAD (second review M7). A scratch
+/// `.rs` file or a `book.toml` elsewhere does not count (third review, finding 3).
+fn uncommitted_inputs(ws: &Path) -> Result<Vec<String>> {
+    let top = toplevel(ws).context("finding the work tree")?;
+    let top = std::fs::canonicalize(&top).unwrap_or(top);
     let status = crate::git::run({
         let mut c = crate::git::git_worktree(ws);
         c.args([
@@ -972,16 +1025,41 @@ fn uncommitted_inputs(ws: &Path) -> Vec<String> {
         ]);
         c
     })
-    .unwrap_or_default();
+    .context("reading git status")?;
+    let sources = verify::source_dirs(ws);
+    let read_by_a_target = |rel: &str| {
+        let path = top.join(rel);
+        sources.as_ref().is_none_or(|dirs| {
+            dirs.iter().any(|(d, recursive)| {
+                if *recursive {
+                    path.starts_with(d)
+                } else {
+                    path.parent() == Some(d.as_path())
+                }
+            })
+        })
+    };
     let mut out: Vec<String> = state::dirty_paths(&status)
         .into_iter()
         .filter(|p| {
             let name = p.rsplit('/').next().unwrap_or(p);
-            p.ends_with(".rs") || p.ends_with(".toml") || name == "Cargo.lock"
+            matches!(
+                name,
+                "Cargo.toml"
+                    | "Cargo.lock"
+                    | "rust-toolchain"
+                    | "rust-toolchain.toml"
+                    | "rustfmt.toml"
+                    | ".rustfmt.toml"
+                    | "clippy.toml"
+                    | ".clippy.toml"
+            ) || p.ends_with(".cargo/config")
+                || p.ends_with(".cargo/config.toml")
+                || (p.ends_with(".rs") && read_by_a_target(p))
         })
         .collect();
     out.sort();
-    out
+    Ok(out)
 }
 
 /// A manifest line that switches checks or tests off (second review M4): manifests are
@@ -1052,10 +1130,12 @@ fn failure_reason(report: &Report, touched: &[String]) -> String {
 /// What the change adds that weakens checks, shown to the user on a pass (review finding
 /// m6): lint suppressions (`cfg_attr` forms included), `rustfmt::skip`, ignored or
 /// should-panic tests, `cfg(any())`, removed assertions, lints allowed in a manifest, and
-/// changed lint or format configuration. New untracked files count as added lines.
-fn suppression_summary(ws: &Path, start_head: Option<&str>) -> Option<String> {
+/// changed lint, format, cargo or toolchain configuration (tracked configuration is not
+/// judged, so this is where it shows). New untracked files count as added lines; files
+/// already changed when the session started and untouched since do not count.
+fn suppression_summary(ws: &Path, me: &state::Session) -> Option<String> {
     let root = toplevel(ws)?;
-    let base = diff_base(ws, start_head);
+    let base = diff_base(ws, me.start_head.as_deref());
     let pathspecs = [
         "*.rs",
         ":(glob)**/Cargo.toml",
@@ -1065,6 +1145,8 @@ fn suppression_summary(ws: &Path, start_head: Option<&str>) -> Option<String> {
         ":(glob)**/.rustfmt.toml",
         ":(glob)**/.cargo/config",
         ":(glob)**/.cargo/config.toml",
+        ":(glob)**/rust-toolchain",
+        ":(glob)**/rust-toolchain.toml",
     ];
     let diff = crate::git::run({
         let mut c = crate::git::git_worktree(&root);
@@ -1111,10 +1193,13 @@ fn suppression_summary(ws: &Path, start_head: Option<&str>) -> Option<String> {
             lines.extend(text.lines().map(|l| (rel.clone(), '+', l.to_string())));
         }
     }
+    lines.retain(|(file, _, _)| !preexisting(&root, me, file));
     let mut hits: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
     for (file, sign, text) in &lines {
         let name = file.rsplit('/').next().unwrap_or(file);
-        let kind = if !file.ends_with(".rs") && name != "Cargo.toml" {
+        let kind = if file.contains(".cargo/config") || name.starts_with("rust-toolchain") {
+            "build configuration changed"
+        } else if !file.ends_with(".rs") && name != "Cargo.toml" {
             "lint or format configuration changed"
         } else if name == "Cargo.toml" {
             match manifest_weakening(text) {
@@ -1246,6 +1331,21 @@ mod tests {
             lines.iter().any(|l| l.trim_start().starts_with("regex ")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn a_failed_pre_push_check_denies_only_publishing_commands() {
+        let input = |cmd: &str| json!({"tool_input": {"command": cmd}});
+        let push = failure_out(
+            Event::PreBash,
+            &input("git push origin main"),
+            "crashed (x)",
+        );
+        assert!(push.deny.is_some_and(|d| d.contains("crashed (x)")));
+        let other = failure_out(Event::PreBash, &input("cargo test"), "crashed (x)");
+        assert!(other.deny.is_none() && !other.system.is_empty());
+        let stop = failure_out(Event::Stop, &input("git push"), "crashed (x)");
+        assert!(stop.deny.is_none());
     }
 
     #[test]

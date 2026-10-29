@@ -355,8 +355,34 @@ gate three times on commands that only mentioned a push in a commit message or a
 and 56 s), the false positive this round removed; the third run also caught a formatting slip in
 a commit that had just been made.
 
-**Costs.** Every turn that changed the tree pays one gate run: on this repository 41 s with nothing
-to rebuild (4-core container, 120 tests). Nearly all of it is `cargo test`, whose 34 end-to-end
+**Third implementation review.** A fourth fresh agent, scoped to whether the code now matches
+the stated threat model, found that it did not in both directions. Hidden configuration still
+had ways through, and tracked, legitimate configuration failed. The fix aligns the code with the
+model rather than the other way round. Where a file is decides how it is judged: tracked files are
+not judged (changes are reported on pass), hidden files inside the repository are judged and never
+trusted, files outside it are judged and trustable. Environment variables are judged by value.
+
+| Finding | Fix | Alternative and why not |
+|---|---|---|
+| 1. A hidden `[env]` could set `LD_PRELOAD`, `COMPILER_PATH` or a snapshot switch the name list missed (`UPDATE_GOLDENFILES`, `EXPECTORATE`). | In a hidden file every `[env]` entry fails; the environment list gained loader, compiler-driver and snapshot variables. | Extend the name list only: a list is never complete, and a hidden file has no legitimate reason to differ from CI. |
+| 2. A `rustup override set` directory override was not checked. | Overrides for the root or its ancestors in rustup's `settings.toml` are judged like a toolchain channel. | Ask `rustup show active-toolchain`: a process per scan, and its text output changes between rustup versions. |
+| 3. Push denied for files no build reads (`docs/book.toml`, `scratch/try.rs`), for `gh pr merge`, for `git push --delete`. | Build inputs are manifests, the lock file, cargo/rustfmt/clippy/toolchain files and `.rs` files in a directory a target reads (from `cargo metadata`); deleting refs, `--help` and `gh pr merge` are not publishing. | Keep the broad rule: each false denial teaches the agent to work around the hook. |
+| 4. Tracked, committed configuration failed integrity: a `wasm32` runner, an embedded link script, `-fuse-ld=/usr/bin/mold`, a `rustdocflags` value counted as a flag, a vendored `[source]`, a tracked rustfmt `ignore`, a corporate mirror in `CARGO_HOME`. | Tracked files are not judged; target tables apply only to the host, the build target and `cfg(…)`; `-fuse-ld=` accepts absolute paths outside the repository; a flag's value travels with it; only local-directory sources count. | Judge tracked files too and document it: contradicts "CI runs it too", and fails legitimate repositories on first use. |
+| 5. Trust applied per kind to every file, so trusting `runner` for one machine-wide config also let a hidden one in the repository through. | Trust applies only outside the repository; findings say whether they are trustable, and the message says which remedy applies. A trusted kind still applies to every file outside the repository: an agent writing one above it to get past the gate is the out-of-scope case. | Trust per file path: paths differ per machine. |
+| 6. Hidden rustfmt configuration with ordinary options (`max_width` in an ignored `src/rustfmt.toml`) passed; `~/.rustfmt.toml` was not read when the home directory is not an ancestor. | Any hidden rustfmt file fails; a rustfmt file outside the repository fails (`rustfmt-outside`, trustable) when the repository has none of its own. | Judge rustfmt options one by one: almost every option changes what `--check` reports. |
+| 7. A file already changed before the session was labelled "changed in this session". | The session hashes pending files at first sight; unchanged since, they are not its own, for failure labels and for the pass report. | Diff against a stash of the start state: writes to the repository. |
+| 8. Harmless variables were removed wholesale (`CARGO_BUILD_JOBS`, `CARGO_PROFILE_*_DEBUG`, `RUSTFLAGS="--cfg tokio_unstable"`). | Judged by value with the same rules as config files. | — |
+| 9. Minor: a crash of the pre-push hook let the push through; `"$(git push)"`, backticks in double quotes and a line after `echo "<<X"` were missed; `git push --help` was gated; a new repository's untracked root `clippy.toml` failed with no hint. | A failed or crashed pre-push check denies a publishing command; substitutions in double quotes are followed and heredoc operators are found only outside quotes; the message names the remedy (remove it, or ask the user to commit it). | Let the agent commit hidden files itself: turns a block into a report the user may not read. |
+
+**Mutation check, after the third round.** 75 guards removed one at a time (the 45 before, their
+anchors updated, and 30 new ones); each matching test failed. Two needed a second look: one anchor
+no longer matched the code, and one test passed with "tracked files are not judged" removed, because
+its tracked config held only a variable the rules accept anyway; it now also holds one they judge.
+A live check in this container: a `rustup override set` to a linked toolchain made `fsmap verify`
+refuse before any cargo call (exit 2); rustup's settings were restored byte for byte afterwards.
+
+**Costs.** Every turn that changed the tree pays one gate run: on this repository 43 s with nothing
+to rebuild (4-core container, 129 tests, three runs). Nearly all of it is `cargo test`, whose 38 end-to-end
 hook tests each build a small Cargo project. Every Rust edit
 pays a `cargo check` (median 1.1 s in the session that wired the hooks). The hooks run build scripts, proc macros and tests without asking, so they
 are for repositories you trust. The ask rules add prompts when the agent edits manifests, lint

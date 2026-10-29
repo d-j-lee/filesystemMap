@@ -1,17 +1,22 @@
 //! Configuration and environment that can make the gate pass without the code changing
 //! (decision D-15). Reproduced in reviews: `--cap-lints allow` plus `runner = "true"` in a
 //! git-ignored `.cargo/config.toml` turned a failing `clippy -D warnings` and a failing
-//! test into exit code 0; so did an `[alias]` shadowing `cargo clippy`, a fake linker, a
-//! nested `rustfmt.toml` and a toolchain `path`.
+//! test into exit code 0; so did an `[alias]` shadowing `cargo clippy`, a fake linker,
+//! `--force-warn`, `[env] LD_PRELOAD`, a nested `rustfmt.toml` and a toolchain override.
 //!
-//! The files are parsed as TOML and judged against an **allowlist**: cargo keys that cannot
-//! change what fmt, clippy or the tests report pass; known weakening settings get a named
-//! kind; anything else is reported as `config:<table>`. A repository that needs one of them
-//! trusts its kind in `[package.metadata.fsmap.verify] trust = [...]`. Variables that do the
-//! same from the environment are removed before every step.
+//! What is judged follows the threat model in `docs/agent-harness.md`: configuration that is
+//! **hidden** from the repository's history makes the local gate disagree with CI, so it is
+//! judged here. Files git tracks are in the diff and CI reads them too: they are not judged
+//! (the stop hook reports changes to them). Hidden files are parsed as TOML and judged
+//! against an **allowlist**: settings that cannot change what fmt, clippy or the tests report
+//! pass, known shortcuts get a named kind, anything else is `config:<table>`. Inside the
+//! repository nothing hidden can be trusted; outside it (the developer's own environment) a
+//! repository may trust a kind in `[package.metadata.fsmap.verify] trust = [...]`.
+//! Environment variables are judged by name and value, and the weakening ones are removed
+//! before every step.
 //!
-//! A guardrail against an agent's shortcuts, not a sandbox: `PATH`, the installed toolchain
-//! and the user's own settings outside these files are trusted.
+//! A guardrail against an agent's shortcuts, not a sandbox: `PATH` and the installed
+//! toolchain are trusted.
 
 use std::path::{Path, PathBuf};
 
@@ -20,60 +25,118 @@ use crate::git;
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Finding {
     /// What the setting does, which is also the word that trusts it: `runner`, `linker`,
-    /// `rustc-wrapper`, `cap-lints`, `allow-flag`, `rustflag`, `env`, `alias`,
-    /// `config:<table>`, `fmt-disabled`, `fmt-ignore`, `untracked-clippy-config`,
-    /// `toolchain-path`, `toolchain-custom`, `unreadable`.
+    /// `rustc-wrapper`, `cap-lints`, `allow-flag`, `rustflag`, `env`, `alias`, `source`,
+    /// `config:<table>`, `fmt-disabled`, `fmt-ignore`, `untracked-rustfmt-config`,
+    /// `untracked-clippy-config`, `rustfmt-outside`, `toolchain-path`, `toolchain-custom`,
+    /// `unreadable`.
     pub kind: String,
     /// The file, relative to the root when inside it.
     pub file: String,
     /// The setting as `dotted.key = value`, cut at 160 characters.
     pub text: String,
+    /// Whether `trust` can accept it: not for a file inside the repository that git does
+    /// not track, which only committing (or removing) resolves.
+    pub trustable: bool,
 }
 
-/// Environment variables removed before running a gate step unless trusted as
-/// `env:NAME`: they change how code is compiled, linted or tested, or let a test pass
-/// by rewriting its expectations.
-const WEAKENING_ENV: &[&str] = &[
-    "RUSTFLAGS",
-    "RUSTDOCFLAGS",
+/// Variables that always change what the steps report: the tools themselves, snapshot
+/// "accept everything" switches, property-test case counts, and loader or compiler-driver
+/// injection. Removing one restores the default CI runs with.
+const ALWAYS_WEAKENING_ENV: &[&str] = &[
     "RUSTC",
     "RUSTDOC",
-    "RUSTC_WRAPPER",
-    "RUSTC_WORKSPACE_WRAPPER",
     "RUSTC_BOOTSTRAP",
     "RUSTUP_TOOLCHAIN",
+    "RUSTFMT",
     "CLIPPY_CONF_DIR",
     "CLIPPY_ARGS",
     "INSTA_FORCE_PASS",
     "INSTA_UPDATE",
     "UPDATE_EXPECT",
+    "UPDATE_GOLDENFILES",
+    "EXPECTORATE",
     "TRYBUILD",
     "TRYCMD",
     "SNAPSHOTS",
-    "RUSTFMT",
-];
-/// Prefixes of cargo's environment configuration: build settings, target runners,
-/// linkers and flags, aliases, profiles and unstable options.
-const WEAKENING_ENV_PREFIXES: &[&str] = &[
-    "CARGO_BUILD_",
-    "CARGO_TARGET_",
-    "CARGO_ALIAS_",
-    "CARGO_PROFILE_",
-    "CARGO_UNSTABLE_",
-    "CARGO_ENCODED_",
-    "__CARGO_",
+    "PROPTEST_CASES",
+    "QUICKCHECK_TESTS",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "COMPILER_PATH",
+    "GCC_EXEC_PREFIX",
 ];
 
-/// Names of weakening variables set in `vars`, minus trusted ones. `CARGO_TARGET_DIR` is
-/// not among them: the gate sets it itself.
-pub fn weakening_env<'a>(vars: impl Iterator<Item = &'a str>, trust: &[String]) -> Vec<String> {
+/// Whether setting `name` to `value` can change what the gate's steps report for the
+/// repository at `root`. Judged by value where that is safe: `RUSTFLAGS="--cfg
+/// tokio_unstable"`, `RUSTC_WRAPPER=sccache` and `CARGO_BUILD_JOBS` stay, `-A warnings` or
+/// a runner goes (third review, finding 8).
+pub fn env_weakens(name: &str, value: &str, root: &Path) -> bool {
+    let flags = |sep: Option<char>| {
+        let tokens: Vec<String> = match sep {
+            Some(c) => value.split(c).map(String::from).collect(),
+            None => value.split_whitespace().map(String::from).collect(),
+        };
+        !judge_flags(&tokens, Some(root)).is_empty()
+    };
+    match name {
+        "RUSTFLAGS" | "RUSTDOCFLAGS" | "CARGO_BUILD_RUSTFLAGS" | "CARGO_BUILD_RUSTDOCFLAGS" => {
+            flags(None)
+        }
+        "CARGO_ENCODED_RUSTFLAGS" | "CARGO_ENCODED_RUSTDOCFLAGS" => flags(Some('\u{1f}')),
+        "RUSTC_WRAPPER"
+        | "RUSTC_WORKSPACE_WRAPPER"
+        | "CARGO_BUILD_RUSTC_WRAPPER"
+        | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER" => {
+            !value.is_empty() && !known_name(value, KNOWN_WRAPPERS, Some(root))
+        }
+        "CARGO_BUILD_JOBS"
+        | "CARGO_BUILD_INCREMENTAL"
+        | "CARGO_BUILD_TARGET"
+        | "CARGO_BUILD_PIPELINING"
+        | "CARGO_BUILD_DEP_INFO_BASEDIR"
+        | "CARGO_BUILD_TARGET_DIR"
+        | "CARGO_TARGET_DIR" => false, // the build directory is set by the gate
+        n if ALWAYS_WEAKENING_ENV.contains(&n) => true,
+        n if n.starts_with("CARGO_TARGET_") => {
+            if n.ends_with("_RUSTFLAGS") || n.ends_with("_RUSTDOCFLAGS") {
+                flags(None)
+            } else if n.ends_with("_LINKER") {
+                !known_name(value, KNOWN_LINKERS, Some(root))
+            } else {
+                true // runners and the rest
+            }
+        }
+        n if n.starts_with("CARGO_PROFILE_") => {
+            if n.ends_with("_DEBUG_ASSERTIONS") || n.ends_with("_OVERFLOW_CHECKS") {
+                value != "true"
+            } else if n.ends_with("_OPT_LEVEL") {
+                value != "0"
+            } else {
+                false
+            }
+        }
+        n => [
+            "CARGO_BUILD_",
+            "CARGO_ALIAS_",
+            "CARGO_UNSTABLE_",
+            "__CARGO_",
+            "DYLD_",
+        ]
+        .iter()
+        .any(|p| n.starts_with(p)),
+    }
+}
+
+/// Names of the weakening variables in `vars`, minus those trusted as `env:NAME`.
+pub fn weakening_env<'a>(
+    vars: impl Iterator<Item = (&'a str, &'a str)>,
+    trust: &[String],
+    root: &Path,
+) -> Vec<String> {
     let mut out: Vec<String> = vars
-        .filter(|k| {
-            WEAKENING_ENV.contains(k) || WEAKENING_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
-        })
-        .filter(|k| *k != "CARGO_TARGET_DIR")
-        .filter(|k| !trust.iter().any(|t| t.strip_prefix("env:") == Some(*k)))
-        .map(String::from)
+        .filter(|(k, v)| env_weakens(k, v, root))
+        .filter(|(k, _)| !trust.iter().any(|t| t.strip_prefix("env:") == Some(*k)))
+        .map(|(k, _)| k.to_string())
         .collect();
     out.sort();
     out.dedup();
@@ -88,12 +151,27 @@ enum Kind {
     Toolchain,
 }
 
+/// Where a configuration file lives, which decides how it is judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// Tracked in this repository: in the diff, and CI reads it too. Not judged.
+    Tracked,
+    /// Inside the repository but untracked or ignored: what CI never sees. Judged; never
+    /// trusted.
+    Hidden,
+    /// Outside the repository (ancestors, `CARGO_HOME`, the user's rustfmt configuration):
+    /// the developer's environment. Judged; a repository can trust kinds here.
+    Outside,
+    /// Inside a project that is not in a git repository: there is no history to hide
+    /// from, so it is judged like `Outside`.
+    Unversioned,
+}
+
 #[derive(Debug)]
 struct ConfigFile {
     path: PathBuf,
     kind: Kind,
-    /// Inside the repository but not tracked by git.
-    untracked: bool,
+    place: Place,
 }
 
 const ANCESTOR_FILES: &[(&str, Kind)] = &[
@@ -109,15 +187,15 @@ const ANCESTOR_FILES: &[(&str, Kind)] = &[
 
 /// Every existing configuration file that cargo, rustfmt, clippy or rustup can read for
 /// `root`: the root's ancestors, `CARGO_HOME`, rustfmt's user configuration, and every
-/// `rustfmt.toml`/`clippy.toml` inside the tree (rustfmt looks upward from each source
-/// file), git-ignored ones included. Hashed into the stop gate's fingerprint.
+/// `rustfmt.toml`/`clippy.toml` inside the tree, git-ignored ones included. Hashed into
+/// the stop gate's fingerprint.
 pub fn config_files(root: &Path) -> Vec<PathBuf> {
     configs(root).into_iter().map(|c| c.path).collect()
 }
 
 /// Whether an in-tree rustfmt or clippy file at `dir` can apply to the workspace
 /// members: it sits at or above a member directory, or inside one without another package
-/// in between (a vendored crate's own `clippy.toml` cannot; final review M10).
+/// in between (a vendored crate's own `clippy.toml` cannot; second review M10).
 fn applies_to_members(dir: &Path, members: &[PathBuf]) -> bool {
     members.iter().any(|m| {
         m.starts_with(dir)
@@ -130,69 +208,129 @@ fn applies_to_members(dir: &Path, members: &[PathBuf]) -> bool {
 }
 
 fn configs(root: &Path) -> Vec<ConfigFile> {
-    let mut out: Vec<ConfigFile> = Vec::new();
-    let mut add = |path: PathBuf, kind: Kind, untracked: bool| {
-        if path.is_file() {
-            out.push(ConfigFile {
-                path,
-                kind,
-                untracked,
-            });
+    let top = toplevel(root);
+    let listed = top.as_deref().map(listed_files).unwrap_or_default();
+    // Compared canonically: git prints the toplevel with links resolved (`/private/var` on
+    // macOS), while `root` is spelled as given.
+    let (croot, ctop) = (canon(root), top.as_deref().map(canon));
+    let place_of = |path: &Path| -> Place {
+        let path = canon(path);
+        let Some(top) = ctop.as_deref() else {
+            return if path.starts_with(&croot) {
+                Place::Unversioned
+            } else {
+                Place::Outside
+            };
+        };
+        match path.strip_prefix(top) {
+            Err(_) => Place::Outside,
+            Ok(rel) => {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if listed.iter().any(|(p, tracked)| *tracked && *p == rel) {
+                    Place::Tracked
+                } else {
+                    Place::Hidden
+                }
+            }
         }
     };
+    let mut candidates: Vec<(PathBuf, Kind)> = Vec::new();
     for dir in root.ancestors() {
         for (rel, kind) in ANCESTOR_FILES {
-            // Above the root no git tracks a clippy file for this repository.
-            add(dir.join(rel), *kind, dir != root && *kind == Kind::Clippy);
+            candidates.push((dir.join(rel), *kind));
         }
     }
     if let Some(home) = cargo_home() {
-        add(home.join("config.toml"), Kind::Cargo, false);
-        add(home.join("config"), Kind::Cargo, false);
+        candidates.push((home.join("config.toml"), Kind::Cargo));
+        candidates.push((home.join("config"), Kind::Cargo));
     }
-    for dir in user_config_dirs() {
-        add(dir.join("rustfmt/rustfmt.toml"), Kind::Rustfmt, false);
-        add(dir.join("rustfmt/.rustfmt.toml"), Kind::Rustfmt, false);
+    for dir in user_rustfmt_dirs() {
+        candidates.push((dir.join("rustfmt.toml"), Kind::Rustfmt));
+        candidates.push((dir.join(".rustfmt.toml"), Kind::Rustfmt));
     }
-    for (rel, tracked) in tree_files(root) {
-        let kind = if rel.ends_with("clippy.toml") {
-            Kind::Clippy
-        } else {
-            Kind::Rustfmt
-        };
-        add(root.join(&rel), kind, !tracked);
-    }
-    // One entry per file; the in-tree listing knows whether git tracks it.
-    let mut seen: Vec<(PathBuf, usize)> = Vec::new();
-    let mut unique: Vec<ConfigFile> = Vec::new();
-    for c in out {
-        let key = std::fs::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone());
-        if let Some((_, i)) = seen.iter().find(|(k, _)| *k == key) {
-            unique[*i].untracked |= c.untracked;
-        } else {
-            seen.push((key, unique.len()));
-            unique.push(c);
+    if let Some(top) = ctop.as_deref() {
+        for (rel, _) in &listed {
+            let kind = match rel.rsplit('/').next().unwrap_or(rel) {
+                "clippy.toml" | ".clippy.toml" => Kind::Clippy,
+                "rustfmt.toml" | ".rustfmt.toml" => Kind::Rustfmt,
+                _ => continue, // cargo reads its configuration from the root upwards only
+            };
+            // Spelled under `root` where possible, like the members it is compared with.
+            let path = top.join(rel);
+            let path = match path.strip_prefix(&croot) {
+                Ok(r) => root.join(r),
+                Err(_) => path,
+            };
+            candidates.push((path, kind));
         }
     }
-    unique
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut out = Vec::new();
+    for (path, kind) in candidates {
+        if !path.is_file() {
+            continue;
+        }
+        let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let place = place_of(&path);
+        out.push(ConfigFile { path, kind, place });
+    }
+    out
 }
 
-/// `rustfmt.toml`, `.rustfmt.toml`, `clippy.toml` and `.clippy.toml` inside the work tree,
-/// with whether git tracks them.
-fn tree_files(root: &Path) -> Vec<(String, bool)> {
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Where a single file is: tracked by the repository around it, inside one but not
+/// tracked, or in no repository.
+fn place_of_file(path: &Path) -> Place {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Place::Outside;
+    };
+    match git::run({
+        let mut c = git::git(dir);
+        c.args(["ls-files", "-z", "--"]).arg(name);
+        c
+    }) {
+        Ok(o) if !o.is_empty() => Place::Tracked,
+        Ok(_) => Place::Hidden,
+        Err(_) => Place::Outside,
+    }
+}
+
+fn toplevel(root: &Path) -> Option<PathBuf> {
+    git::run({
+        let mut c = git::git(root);
+        c.args(["rev-parse", "--show-toplevel"]);
+        c
+    })
+    .ok()
+    .map(|o| PathBuf::from(String::from_utf8_lossy(&o).trim()))
+}
+
+/// Configuration files inside the work tree at `top`, relative to it, with whether git
+/// tracks them: tracked, untracked and ignored alike (a hidden config is the point).
+fn listed_files(top: &Path) -> Vec<(String, bool)> {
     let patterns = [
         ":(glob)**/rustfmt.toml",
         ":(glob)**/.rustfmt.toml",
         ":(glob)**/clippy.toml",
         ":(glob)**/.clippy.toml",
+        ":(glob)**/.cargo/config",
+        ":(glob)**/.cargo/config.toml",
+        ":(glob)**/rust-toolchain",
+        ":(glob)**/rust-toolchain.toml",
         ":(exclude)target/",
     ];
     let list = |others: bool| -> Vec<String> {
         git::run({
-            let mut c = git::git(root);
+            let mut c = git::git(top);
             c.args(["ls-files", "-z"]);
             if others {
-                // Untracked and ignored files alike: a hidden config is the point.
                 c.arg("--others");
             }
             c.arg("--").args(patterns);
@@ -229,35 +367,62 @@ fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Where rustfmt looks for a user configuration (`dirs::config_dir()` on each platform).
-fn user_config_dirs() -> Vec<PathBuf> {
+/// Where rustfmt looks when no configuration is found above a file: the home directory
+/// and the user configuration directory (`dirs::config_dir()/rustfmt` on each platform).
+fn user_rustfmt_dirs() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        out.push(PathBuf::from(x));
-    }
     if let Some(h) = home() {
-        out.push(h.join(".config"));
-        out.push(h.join("Library/Application Support"));
+        out.push(h.clone());
+        out.push(h.join(".config/rustfmt"));
+        out.push(h.join("Library/Application Support/rustfmt"));
+    }
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
+        out.push(PathBuf::from(x).join("rustfmt"));
     }
     if let Some(a) = std::env::var_os("APPDATA") {
-        out.push(PathBuf::from(a));
+        out.push(PathBuf::from(a).join("rustfmt"));
     }
     out
 }
 
-/// Settings in the configuration files that weaken the gate, minus trusted kinds.
-/// `members` are the workspace members' directories (rustfmt and clippy files that cannot
-/// apply to them are not judged).
+/// The host triple, for deciding which `[target.<triple>]` tables apply.
+fn host_triple(dir: &Path) -> Option<String> {
+    let out = super::verify::clean_command(dir, "rustc")
+        .arg("-vV")
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .map(String::from)
+}
+
+/// Settings that weaken the gate in hidden configuration (see the module documentation),
+/// minus kinds trusted for files outside the repository. `members` are the workspace
+/// members' directories.
 pub fn scan(root: &Path, members: &[PathBuf], trust: &[String]) -> Vec<Finding> {
-    let mut out = Vec::new();
+    let files = configs(root);
+    let members: Vec<PathBuf> = members.iter().map(|m| canon(m)).collect();
     let rustup = rustup_home();
-    for c in configs(root) {
+    let host = host_triple(root);
+    // rustfmt stops at the first configuration above a file: the project's own one at or
+    // above the root means configurations outside the project never apply.
+    let own_rustfmt = files.iter().any(|c| {
+        c.kind == Kind::Rustfmt
+            && matches!(c.place, Place::Tracked | Place::Unversioned)
+            && c.path.parent().is_some_and(|d| root.starts_with(d))
+    });
+    let mut out = Vec::new();
+    for c in files {
+        if c.place == Place::Tracked {
+            continue;
+        }
         if matches!(c.kind, Kind::Rustfmt | Kind::Clippy)
-            && c.path.starts_with(root)
+            && c.place == Place::Hidden
             && !c
                 .path
                 .parent()
-                .is_some_and(|d| applies_to_members(d, members))
+                .is_some_and(|d| applies_to_members(&canon(d), &members))
         {
             continue;
         }
@@ -265,44 +430,68 @@ pub fn scan(root: &Path, members: &[PathBuf], trust: &[String]) -> Vec<Finding> 
             |_| c.path.display().to_string(),
             |p| p.display().to_string().replace('\\', "/"),
         );
+        let trustable = c.place != Place::Hidden;
         let mut push = |kind: &str, text: String| {
-            out.push(Finding {
-                kind: kind.to_string(),
-                file: shown.clone(),
-                text: text.chars().take(160).collect(),
-            });
-        };
-        if c.kind == Kind::Clippy {
-            if c.untracked {
-                push(
-                    "untracked-clippy-config",
-                    "a clippy configuration git does not track (lint thresholds and allowances)"
-                        .into(),
-                );
+            if !(trustable && trust.iter().any(|t| t == kind)) {
+                out.push(Finding {
+                    kind: kind.to_string(),
+                    file: shown.clone(),
+                    text: text.chars().take(160).collect(),
+                    trustable,
+                });
             }
-            continue;
-        }
+        };
         let Ok(text) = std::fs::read_to_string(&c.path) else {
             continue;
         };
-        match (c.kind, text.parse::<toml::Table>()) {
-            (Kind::Cargo, Ok(t)) => cargo_findings(&t, root, &mut push),
-            (Kind::Rustfmt, Ok(t)) => rustfmt_findings(&t, &mut push),
-            (Kind::Toolchain, Ok(t)) => toolchain_findings(&t, rustup.as_deref(), &mut push),
-            // The legacy `rust-toolchain` file may hold just a channel name.
-            (Kind::Toolchain, Err(_)) if !text.trim().contains(['=', '[']) => {
-                channel_finding(text.trim(), rustup.as_deref(), &mut push);
-            }
-            (_, Err(e)) => push("unreadable", format!("not valid TOML: {}", e.message())),
-            (Kind::Clippy, Ok(_)) => {}
+        match c.kind {
+            Kind::Clippy => push(
+                "untracked-clippy-config",
+                "lint thresholds and allowances git does not track".into(),
+            ),
+            Kind::Rustfmt => match c.place {
+                Place::Hidden => push(
+                    "untracked-rustfmt-config",
+                    "formatting rules git does not track".into(),
+                ),
+                Place::Outside if !own_rustfmt => push(
+                    "rustfmt-outside",
+                    "formatting rules from outside the repository apply to it (CI lacks them)"
+                        .into(),
+                ),
+                Place::Outside | Place::Tracked => {}
+                Place::Unversioned => match text.parse::<toml::Table>() {
+                    Ok(t) => rustfmt_findings(&t, &mut push),
+                    Err(e) => push("unreadable", format!("not valid TOML: {}", e.message())),
+                },
+            },
+            Kind::Cargo => match text.parse::<toml::Table>() {
+                Ok(t) => cargo_findings(
+                    &t,
+                    root,
+                    c.place == Place::Hidden,
+                    host.as_deref(),
+                    &mut push,
+                ),
+                Err(e) => push("unreadable", format!("not valid TOML: {}", e.message())),
+            },
+            Kind::Toolchain => match text.parse::<toml::Table>() {
+                Ok(t) => toolchain_findings(&t, rustup.as_deref(), &mut push),
+                // The legacy `rust-toolchain` file may hold just a channel name.
+                Err(_) if !text.trim().contains(['=', '[']) => {
+                    channel_finding(text.trim(), rustup.as_deref(), &mut push);
+                }
+                Err(e) => push("unreadable", format!("not valid TOML: {}", e.message())),
+            },
         }
     }
-    out.retain(|f| !trust.contains(&f.kind));
     out
 }
 
-/// The toolchain settings in `dir` and its ancestors, which rustup obeys as soon as
-/// cargo runs there: checked before the gate runs cargo at all.
+/// The toolchain settings rustup obeys as soon as cargo runs in `dir`: toolchain files in
+/// `dir` and its ancestors that git does not track, and directory overrides
+/// (`rustup override set`) in rustup's own settings (third review, finding 2). Checked
+/// before the gate runs cargo at all.
 pub fn toolchain_scan(dir: &Path, trust: &[String]) -> Vec<Finding> {
     toolchain_scan_with(dir, trust, rustup_home().as_deref())
 }
@@ -315,11 +504,16 @@ fn toolchain_scan_with(dir: &Path, trust: &[String], rustup: Option<&Path>) -> V
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
+            let place = place_of_file(&path);
+            if place == Place::Tracked {
+                continue;
+            }
             let mut push = |kind: &str, text: String| {
                 out.push(Finding {
                     kind: kind.to_string(),
                     file: path.display().to_string(),
                     text,
+                    trustable: place != Place::Hidden,
                 });
             };
             match text.parse::<toml::Table>() {
@@ -331,7 +525,31 @@ fn toolchain_scan_with(dir: &Path, trust: &[String], rustup: Option<&Path>) -> V
             }
         }
     }
-    out.retain(|f| !trust.contains(&f.kind));
+    if let Some(home) = rustup {
+        let settings = home.join("settings.toml");
+        let overrides = std::fs::read_to_string(&settings)
+            .ok()
+            .and_then(|t| t.parse::<toml::Table>().ok())
+            .and_then(|t| t.get("overrides").and_then(toml::Value::as_table).cloned())
+            .unwrap_or_default();
+        let dir = canon(dir);
+        for (path, toolchain) in &overrides {
+            if let Some(name) = toolchain.as_str()
+                && dir.starts_with(path)
+            {
+                let mut push = |kind: &str, text: String| {
+                    out.push(Finding {
+                        kind: kind.to_string(),
+                        file: settings.display().to_string(),
+                        text: format!("override for {path}: {text}"),
+                        trustable: true,
+                    });
+                };
+                channel_finding(name, rustup, &mut push);
+            }
+        }
+    }
+    out.retain(|f| !(f.trustable && trust.contains(&f.kind)));
     out
 }
 
@@ -345,7 +563,8 @@ fn entries(v: &toml::Value) -> Vec<(&String, &toml::Value)> {
     v.as_table().map(|t| t.iter().collect()).unwrap_or_default()
 }
 
-/// Cargo tables that cannot change what the gate's steps report.
+/// Cargo tables that cannot change what the gate's steps report (`source` is judged per
+/// entry).
 const CARGO_SAFE_TABLES: &[&str] = &[
     "cargo-new",
     "http",
@@ -371,8 +590,8 @@ const BUILD_SAFE_KEYS: &[&str] = &[
     "dep-info-basedir",
     "pipelining",
 ];
-/// Linkers a repository may choose without being trusted, by file name, when not
-/// shipped inside the repository itself.
+/// Linkers a configuration may choose by file name, when not shipped inside the
+/// repository itself.
 const KNOWN_LINKERS: &[&str] = &[
     "cc", "c++", "gcc", "g++", "clang", "clang++", "ld", "ld.lld", "lld", "rust-lld", "mold",
     "ld.mold", "link.exe", "lld-link",
@@ -381,11 +600,8 @@ const KNOWN_LINKERS: &[&str] = &[
 const KNOWN_WRAPPERS: &[&str] = &["sccache", "cachepot"];
 
 /// A tool named by file name only (found on `PATH`, which is trusted), or by a path
-/// outside the repository, whose file name is in `known`.
-fn known_tool(v: &toml::Value, root: &Path, known: &[&str]) -> bool {
-    let Some(s) = v.as_str() else {
-        return false;
-    };
+/// outside the repository (`root`, when known), whose file name is in `known`.
+fn known_name(s: &str, known: &[&str], root: Option<&Path>) -> bool {
     let path = Path::new(s);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let name = name.strip_suffix(".exe").unwrap_or(name);
@@ -396,21 +612,40 @@ fn known_tool(v: &toml::Value, root: &Path, known: &[&str]) -> bool {
                 && name.ends_with(&format!("-{k}")))
     });
     known_name
-        && (path.components().count() == 1 || (path.is_absolute() && !path.starts_with(root)))
+        && (path.components().count() == 1
+            || (path.is_absolute() && root.is_none_or(|r| !path.starts_with(r))))
+}
+
+fn known_tool(v: &toml::Value, root: &Path, known: &[&str]) -> bool {
+    v.as_str().is_some_and(|s| known_name(s, known, Some(root)))
 }
 
 /// Subcommands the gate runs that an `[alias]` could replace (cargo ignores aliases of
 /// its built-in commands, but `fmt`, `clippy` and `deny` are external).
 const GATE_SUBCOMMANDS: &[&str] = &["fmt", "clippy", "deny", "test", "check", "build"];
 
-fn cargo_findings(t: &toml::Table, root: &Path, push: &mut Push<'_>) {
+/// Judge a parsed cargo configuration. `hidden`: inside the repository but untracked, where
+/// every `[env]` entry fails (cargo hands them to rustc, clippy and the test binaries).
+/// `[target.<triple>]` tables apply only to the host, the configured build target and
+/// `cfg(...)` selectors.
+fn cargo_findings(
+    t: &toml::Table,
+    root: &Path,
+    hidden: bool,
+    host: Option<&str>,
+    push: &mut Push<'_>,
+) {
+    let build_target = t
+        .get("build")
+        .and_then(|b| b.get("target"))
+        .and_then(toml::Value::as_str);
     for (key, v) in t {
         match key.as_str() {
             "build" => {
                 for (k, v) in entries(v) {
                     let path = format!("build.{k}");
                     match k.as_str() {
-                        "rustflags" | "rustdocflags" => flag_findings(&path, v, push),
+                        "rustflags" | "rustdocflags" => flag_findings(&path, v, Some(root), push),
                         "rustc-wrapper" | "rustc-workspace-wrapper"
                             if known_tool(v, root, KNOWN_WRAPPERS) => {}
                         "rustc" | "rustc-wrapper" | "rustc-workspace-wrapper" | "rustdoc" => {
@@ -422,14 +657,23 @@ fn cargo_findings(t: &toml::Table, root: &Path, push: &mut Push<'_>) {
                 }
             }
             "target" => {
-                for (triple, tv) in entries(v) {
+                for (selector, tv) in entries(v) {
+                    let applies = selector.starts_with("cfg(")
+                        || Some(selector.as_str()) == host
+                        || Some(selector.as_str()) == build_target
+                        || host.is_none();
+                    if !applies {
+                        continue;
+                    }
                     for (k, v) in entries(tv) {
-                        let path = format!("target.{triple}.{k}");
+                        let path = format!("target.{selector}.{k}");
                         match k.as_str() {
                             "runner" => push("runner", show(&path, v)),
                             "linker" if known_tool(v, root, KNOWN_LINKERS) => {}
                             "linker" | "ar" => push("linker", show(&path, v)),
-                            "rustflags" | "rustdocflags" => flag_findings(&path, v, push),
+                            "rustflags" | "rustdocflags" => {
+                                flag_findings(&path, v, Some(root), push);
+                            }
                             // `[target.<triple>.<lib>]` build-script overrides.
                             _ => push("config:target", show(&path, v)),
                         }
@@ -443,17 +687,28 @@ fn cargo_findings(t: &toml::Table, root: &Path, push: &mut Push<'_>) {
                     }
                 }
             }
-            // Ordinary variables (`SQLX_OFFLINE`) are fine; the ones the gate removes from
-            // its own environment are not, set here either.
             "env" => {
                 for (name, v) in entries(v) {
-                    if !weakening_env(std::iter::once(name.as_str()), &[]).is_empty() {
+                    let value = v
+                        .as_str()
+                        .or_else(|| v.get("value").and_then(toml::Value::as_str))
+                        .unwrap_or("");
+                    if hidden || env_weakens(name, value, root) {
                         push("env", show(&format!("env.{name}"), v));
                     }
                 }
             }
-            // Source replacement (`cargo vendor`) can swap in modified dependencies.
-            "source" => push("source", show("source", v)),
+            // Replacing a source by a local directory can swap in modified dependencies; a
+            // remote registry mirror cannot.
+            "source" => {
+                for (name, sv) in entries(v) {
+                    for k in ["directory", "local-registry"] {
+                        if let Some(dir) = sv.get(k) {
+                            push("source", show(&format!("source.{name}.{k}"), dir));
+                        }
+                    }
+                }
+            }
             "profile" => profile_findings("profile", v, push),
             k if CARGO_SAFE_TABLES.contains(&k) => {}
             k => push(&format!("config:{k}"), show(k, v)),
@@ -508,8 +763,9 @@ const LINK_CODEGEN: &[&str] = &[
     "link-dead-code",
 ];
 
-/// Judge a `rustflags` value (an array, or a string split at whitespace).
-fn flag_findings(path: &str, v: &toml::Value, push: &mut Push<'_>) {
+/// Judge a `rustflags` value (an array, or a string split at whitespace): one finding per
+/// kind, naming the flags (a flag's value is not reported as a flag of its own).
+fn flag_findings(path: &str, v: &toml::Value, root: Option<&Path>, push: &mut Push<'_>) {
     let tokens: Vec<String> = match v {
         toml::Value::Array(a) => a
             .iter()
@@ -518,11 +774,27 @@ fn flag_findings(path: &str, v: &toml::Value, push: &mut Push<'_>) {
         toml::Value::String(s) => s.split_whitespace().map(String::from).collect(),
         other => vec![other.to_string()],
     };
+    let mut by_kind: Vec<(&'static str, Vec<String>)> = Vec::new();
+    for (kind, flag) in judge_flags(&tokens, root) {
+        match by_kind.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, flags)) => flags.push(flag),
+            None => by_kind.push((kind, vec![flag])),
+        }
+    }
+    for (kind, flags) in by_kind {
+        push(kind, format!("{path}: {}", flags.join(" ")));
+    }
+}
+
+/// The flags in `tokens` that can weaken the gate, with their kind. A flag's separate
+/// value travels with it. `root`, when known, keeps linkers inside the repository out.
+fn judge_flags(tokens: &[String], root: Option<&Path>) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
         let t = tokens[i].as_str();
         let next = tokens.get(i + 1).map(String::as_str);
-        // (option, its value, whether the value was the next token)
+        // (option value, whether the value was the next token)
         let split = |short: &str, long: &str| -> Option<(String, bool)> {
             if t == short || t == long {
                 Some((next.unwrap_or("").to_string(), true))
@@ -534,11 +806,7 @@ fn flag_findings(path: &str, v: &toml::Value, push: &mut Push<'_>) {
                 None
             }
         };
-        let shown = format!(
-            "{path}: {t}{}",
-            next.map(|n| format!(" {n}")).unwrap_or_default()
-        );
-        let kind: Option<&str>;
+        let kind: Option<&'static str>;
         let used_next;
         if let Some((_, n)) = split("", "--cap-lints") {
             kind = Some("cap-lints");
@@ -547,7 +815,7 @@ fn flag_findings(path: &str, v: &toml::Value, push: &mut Push<'_>) {
             kind = Some("allow-flag");
             used_next = n;
         } else if let Some((_, n)) = split("", "--force-warn") {
-            // A force-warned lint stays a warning under `-D warnings` (final review B1).
+            // A force-warned lint stays a warning under `-D warnings` (second review B1).
             kind = Some("allow-flag");
             used_next = n;
         } else if let Some((_, n)) = [("-W", "--warn"), ("-D", "--deny"), ("-F", "--forbid")]
@@ -560,11 +828,11 @@ fn flag_findings(path: &str, v: &toml::Value, push: &mut Push<'_>) {
             let (name, value) = opt.split_once('=').unwrap_or((opt.as_str(), ""));
             let on = matches!(value, "on" | "yes" | "y" | "true" | "");
             kind = match name {
-                // Above 0, debug assertions and overflow checks default to off (final
+                // Above 0, debug assertions and overflow checks default to off (second
                 // review M1): failing `debug_assert!`s and overflows then pass.
                 "opt-level" if value == "0" => None,
                 "debug-assertions" | "overflow-checks" if on => None,
-                "link-arg" if is_known_fuse_ld(value) => None,
+                "link-arg" if is_known_fuse_ld(value, root) => None,
                 n if SAFE_CODEGEN.contains(&n) => None,
                 n if LINK_CODEGEN.contains(&n) => Some("linker"),
                 _ => Some("rustflag"),
@@ -579,21 +847,38 @@ fn flag_findings(path: &str, v: &toml::Value, push: &mut Push<'_>) {
             // `--cfg tokio_unstable` and the like; code gated on a cfg is in the diff.
             kind = None;
             used_next = n;
+        } else if t.starts_with('-') {
+            kind = Some("rustflag");
+            // An unknown option's value, if any, is reported with it, not as a flag.
+            used_next = next.is_some_and(|n| !n.starts_with('-'));
         } else {
             kind = Some("rustflag");
             used_next = false;
         }
         if let Some(k) = kind {
-            push(k, shown);
+            let shown = if used_next {
+                format!("{t} {}", next.unwrap_or(""))
+            } else {
+                t.to_string()
+            };
+            out.push((k, shown));
         }
         i += if used_next { 2 } else { 1 };
     }
+    out
 }
 
-/// `-fuse-ld=` with a known linker (mold, lld, gold, bfd).
-fn is_known_fuse_ld(arg: &str) -> bool {
-    arg.strip_prefix("-fuse-ld=")
-        .is_some_and(|l| matches!(l, "mold" | "lld" | "gold" | "bfd" | "ld.mold" | "ld.lld"))
+/// `-fuse-ld=` with a known linker (mold, lld, gold, bfd), by name or by a path outside
+/// the repository (mold's README gives an absolute path).
+fn is_known_fuse_ld(arg: &str, root: Option<&Path>) -> bool {
+    arg.strip_prefix("-fuse-ld=").is_some_and(|l| {
+        matches!(l, "mold" | "lld" | "gold" | "bfd" | "ld.mold" | "ld.lld")
+            || known_name(
+                l,
+                &["mold", "ld.mold", "lld", "ld.lld", "ld.gold", "ld.bfd"],
+                root,
+            ) && Path::new(l).is_absolute()
+    })
 }
 
 fn rustfmt_findings(t: &toml::Table, push: &mut Push<'_>) {
@@ -629,7 +914,7 @@ fn toolchain_findings(t: &toml::Table, rustup: Option<&Path>, push: &mut Push<'_
 /// A channel that is not an official one names a toolchain linked with
 /// `rustup toolchain link`: any directory of binaries. rustup also accepts official-looking
 /// link names (`stable-evil`), so a channel whose toolchain directory is a link is refused
-/// too (final review M5).
+/// too (second review M5).
 fn channel_finding(channel: &str, rustup: Option<&Path>, push: &mut Push<'_>) {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
@@ -656,15 +941,35 @@ mod tests {
         std::fs::write(p, text).unwrap();
     }
 
+    fn git(root: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
     /// Scan with the root as the only workspace member.
     fn sc(root: &Path, trust: &[String]) -> Vec<Finding> {
         scan(root, &[root.to_path_buf()], trust)
     }
 
-    fn kinds(root: &Path) -> Vec<String> {
-        let mut k: Vec<String> = sc(root, &[]).into_iter().map(|f| f.kind).collect();
+    fn kinds_trusting(root: &Path, trust: &[String]) -> Vec<String> {
+        let mut k: Vec<String> = sc(root, trust).into_iter().map(|f| f.kind).collect();
         k.sort();
         k
+    }
+
+    fn kinds(root: &Path) -> Vec<String> {
+        kinds_trusting(root, &[])
+    }
+
+    /// The host triple, so that `[target.<host>]` tables apply on every CI platform.
+    fn host() -> String {
+        host_triple(Path::new(".")).expect("rustc -vV names the host")
     }
 
     #[test]
@@ -674,9 +979,12 @@ mod tests {
         write(
             r,
             ".cargo/config.toml",
-            "[build]\nrustflags = [\"--cap-lints\", \"allow\"]\n\
-             [target.x86_64-unknown-linux-gnu]\nrunner = \"true\"\n\
-             [env]\nINSTA_FORCE_PASS = \"1\"\n# runner = \"commented\"\n",
+            &format!(
+                "[build]\nrustflags = [\"--cap-lints\", \"allow\"]\n\
+                 [target.{}]\nrunner = \"true\"\n\
+                 [env]\nINSTA_FORCE_PASS = \"1\"\n# runner = \"commented\"\n",
+                host()
+            ),
         );
         write(r, ".rustfmt.toml", "disable_all_formatting = true\n");
         write(r, "rust-toolchain.toml", "[toolchain]\npath = \"/tmp/x\"\n");
@@ -690,71 +998,74 @@ mod tests {
                 "toolchain-path"
             ]
         );
-        let trusted = sc(r, &["runner".into(), "env".into()]);
-        assert!(
-            trusted
-                .iter()
-                .all(|f| f.kind != "runner" && f.kind != "env")
-        );
+        // Outside a git repository nothing is hidden: kinds can be trusted.
+        let trusted = kinds_trusting(r, &["runner".into(), "env".into()]);
+        assert_eq!(trusted, ["cap-lints", "fmt-disabled", "toolchain-path"]);
     }
 
     /// The bypasses the final review reproduced against the line-based parser.
     #[test]
     fn bypasses_of_the_line_parser_are_found() {
-        let cases: &[(&str, &str, &str)] = &[
+        let h = host();
+        let cases: &[(&str, String, &str)] = &[
             (
                 ".cargo/config.toml",
-                "[alias]\nclippy = \"test --no-run\"\n",
+                "[alias]\nclippy = \"test --no-run\"\n".into(),
                 "alias",
             ),
             (
                 ".cargo/config.toml",
-                "[target.x86_64-unknown-linux-gnu]\nlinker = \".cargo/fake-ld.sh\"\n",
+                format!("[target.{h}]\nlinker = \".cargo/fake-ld.sh\"\n"),
                 "linker",
             ),
             (
                 ".cargo/config.toml",
-                "[build]\nrustflags = [\"-Cmetadata=#\", \"--cap-lints\", \"allow\"]\n",
+                "[build]\nrustflags = [\"-Cmetadata=#\", \"--cap-lints\", \"allow\"]\n".into(),
                 "cap-lints",
             ),
             (
                 ".cargo/config.toml",
-                "[build]\nrustflags = [\"--cap-\\u006cints\", \"allow\"]\n",
+                "[build]\nrustflags = [\"--cap-\\u006cints\", \"allow\"]\n".into(),
                 "cap-lints",
             ),
             (
                 ".cargo/config.toml",
-                "target.x86_64-unknown-linux-gnu.runner = \"true\"\n",
+                format!("target.{h}.runner = \"true\"\n"),
                 "runner",
             ),
             (
                 ".cargo/config.toml",
-                "build = { rustflags = \"-A warnings\" }\n",
+                "[target.'cfg(all())']\nrunner = \"true\"\n".into(),
+                "runner",
+            ),
+            (
+                ".cargo/config.toml",
+                "build = { rustflags = \"-A warnings\" }\n".into(),
                 "allow-flag",
             ),
             (
                 ".cargo/config.toml",
-                "[build]\nrustflags = [\"-C\", \"link-arg=-Wl,-e,exit\"]\n",
+                "[build]\nrustflags = [\"-C\", \"link-arg=-Wl,-e,exit\"]\n".into(),
                 "linker",
             ),
             (
                 ".cargo/config.toml",
-                "[patch.crates-io]\nfoo = { path = \"x\" }\n",
+                "[patch.crates-io]\nfoo = { path = \"x\" }\n".into(),
                 "config:patch",
             ),
             (
                 "rust-toolchain.toml",
-                "toolchain.path = \"/abs/tc\"\n",
+                "toolchain.path = \"/abs/tc\"\n".into(),
                 "toolchain-path",
             ),
             (
                 "rust-toolchain.toml",
-                "[toolchain]\nchannel = \"evil\"\n",
+                "[toolchain]\nchannel = \"evil\"\n".into(),
                 "toolchain-custom",
             ),
             (
                 "rust-toolchain",
-                "my-linked-toolchain\n",
+                "my-linked-toolchain\n".into(),
                 "toolchain-custom",
             ),
         ];
@@ -765,30 +1076,65 @@ mod tests {
         }
     }
 
+    /// Inside a repository, configuration git does not track is what CI never sees: it
+    /// fails whatever it says and whatever the repository trusts; once tracked it is in
+    /// the diff and is not judged (third review, findings 4 and 5).
+    #[test]
+    fn hidden_config_is_judged_and_never_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "-q"]);
+        write(
+            r,
+            ".cargo/config.toml",
+            &format!(
+                "[target.{}]\nrunner = \"true\"\n[env]\nLD_PRELOAD = \"x.so\"\nSQLX_OFFLINE = \"true\"\n",
+                host()
+            ),
+        );
+        let all = ["runner".to_string(), "env".into()];
+        assert_eq!(kinds_trusting(r, &all), ["env", "env", "runner"]);
+        git(r, &["add", ".cargo/config.toml"]);
+        assert_eq!(kinds_trusting(r, &[]), Vec::<String>::new());
+    }
+
     /// rustfmt reads configuration from each source file's directory upward, so a nested
-    /// file counts, tracked or not.
+    /// file counts, ignored or not; clippy files likewise.
     #[test]
     fn nested_rustfmt_and_untracked_clippy_config_are_found() {
         let dir = tempfile::tempdir().unwrap();
         let r = dir.path();
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(r)
-            .status()
-            .unwrap();
-        write(r, "src/rustfmt.toml", "disable_all_formatting = true\n");
+        git(r, &["init", "-q"]);
+        write(r, ".gitignore", "src/rustfmt.toml\n");
+        write(r, "src/rustfmt.toml", "max_width = 200\n");
         write(
             r,
             "crates/a/clippy.toml",
             "too-many-arguments-threshold = 99\n",
         );
-        assert_eq!(kinds(r), ["fmt-disabled", "untracked-clippy-config"]);
-        std::process::Command::new("git")
-            .args(["add", "crates/a/clippy.toml"])
-            .current_dir(r)
-            .status()
-            .unwrap();
-        assert_eq!(kinds(r), ["fmt-disabled"]);
+        assert_eq!(
+            kinds(r),
+            ["untracked-clippy-config", "untracked-rustfmt-config"]
+        );
+        git(r, &["add", "crates/a/clippy.toml"]);
+        git(r, &["add", "-f", "src/rustfmt.toml"]);
+        assert!(kinds(r).is_empty(), "{:?}", kinds(r));
+    }
+
+    /// A rustfmt file outside the repository applies only when the repository has none
+    /// of its own (third review, finding 6).
+    #[test]
+    fn rustfmt_rules_from_outside_the_repository() {
+        let outer = tempfile::tempdir().unwrap();
+        let r = outer.path().join("repo");
+        std::fs::create_dir_all(&r).unwrap();
+        git(&r, &["init", "-q"]);
+        write(outer.path(), "rustfmt.toml", "max_width = 200\n");
+        assert_eq!(kinds(&r), ["rustfmt-outside"]);
+        assert!(kinds_trusting(&r, &["rustfmt-outside".into()]).is_empty());
+        write(&r, "rustfmt.toml", "edition = \"2024\"\n");
+        git(&r, &["add", "rustfmt.toml"]);
+        assert!(kinds(&r).is_empty(), "{:?}", kinds(&r));
     }
 
     #[test]
@@ -820,33 +1166,35 @@ mod tests {
     /// The second implementation review: settings the allowlist wrongly called safe.
     #[test]
     fn second_review_bypasses_are_found() {
-        let cases: &[(&str, &str)] = &[
+        let h = host();
+        let cases: &[(String, &str)] = &[
             (
-                "[build]\nrustflags = [\"--force-warn\", \"clippy::unwrap_used\"]\n",
+                "[build]\nrustflags = [\"--force-warn\", \"clippy::unwrap_used\"]\n".into(),
                 "allow-flag",
             ),
             (
-                "[build]\nrustflags = [\"-C\", \"opt-level=1\"]\n",
+                "[build]\nrustflags = [\"-C\", \"opt-level=1\"]\n".into(),
                 "rustflag",
             ),
             (
-                "[build]\nrustflags = [\"-Cdebug-assertions=off\"]\n",
+                "[build]\nrustflags = [\"-Cdebug-assertions=off\"]\n".into(),
                 "rustflag",
             ),
             (
-                "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"v\"\n",
+                "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"v\"\n".into(),
                 "source",
             ),
-            ("[env]\nINSTA_FORCE_PASS = \"1\"\n", "env"),
+            ("[env]\nINSTA_FORCE_PASS = \"1\"\n".into(), "env"),
+            ("[env]\nLD_PRELOAD = \"/tmp/x.so\"\n".into(), "env"),
             (
-                "[target.x86_64-unknown-linux-gnu]\nlinker = \".cargo/fake-ld.sh\"\n",
+                format!("[target.{h}]\nlinker = \".cargo/fake-ld.sh\"\n"),
                 "linker",
             ),
+            (format!("[target.{h}]\nlinker = \"evil-ld\"\n"), "linker"),
             (
-                "[target.x86_64-unknown-linux-gnu]\nlinker = \"evil-ld\"\n",
-                "linker",
+                "[build]\nrustc-wrapper = \"./wrap.sh\"\n".into(),
+                "rustc-wrapper",
             ),
-            ("[build]\nrustc-wrapper = \"./wrap.sh\"\n", "rustc-wrapper"),
         ];
         for (text, kind) in cases {
             let dir = tempfile::tempdir().unwrap();
@@ -856,7 +1204,8 @@ mod tests {
     }
 
     /// Common legitimate settings stay quiet: mold, sccache, tokio_unstable, ordinary
-    /// `[env]` variables, explicit debug assertions.
+    /// `[env]` variables, explicit debug assertions, vendoring through a registry mirror,
+    /// and settings for targets other than the host (third review, finding 4).
     #[test]
     fn common_legitimate_settings_pass() {
         let dir = tempfile::tempdir().unwrap();
@@ -864,19 +1213,54 @@ mod tests {
         write(
             r,
             ".cargo/config.toml",
-            "[build]\nrustc-wrapper = \"sccache\"\n\
-             rustflags = [\"--cfg\", \"tokio_unstable\", \"-C\", \"opt-level=0\", \"-Cdebug-assertions=on\"]\n\
-             [target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n\
-             rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n\
-             [env]\nSQLX_OFFLINE = \"true\"\n",
+            &format!(
+                "[build]\nrustc-wrapper = \"sccache\"\n\
+                 rustflags = [\"--cfg\", \"tokio_unstable\", \"-C\", \"opt-level=0\", \"-Cdebug-assertions=on\"]\n\
+                 rustdocflags = [\"--cfg\", \"docsrs\"]\n\
+                 [target.{}]\nlinker = \"clang\"\n\
+                 rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\", \"-C\", \"link-arg=-fuse-ld=/usr/local/bin/mold\"]\n\
+                 [target.wasm32-unknown-unknown]\nrunner = \"wasm-bindgen-test-runner\"\n\
+                 [target.thumbv7em-none-eabihf]\nrustflags = [\"-C\", \"link-arg=-Tlink.x\"]\n\
+                 [source.crates-io]\nreplace-with = \"corp\"\n\
+                 [source.corp]\nregistry = \"sparse+https://mirror.example.com/index/\"\n\
+                 [env]\nSQLX_OFFLINE = \"true\"\n",
+                host()
+            ),
         );
         assert!(sc(r, &[]).is_empty(), "{:?}", sc(r, &[]));
+    }
+
+    /// Flags are reported once per kind, a flag's value with it; a linker inside the
+    /// repository is never a known one.
+    #[test]
+    fn flags_are_reported_with_their_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
         write(
             r,
             ".cargo/config.toml",
-            "[source.crates-io]\nreplace-with = \"v\"\n",
+            &format!(
+                "[build]\nrustdocflags = [\"-Z\", \"unstable-options\", \"--extern-html-root-url\", \"x=y\"]\n\
+                 rustflags = [\"-A\", \"dead_code\", \"-Aunused\"]\n\
+                 [target.{}]\nrustflags = [\"-C\", \"link-arg=-fuse-ld={}\"]\n",
+                host(),
+                r.join("tools/mold").display()
+            ),
         );
-        assert!(sc(r, &["source".into()]).is_empty(), "trusted vendoring");
+        let f = sc(r, &[]);
+        let mut k: Vec<&str> = f.iter().map(|f| f.kind.as_str()).collect();
+        k.sort_unstable();
+        assert_eq!(k, ["allow-flag", "linker", "rustflag"], "{f:?}");
+        let text = |kind: &str| &f.iter().find(|f| f.kind == kind).unwrap().text;
+        assert!(text("rustflag").contains("-Z unstable-options"), "{f:?}");
+        assert!(
+            text("rustflag").contains("--extern-html-root-url x=y"),
+            "{f:?}"
+        );
+        assert!(
+            text("allow-flag").contains("-A dead_code -Aunused"),
+            "{f:?}"
+        );
     }
 
     /// A clippy file above the repository is untracked by definition (final review M3); a
@@ -886,11 +1270,7 @@ mod tests {
         let outer = tempfile::tempdir().unwrap();
         let r = outer.path().join("repo");
         std::fs::create_dir_all(&r).unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&r)
-            .status()
-            .unwrap();
+        git(&r, &["init", "-q"]);
         write(
             &r,
             "vendor/base64/Cargo.toml",
@@ -932,6 +1312,31 @@ mod tests {
         assert!(toolchain_scan_with(dir.path(), &[], Some(home.path())).is_empty());
     }
 
+    /// `rustup override set` lives in rustup's settings, not in the tree (third review,
+    /// finding 2).
+    #[test]
+    fn rustup_directory_overrides_are_checked() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("crate");
+        std::fs::create_dir_all(&sub).unwrap();
+        let key = canon(dir.path()).display().to_string();
+        let settings = |toolchain: &str| {
+            write(
+                home.path(),
+                "settings.toml",
+                &format!("version = \"12\"\n[overrides]\n'{key}' = \"{toolchain}\"\n"),
+            );
+        };
+        settings("my-linked-toolchain");
+        let f = toolchain_scan_with(&sub, &[], Some(home.path()));
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].kind, "toolchain-custom");
+        assert!(f[0].file.ends_with("settings.toml"), "{f:?}");
+        settings("1.97.0");
+        assert!(toolchain_scan_with(&sub, &[], Some(home.path())).is_empty());
+    }
+
     #[test]
     fn toolchain_scan_reads_ancestors_before_cargo_runs() {
         let dir = tempfile::tempdir().unwrap();
@@ -946,31 +1351,55 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].kind, "toolchain-path");
         assert!(toolchain_scan(&sub, &["toolchain-path".into()]).is_empty());
+        // Inside a repository but untracked, trust does not apply; tracked, it is in the
+        // diff and CI uses it too.
+        git(dir.path(), &["init", "-q"]);
+        let f = toolchain_scan(&sub, &["toolchain-path".into()]);
+        assert!(f.len() == 1 && !f[0].trustable, "{f:?}");
+        git(dir.path(), &["add", "rust-toolchain.toml"]);
+        assert!(toolchain_scan(&sub, &[]).is_empty());
     }
 
+    /// Variables are judged by value where that is safe (third review, finding 8).
     #[test]
-    fn weakening_env_names() {
+    fn weakening_env_by_name_and_value() {
+        let root = Path::new("/repo");
         let vars = [
-            "PATH",
-            "RUSTFLAGS",
-            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
-            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
-            "CARGO_ALIAS_CLIPPY",
-            "RUSTUP_TOOLCHAIN",
-            "RUSTC_WRAPPER",
-            "CARGO_TARGET_DIR",
-            "CARGO_HOME",
-            "RUSTFMT",
+            ("PATH", "/usr/bin"),
+            ("RUSTFLAGS", "--cfg tokio_unstable -C target-cpu=native"),
+            ("RUSTDOCFLAGS", "-A warnings"),
+            ("CARGO_ENCODED_RUSTFLAGS", "--cap-lints\u{1f}allow"),
+            ("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER", "true"),
+            ("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER", "clang"),
+            ("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER", "/repo/ld"),
+            ("CARGO_ALIAS_CLIPPY", "check"),
+            ("CARGO_BUILD_JOBS", "8"),
+            ("CARGO_PROFILE_DEV_DEBUG", "0"),
+            ("CARGO_PROFILE_TEST_OVERFLOW_CHECKS", "false"),
+            ("CARGO_PROFILE_DEV_OPT_LEVEL", "1"),
+            ("RUSTUP_TOOLCHAIN", "stable"),
+            ("RUSTC_WRAPPER", "sccache"),
+            ("RUSTC_WORKSPACE_WRAPPER", "/repo/wrap.sh"),
+            ("CARGO_TARGET_DIR", "/elsewhere"),
+            ("CARGO_HOME", "/home/x/.cargo"),
+            ("RUSTFMT", "/bin/true"),
+            ("LD_PRELOAD", "x.so"),
+            ("UPDATE_GOLDENFILES", "1"),
         ];
         assert_eq!(
-            weakening_env(vars.iter().copied(), &["env:RUSTC_WRAPPER".into()]),
+            weakening_env(vars.iter().copied(), &["env:RUSTFMT".into()], root),
             [
                 "CARGO_ALIAS_CLIPPY",
-                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+                "CARGO_ENCODED_RUSTFLAGS",
+                "CARGO_PROFILE_DEV_OPT_LEVEL",
+                "CARGO_PROFILE_TEST_OVERFLOW_CHECKS",
+                "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
                 "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER",
-                "RUSTFLAGS",
-                "RUSTFMT",
-                "RUSTUP_TOOLCHAIN"
+                "LD_PRELOAD",
+                "RUSTC_WORKSPACE_WRAPPER",
+                "RUSTDOCFLAGS",
+                "RUSTUP_TOOLCHAIN",
+                "UPDATE_GOLDENFILES",
             ]
         );
     }

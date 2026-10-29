@@ -154,7 +154,6 @@ fn verify(d: &Path, args: &[&str]) -> (Option<i32>, String) {
     )
 }
 
-#[cfg(unix)]
 fn host_triple() -> String {
     let out = Command::new("rustc").arg("-vV").output().unwrap();
     String::from_utf8_lossy(&out.stdout)
@@ -288,9 +287,12 @@ fn cargo_config_that_weakens_the_gate_fails_it() {
     write(
         d,
         ".cargo/config.toml",
-        "[build]\nrustflags = [\"--cap-lints\", \"allow\"]\n\
-         [target.x86_64-unknown-linux-gnu]\nrunner = \"true\"\n\
-         [alias]\nclippy = \"check\"\n",
+        &format!(
+            "[build]\nrustflags = [\"--cap-lints\", \"allow\"]\n\
+             [target.{}]\nrunner = \"true\"\n\
+             [alias]\nclippy = \"check\"\n",
+            host_triple()
+        ),
     );
     write(d, ".git/info/exclude", "/.cargo\n");
     write(d, "src/lib.rs", FAILING_TEST);
@@ -398,13 +400,19 @@ fn pushing_with_uncommitted_build_inputs_is_denied() {
     commit_staged(d, "uses helper", T0 + 60);
     write(d, "src/helper.rs", "pub const ONE: u32 = 1;\n");
     write(d, "notes.md", "scratch\n");
+    // No target reads these (third review, finding 3).
+    write(d, "scratch/try.rs", "fn main() {}\n");
+    write(d, "docs/book.toml", "[book]\ntitle = \"x\"\n");
     let v = push(d);
     assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{v}");
     let why = v["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
         .unwrap();
     assert!(
-        why.contains("src/helper.rs") && !why.contains("notes.md"),
+        why.contains("src/helper.rs")
+            && !why.contains("notes.md")
+            && !why.contains("scratch/try.rs")
+            && !why.contains("book.toml"),
         "{why}"
     );
     git(d, &["add", "src/helper.rs"], T0 + 120);
@@ -412,8 +420,147 @@ fn pushing_with_uncommitted_build_inputs_is_denied() {
     let v = push(d);
     assert!(
         v.is_null(),
-        "only build inputs count, notes.md may stay: {v}"
+        "only build inputs count, the rest may stay: {v}"
     );
+    // Deleting a remote branch publishes nothing local.
+    write(d, "src/helper.rs", "pub const ONE: u32 = 2;\n");
+    let v = hook(
+        d,
+        "pre-bash",
+        &json!({"session_id": "s1", "tool_input": {"command": "git push origin --delete old"}}),
+    );
+    assert!(v.is_null(), "{v}");
+}
+
+/// Third review, finding 7: a file already changed when the session started, and not
+/// touched since, is not the session's; its failure is reported as such.
+#[test]
+fn a_change_pending_before_the_session_is_not_the_sessions() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "src/lib.rs", &format!("mod other;\n{GOOD}"));
+    write(d, "src/other.rs", "pub fn   ugly( ) {}\n");
+    start(d, "startup");
+    write(
+        d,
+        "src/lib.rs",
+        &format!("mod other;\n{}", GOOD.replace("a + b", "b + a")),
+    );
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("src/other.rs (not changed in this session)"),
+        "{reason}"
+    );
+    let v = stop(d, true);
+    assert!(!blocked(&v), "released after one block: {v}");
+    // Touching it makes it the session's.
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/other.rs", "pub fn   ugly( ) { }\n");
+    let v = stop(d, false);
+    let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("src/other.rs (changed in this session)"),
+        "{reason}"
+    );
+}
+
+/// A suppression already pending when the session started is not reported as the
+/// session's; one the session adds is.
+#[test]
+fn suppressions_pending_before_the_session_are_not_reported() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "src/lib.rs", &format!("mod extra;\n{GOOD}"));
+    write(d, "src/extra.rs", "#[allow(dead_code)]\nfn unused() {}\n");
+    start(d, "startup");
+    write(
+        d,
+        "src/lib.rs",
+        &format!("mod extra;\n{}", GOOD.replace("a + b", "b + a")),
+    );
+    let v = stop(d, false);
+    assert!(!blocked(&v), "{v}");
+    assert!(
+        !v.to_string().contains("src/extra.rs"),
+        "pending before the session: {v}"
+    );
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(
+        d,
+        "src/extra.rs",
+        "#[allow(dead_code)]\nfn unused() {}\n#[allow(dead_code)]\nfn other() {}\n",
+    );
+    let v = stop(d, false);
+    assert!(v.to_string().contains("allow (src/extra.rs"), "{v}");
+}
+
+/// The threat model: configuration git does not track fails the gate whatever it says
+/// (third review, finding 1: `[env]` reaches rustc, clippy and the tests); once tracked it
+/// is in the diff, is not judged, and is reported when the gate passes.
+#[test]
+fn hidden_config_fails_and_tracked_config_is_reported() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    // `INSTA_UPDATE` is one the gate would judge in any file it judges.
+    write(
+        d,
+        ".cargo/config.toml",
+        "[env]\nFX_MODE = \"fast\"\nINSTA_UPDATE = \"no\"\n",
+    );
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("## integrity") && reason.contains("env.FX_MODE"),
+        "{reason}"
+    );
+    git(d, &["add", ".cargo/config.toml"], T0 + 60);
+    let v = stop(d, false);
+    assert!(!blocked(&v), "{v}");
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("build configuration changed") && msg.contains(".cargo/config.toml"),
+        "{v}"
+    );
+}
+
+/// Third review, finding 6: rustfmt reads the user's own configuration when the project
+/// has none; CI does not have it.
+#[test]
+fn rustfmt_rules_from_the_home_directory_fail_the_gate() {
+    let repo = fixture();
+    let d = repo.path();
+    let home = tempfile::tempdir().unwrap();
+    write(home.path(), ".rustfmt.toml", "max_width = 40\n");
+    let real_home = std::env::var("HOME").unwrap_or_default();
+    let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| format!("{real_home}/.cargo"));
+    let rustup_home =
+        std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{real_home}/.rustup"));
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_fsmap"))
+            .arg("verify")
+            .arg(d)
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("CARGO_HOME", &cargo_home)
+            .env("RUSTUP_HOME", &rustup_home)
+            .output()
+            .unwrap()
+    };
+    let out = run();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("rustfmt-outside"), "{text}");
+    write(d, "rustfmt.toml", "edition = \"2021\"\n");
+    commit(d, "A", "own rustfmt rules", T0 + 60);
+    let out = run();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("rustfmt-outside"), "{text}");
 }
 
 /// Final review M1: the gate passes only when every step passes. A failure only in files
