@@ -445,20 +445,17 @@ fn package_manifest(ws: &Path, file: &Path) -> Option<PathBuf> {
 /// its test target report the same error twice), in order, relative to the workspace.
 fn error_lines(output: &str, ws: &Path) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    let prefix = format!("{}/", ws.display());
     verify::sanitize(output)
         .lines()
         .map(str::trim)
-        .filter(|l| {
-            l.split_once(':').is_some_and(|(path, rest)| {
-                !path.is_empty()
-                    && rest
-                        .splitn(3, ':')
-                        .nth(2)
-                        .is_some_and(|r| r.trim_start().starts_with("error"))
-            })
+        .filter_map(|l| {
+            let (path, level) = verify::diagnostic(l)?;
+            if level != "error" {
+                return None;
+            }
+            let shown = verify::rel_path(ws, path).unwrap_or_else(|| path.replace('\\', "/"));
+            Some(format!("{shown}{}", &l[path.len()..]))
         })
-        .map(|l| l.strip_prefix(&prefix).unwrap_or(l).to_string())
         .filter(|l| seen.insert(l.clone()))
         .collect()
 }
@@ -690,30 +687,39 @@ fn log_gate(ws: &Path, sid: &str, result: &str, ms: u64) {
     );
 }
 
-/// Files changed since the session started (or since HEAD), untracked ones included, as
-/// absolute paths.
-fn touched_files(ws: &Path, start_head: Option<&str>) -> Vec<PathBuf> {
+/// Files changed since the session started (or since HEAD), untracked ones included,
+/// relative to the workspace root with forward slashes. Compared as strings: absolute
+/// paths differ in form (Windows `\\?\` canonical paths vs cargo's), and a mismatch would
+/// turn a new failure into a "pre-existing" one.
+fn touched_files(ws: &Path, start_head: Option<&str>) -> Vec<String> {
     let Some((root, _)) = brief::locate(ws) else {
         return Vec::new();
     };
+    let prefix = crate::git::run({
+        let mut c = crate::git::git(ws);
+        c.args(["rev-parse", "--show-prefix"]);
+        c
+    })
+    .map(|o| String::from_utf8_lossy(&o).trim().to_string())
+    .unwrap_or_default();
     brief::changed_files(&root, start_head.unwrap_or("HEAD"))
         .unwrap_or_default()
         .into_iter()
-        .map(|f| root.join(f))
+        .filter_map(|f| f.strip_prefix(&prefix).map(String::from))
         .collect()
 }
 
-/// Failing steps that block (unattributable, or pointing at a touched file) and the files
+/// Failing steps that block (integrity, unattributable, or pointing at a touched file) and the files
 /// of failures that only concern untouched files (pre-existing, review finding M7).
-fn split_failures<'a>(report: &'a Report, touched: &[PathBuf]) -> (Vec<&'a str>, Vec<String>) {
-    let root = Path::new(&report.root);
+fn split_failures<'a>(report: &'a Report, touched: &[String]) -> (Vec<&'a str>, Vec<String>) {
     let mut blocking = Vec::new();
     let mut preexisting = Vec::new();
     for f in report.failures() {
-        let mine = f.files.is_empty()
-            || f.files
-                .iter()
-                .any(|file| touched.iter().any(|t| *t == root.join(file)));
+        // A weakening setting makes every other result meaningless, wherever it lives (a
+        // git-ignored .cargo/config.toml is never "touched"); trusting it is explicit.
+        let mine = f.name == "integrity"
+            || f.files.is_empty()
+            || f.files.iter().any(|file| touched.contains(file));
         if mine {
             blocking.push(f.name.as_str());
         } else {
@@ -883,12 +889,20 @@ mod tests {
     fn error_lines_dedupe_and_relativise() {
         let ws = Path::new("/w");
         let out = "/w/src/a.rs:3:5: error[E0308]: mismatched types\n\
+                   src\\b.rs:1:2: error[E0425]: cannot find value\n\
                    src/a.rs:9:1: warning: unused\n\
                    /w/src/a.rs:3:5: error[E0308]: mismatched types\n\
                    error: could not compile `x` (lib) due to 1 previous error\n";
         assert_eq!(
             error_lines(out, ws),
-            ["src/a.rs:3:5: error[E0308]: mismatched types"]
+            [
+                "src/a.rs:3:5: error[E0308]: mismatched types",
+                "src/b.rs:1:2: error[E0425]: cannot find value"
+            ]
+        );
+        assert_eq!(
+            verify::diagnostic(r"C:\w\src\a.rs:3:5: error[E0308]: x"),
+            Some((r"C:\w\src\a.rs", "error"))
         );
     }
 

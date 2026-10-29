@@ -395,21 +395,36 @@ fn attributed_files(root: &Path, output: &str) -> Vec<String> {
             let path = if let Some(rest) = l.strip_prefix("Diff in ") {
                 rest.rsplitn(3, ':').nth(2)?
             } else {
-                let (path, rest) = l.split_once(':')?;
-                let after = rest.splitn(3, ':').nth(2)?.trim_start();
-                if !(after.starts_with("warning") || after.starts_with("error")) {
-                    return None;
-                }
-                path
+                diagnostic(l)?.0
             };
-            let p = Path::new(path);
-            let rel = p.strip_prefix(root).unwrap_or(p);
-            (!rel.is_absolute()).then(|| rel.to_string_lossy().replace('\\', "/"))
+            rel_path(root, path)
         })
         .collect();
     files.sort();
     files.dedup();
     files
+}
+
+/// A compiler diagnostic in `--message-format=short` form, `path:line:col: error…` or
+/// `…: warning…`: the path and the level. The path may start with a drive letter (`C:\…`),
+/// so splitting at the first colon is wrong.
+pub fn diagnostic(line: &str) -> Option<(&str, &str)> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^(.+?):\d+:\d+: (error|warning)").expect("a valid pattern")
+    });
+    let c = RE.captures(line)?;
+    Some((c.get(1)?.as_str(), c.get(2)?.as_str()))
+}
+
+/// `path` relative to `root` with forward slashes; `None` for a path outside `root`.
+pub fn rel_path(root: &Path, path: &str) -> Option<String> {
+    let p = Path::new(path);
+    let rel = if p.is_absolute() {
+        p.strip_prefix(root).ok()?
+    } else {
+        p
+    };
+    Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
 fn cargo_subcommand_exists(root: &Path, sub: &str) -> bool {
@@ -536,7 +551,7 @@ mod tests {
         let root = Path::new("/w");
         let out = "Diff in /w/src/a.rs:12:\n-x\n+y\n\
                    src/b.rs:3:5: warning: unused variable\n\
-                   src/c.rs:1:1: error[E0308]: mismatched types\n\
+                   src\\c.rs:1:1: error[E0308]: mismatched types\n\
                    error: could not compile `x`\n\
                    /elsewhere/d.rs:1:1: warning: outside\n";
         assert_eq!(
