@@ -409,8 +409,30 @@ stop hook ran the gate on a tree with a mutant in place; it blocked. It also cau
 regression in the same run: a rename's original path had leaked into `dirty_paths`, which an
 existing test pinned. That was fixed in the code; the test is unchanged.
 
-**Costs.** Every turn that changed the tree pays one gate run: on this repository 44–45 s with nothing
-to rebuild (4-core container, 136 tests, three runs). Nearly all of it is `cargo test`, whose 40 end-to-end
+**Fifth implementation review (convergence check).** A sixth fresh agent confirmed every
+previous finding closed. It found no blocker, and 3 major and 4 minor findings, five of them
+regressions from the round before. Its explanation of one (that `git status` prints paths
+relative to a subdirectory) did not hold when checked: the paths are relative to the work tree
+top. The bug it found was real and older: dirty files were read from the workspace instead of
+the top, so in a nested workspace a re-edited file never re-ran the gate.
+
+| Finding | Fix | Alternative and why not |
+|---|---|---|
+| 1. A tracked symlink to an ignored config passed: git tracks only the link text, and placing links where they are (last round) made it Tracked. Edits to the target did not change the fingerprint. | A link is placed by the stricter of where it is and where it points; the fingerprint reads config files through links. | Refuse links: dotfile setups use them. |
+| 2. A tracked file reached through `include` under another name was judged as hidden. Changes to it were not reported on pass. | Files not among the listed config names are asked about one by one; the pass report covers every config file, classified by name. | — |
+| 3. Every unchanged `--skip-worktree` file counted as uncommitted, so a push in a sparse checkout was denied permanently. Nested workspaces never had their dirty files read. | Only entries present on disk whose content differs from the index blob (`git hash-object --no-filters`) count. Dirty files are read from the work tree top. | — |
+| Minor | A heredoc whose output a shell or `eval` runs, or that is piped into a shell, is a script. `#` starts a comment only at a word boundary. `$((` in double quotes and `((` as a command are arithmetic. Delimiters are read as words with quotes and backslashes removed (`'END-MSG'`, `\EOF`), so a commit message heredoc with a dash in its delimiter is no longer denied. | — |
+
+**Mutation check, after the fifth round.** 111 guards removed one at a time; each matching test
+failed. Two guards were replaced this round (`shift-not-heredoc` by `shift-number`,
+`build-config-report` by `classify-by-name`). Two older parser guards passed on the first try:
+the new delimiter reading made their old cases safe without them. Each got a case only that guard
+decides. A test was added for reading configs through links, which had none. During this round a
+Python edit with an empty match range garbled `state.rs`; it was restored from the last commit
+and redone with checked ranges. Nothing of it was committed.
+
+**Costs.** Every turn that changed the tree pays one gate run: on this repository 46–47 s with nothing
+to rebuild (4-core container, 140 tests, three runs). Nearly all of it is `cargo test`, whose 42 end-to-end
 hook tests each build a small Cargo project. Every Rust edit
 pays a `cargo check` (median 1.1 s in the session that wired the hooks). The hooks run build scripts, proc macros and tests without asking, so they
 are for repositories you trust. The ask rules add prompts when the agent edits manifests, lint

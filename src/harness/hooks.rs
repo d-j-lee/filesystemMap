@@ -1148,7 +1148,7 @@ fn failure_reason(report: &Report, touched: &[String]) -> String {
 fn suppression_summary(ws: &Path, me: &state::Session) -> Option<String> {
     let root = toplevel(ws)?;
     let base = diff_base(ws, me.start_head.as_deref());
-    let pathspecs = [
+    let mut pathspecs: Vec<String> = [
         "*.rs",
         ":(glob)**/Cargo.toml",
         ":(glob)**/clippy.toml",
@@ -1159,7 +1159,20 @@ fn suppression_summary(ws: &Path, me: &state::Session) -> Option<String> {
         ":(glob)**/.cargo/config.toml",
         ":(glob)**/rust-toolchain",
         ":(glob)**/rust-toolchain.toml",
-    ];
+    ]
+    .map(String::from)
+    .into();
+    // Files a cargo configuration includes, under any name (fifth review).
+    let top = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    for path in super::integrity::config_files(ws) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        if let Ok(rel) = path.strip_prefix(&top) {
+            pathspecs.push(format!(
+                ":(literal){}",
+                rel.to_string_lossy().replace('\\', "/")
+            ));
+        }
+    }
     let diff = crate::git::run({
         let mut c = crate::git::git_worktree(&root);
         c.args([
@@ -1174,7 +1187,7 @@ fn suppression_summary(ws: &Path, me: &state::Session) -> Option<String> {
             &base,
             "--",
         ])
-        .args(pathspecs);
+        .args(&pathspecs);
         c
     })
     .ok()?;
@@ -1195,7 +1208,7 @@ fn suppression_summary(ws: &Path, me: &state::Session) -> Option<String> {
     let untracked = crate::git::run({
         let mut c = crate::git::git(&root);
         c.args(["ls-files", "-z", "--others", "--exclude-standard", "--"])
-            .args(pathspecs);
+            .args(&pathspecs);
         c
     })
     .unwrap_or_default();
@@ -1211,10 +1224,10 @@ fn suppression_summary(ws: &Path, me: &state::Session) -> Option<String> {
     let mut pending: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
     for (file, sign, text) in &lines {
         let name = file.rsplit('/').next().unwrap_or(file);
-        let kind = if file.contains(".cargo/config") || name.starts_with("rust-toolchain") {
-            "build configuration changed"
-        } else if !file.ends_with(".rs") && name != "Cargo.toml" {
+        let kind = if name.contains("clippy") || name.contains("rustfmt") {
             "lint or format configuration changed"
+        } else if !file.ends_with(".rs") && name != "Cargo.toml" {
+            "build configuration changed"
         } else if name == "Cargo.toml" {
             match manifest_weakening(text) {
                 Some(kind) if *sign == '+' => kind,

@@ -122,7 +122,7 @@ Measured 2026-10-28 on a 4-core cloud container, release build.
 | `/usr`, 93 k entries, `--no-git` | scan 0.14 s; content 1.6 s warm / 10.8 s cold (456 MiB text); peak RSS 88 MB |
 | `/usr --sizes-only` → HTML | 0.57 s, 6.6 MiB report |
 | `brief --hook` on ripgrep with a warm cache (one git call) | 8 ms (median of 30) |
-| `verify` (quick gate) on this repository, 2026-10-29, 136 tests | 44–45 s with nothing to rebuild, three runs; nearly all `cargo test` (40 end-to-end hook tests) |
+| `verify` (quick gate) on this repository, 2026-10-29, 140 tests | 46–47 s with nothing to rebuild, three runs; nearly all `cargo test` (42 end-to-end hook tests) |
 | `hook session-start` / `hook pre-bash` (non-publishing command) on a clean clone | 0.4 s / 5 ms (3 runs each) |
 
 ## 7. Safety and privacy

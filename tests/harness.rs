@@ -557,16 +557,68 @@ fn a_skip_worktree_edit_reruns_the_gate() {
     let repo = fixture();
     let d = repo.path();
     start(d, "startup");
-    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
-    commit(d, "Agent", "swap", T0 + 30);
-    assert!(!blocked(&stop(d, false)));
     git(
         d,
         &["update-index", "--skip-worktree", "src/lib.rs"],
         T0 + 40,
     );
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(!blocked(&stop(d, false)));
+    // Listed already: only its contents tell this edit from the one that passed.
     write(d, "src/lib.rs", FAILING_TEST);
     assert!(blocked(&stop(d, false)), "the hidden edit must be checked");
+}
+
+/// Fifth review: skip-worktree entries that did not change, or are absent from disk (a
+/// sparse checkout), are not uncommitted work; denying every push for them would leave
+/// nothing to commit.
+#[test]
+fn unchanged_or_sparse_skip_worktree_files_do_not_block_a_push() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "tools/gen/Cargo.toml", "[package]\nname = \"gen\"\n");
+    write(d, "tools/gen/src/main.rs", "fn main() {}\n");
+    commit(d, "A", "tool", T0 + 10);
+    start(d, "startup");
+    git(
+        d,
+        &["update-index", "--skip-worktree", "src/lib.rs"],
+        T0 + 20,
+    );
+    git(
+        d,
+        &[
+            "update-index",
+            "--skip-worktree",
+            "tools/gen/Cargo.toml",
+            "tools/gen/src/main.rs",
+        ],
+        T0 + 20,
+    );
+    std::fs::remove_dir_all(d.join("tools")).unwrap();
+    let v = push(d);
+    assert!(v.is_null(), "{v}");
+}
+
+/// A workspace below the git top: `git status` prints paths from the top, so dirty files
+/// must be read from there, or re-editing one would not rerun the gate (fifth review;
+/// before, they were joined onto the workspace and never read).
+#[test]
+fn re_editing_a_dirty_file_in_a_nested_workspace_reruns_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let top = dir.path();
+    init(top);
+    let d = &top.join("crate");
+    write(d, "Cargo.toml", CARGO_TOML);
+    write(d, ".gitignore", IGNORE);
+    write(d, "src/lib.rs", GOOD);
+    lockfile(d);
+    commit(top, "A", "init", T0);
+    start(d, "startup");
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(!blocked(&stop(d, false)));
+    write(d, "src/lib.rs", FAILING_TEST);
+    assert!(blocked(&stop(d, false)), "the second edit must be checked");
 }
 
 /// The threat model: configuration git does not track fails the gate whatever it says
@@ -598,6 +650,18 @@ fn hidden_config_fails_and_tracked_config_is_reported() {
     assert!(
         msg.contains("build configuration changed") && msg.contains(".cargo/config.toml"),
         "{v}"
+    );
+    // A tracked file the config includes, under another name, is reported too.
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, ".cargo/config.toml", "include = [\"shared.toml\"]\n");
+    write(d, ".cargo/shared.toml", "[env]\nFX_MODE = \"fast\"\n");
+    git(d, &["add", ".cargo"], T0 + 90);
+    let v = stop(d, false);
+    assert!(!blocked(&v), "{v}");
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains(".cargo/shared.toml") && !msg.contains("lint or format"),
+        "a cargo file under another name is build configuration: {v}"
     );
 }
 

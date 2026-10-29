@@ -228,8 +228,9 @@ pub fn fingerprint(root: &Path, trust: &[String]) -> Option<String> {
     for path in ignored_build_inputs(root) {
         hash_file(&mut h, &root.join(path));
     }
+    // Through links: a tracked link's target is what cargo reads (fifth review).
     for path in integrity::config_files(root) {
-        hash_file(&mut h, &path);
+        hash_file(&mut h, &std::fs::canonicalize(&path).unwrap_or(path));
     }
     let vars = super::verify::env_vars();
     for name in integrity::weakening_env(
@@ -269,11 +270,15 @@ fn hash_tree(h: &mut xxhash_rust::xxh3::Xxh3, root: &Path, depth: usize) -> Opti
     })
     .ok()?;
     h.update(&status);
+    // `git status` prints paths from the work tree top, also for a workspace below it
+    // (fifth review: joined onto the workspace, a nested one's edits were never read).
+    let top = toplevel(root).unwrap_or_else(|| root.to_path_buf());
     for path in dirty_paths(&status) {
-        hash_file(h, &root.join(&path));
+        hash_file(h, &top.join(&path));
     }
     for path in hidden_index_entries(root) {
-        hash_file(h, &root.join(&path));
+        h.update(path.as_bytes());
+        hash_file(h, &top.join(&path));
     }
     if depth < 2 {
         for sub in submodules(root) {
@@ -341,14 +346,9 @@ fn ignored_build_inputs(root: &Path) -> Vec<String> {
 /// `MAX_DIRTY` (then every change counts as the session's, the strict reading).
 pub fn dirty_snapshot(dir: &Path) -> BTreeMap<String, String> {
     const MAX_DIRTY: usize = 2000;
-    let Ok(top) = git::run({
-        let mut c = git::git(dir);
-        c.args(["rev-parse", "--show-toplevel"]);
-        c
-    }) else {
+    let Some(top) = toplevel(dir) else {
         return BTreeMap::new();
     };
-    let top = PathBuf::from(String::from_utf8_lossy(&top).trim());
     let status = git::run({
         let mut c = git::git_worktree(dir);
         c.args([
@@ -450,22 +450,64 @@ pub fn status_entries(status: &[u8]) -> Vec<StatusEntry> {
     out
 }
 
-/// Tracked files whose changes git was told not to show (`--skip-worktree`,
-/// `--assume-unchanged`), relative to the work tree top: `git status` cannot see their
-/// edits, so they are hashed and treated as uncommitted (fourth review, M4).
+/// Tracked files whose edits git was told not to show (`--skip-worktree`,
+/// `--assume-unchanged`) and that differ from the index, relative to the work tree top:
+/// `git status` cannot see those edits, so they are hashed and treated as uncommitted
+/// (fourth review, M4). Unchanged ones, and ones absent from disk as in a sparse checkout,
+/// are not work to commit (fifth review).
 pub fn hidden_index_entries(dir: &Path) -> Vec<String> {
-    git::run({
-        let mut c = git::git(dir);
-        c.args(["ls-files", "-v", "-z", "--full-name"]);
+    let Some(top) = toplevel(dir) else {
+        return Vec::new();
+    };
+    // `-v -s`: "<tag> <mode> <object> <stage>\t<path>".
+    let listing = git::run({
+        let mut c = git::git(&top);
+        c.args(["ls-files", "-v", "-s", "-z"]);
         c
     })
-    .map(|o| {
-        o.split(|&b| b == 0)
-            .filter(|e| e.len() > 2 && (e[0] == b'S' || e[0].is_ascii_lowercase()))
-            .map(|e| String::from_utf8_lossy(&e[2..]).into_owned())
-            .collect()
+    .unwrap_or_default();
+    let candidates: Vec<(String, String)> = listing
+        .split(|&b| b == 0)
+        .filter(|e| e.len() > 2 && (e[0] == b'S' || e[0].is_ascii_lowercase()))
+        .filter_map(|e| {
+            let text = String::from_utf8_lossy(&e[2..]);
+            let (meta, path) = text.split_once('\t')?;
+            let object = meta.split(' ').nth(1)?.to_string();
+            std::fs::symlink_metadata(top.join(path))
+                .is_ok_and(|m| m.is_file())
+                .then(|| (path.to_string(), object))
+        })
+        .collect();
+    let mut changed = Vec::new();
+    for chunk in candidates.chunks(500) {
+        let Ok(out) = git::run({
+            let mut c = git::git(&top);
+            c.args(["hash-object", "--no-filters", "--"])
+                .args(chunk.iter().map(|(p, _)| p));
+            c
+        }) else {
+            // Cannot tell: count them all, the strict reading.
+            changed.extend(chunk.iter().map(|(p, _)| p.clone()));
+            continue;
+        };
+        let hashes = String::from_utf8_lossy(&out);
+        for ((path, object), now) in chunk.iter().zip(hashes.lines()) {
+            if now.trim() != object {
+                changed.push(path.clone());
+            }
+        }
+    }
+    changed
+}
+
+fn toplevel(dir: &Path) -> Option<PathBuf> {
+    git::run({
+        let mut c = git::git(dir);
+        c.args(["rev-parse", "--show-toplevel"]);
+        c
     })
-    .unwrap_or_default()
+    .ok()
+    .map(|o| PathBuf::from(String::from_utf8_lossy(&o).trim()))
 }
 
 fn hash_file(h: &mut xxhash_rust::xxh3::Xxh3, path: &Path) {
@@ -499,6 +541,36 @@ mod tests {
 
     /// Final review M5: hooks of two sessions updating at once must not drop each other's
     /// records.
+    /// A tracked link's target is what cargo reads: editing it changes the fingerprint
+    /// (fifth review).
+    #[cfg(unix)]
+    #[test]
+    fn the_fingerprint_follows_config_links() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("shared.toml");
+        std::fs::write(&target, "[build]\njobs = 1\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(r)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(r.join(".cargo")).unwrap();
+        std::os::unix::fs::symlink(&target, r.join(".cargo/config.toml")).unwrap();
+        git(&["add", "-A"]);
+        let before = fingerprint(r, &[]);
+        std::fs::write(&target, "[build]\njobs = 2\n").unwrap();
+        assert!(before.is_some());
+        assert_ne!(before, fingerprint(r, &[]));
+    }
+
     #[test]
     fn concurrent_updates_keep_every_record() {
         let tmp = tempfile::tempdir().unwrap();

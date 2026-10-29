@@ -151,20 +151,21 @@ enum Kind {
     Toolchain,
 }
 
-/// Where a configuration file lives, which decides how it is judged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where a configuration file lives, which decides how it is judged. Ordered from the
+/// least to the most strictly judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Place {
     /// Tracked in this repository: in the diff, and CI reads it too. Not judged.
     Tracked,
-    /// Inside the repository but untracked or ignored: what CI never sees. Judged; never
-    /// trusted.
-    Hidden,
-    /// Outside the repository (ancestors, `CARGO_HOME`, the user's rustfmt configuration):
-    /// the developer's environment. Judged; a repository can trust kinds here.
-    Outside,
     /// Inside a project that is not in a git repository: there is no history to hide
     /// from, so it is judged like `Outside`.
     Unversioned,
+    /// Outside the repository (ancestors, `CARGO_HOME`, the user's rustfmt configuration):
+    /// the developer's environment. Judged; a repository can trust kinds here.
+    Outside,
+    /// Inside the repository but untracked, ignored, or hidden from `git status`: what CI
+    /// never sees. Judged; never trusted.
+    Hidden,
 }
 
 #[derive(Debug)]
@@ -213,8 +214,8 @@ fn configs(root: &Path) -> Vec<ConfigFile> {
     // Compared canonically: git prints the toplevel with links resolved (`/private/var` on
     // macOS), while `root` is spelled as given.
     let (croot, ctop) = (canon(root), top.as_deref().map(canon));
-    let place_of = |path: &Path| -> Place {
-        let path = canon_file(path);
+    // Where one location is (its directory resolved, the file itself not).
+    let place_at = |path: &Path| -> Place {
         let Some(top) = ctop.as_deref() else {
             return if path.starts_with(&croot) {
                 Place::Unversioned
@@ -226,12 +227,23 @@ fn configs(root: &Path) -> Vec<ConfigFile> {
             Err(_) => Place::Outside,
             Ok(rel) => {
                 let rel = rel.to_string_lossy().replace('\\', "/");
-                if listed.iter().any(|(p, tracked)| *tracked && *p == rel) {
-                    Place::Tracked
-                } else {
-                    Place::Hidden
+                match listed.iter().find(|(p, _)| *p == rel) {
+                    Some((_, true)) => Place::Tracked,
+                    Some((_, false)) => Place::Hidden,
+                    // Not a config file name (an included file): ask git about it alone.
+                    None => place_of_file(path),
                 }
             }
+        }
+    };
+    // A link is placed by the stricter of where it is and where it points: git tracks only
+    // a link's text, so a tracked link to an ignored file hides its content (fifth review).
+    let place_of = |path: &Path| -> Place {
+        let here = place_at(&canon_file(path));
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            here.max(place_at(&canon(path)))
+        } else {
+            here
         }
     };
     let mut candidates: Vec<(PathBuf, Kind)> = Vec::new();
@@ -1503,6 +1515,31 @@ mod tests {
         );
         assert_eq!(kinds_trusting(r, &["runner".into()]), ["runner"]);
         assert!(config_files(r).iter().any(|p| p.ends_with("local.toml")));
+        // A tracked included file is placed as tracked, whatever its name (fifth review).
+        write(r, ".cargo/config.toml", "include = [\"shared.toml\"]\n");
+        write(r, ".cargo/shared.toml", "[env]\nMY_SETTING = \"1\"\n");
+        git(r, &["add", ".cargo/config.toml", ".cargo/shared.toml"]);
+        assert!(kinds(r).is_empty(), "{:?}", kinds(r));
+    }
+
+    /// A tracked symlink to an ignored file: git tracks only the link text, so the content
+    /// is hidden (fifth review). The stricter of the link's and the target's place wins.
+    #[cfg(unix)]
+    #[test]
+    fn a_tracked_link_to_an_ignored_config_is_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "-q"]);
+        write(r, ".gitignore", "/local-cargo.toml\n");
+        write(
+            r,
+            "local-cargo.toml",
+            &format!("[target.{}]\nrunner = \"true\"\n", host()),
+        );
+        std::fs::create_dir_all(r.join(".cargo")).unwrap();
+        std::os::unix::fs::symlink("../local-cargo.toml", r.join(".cargo/config.toml")).unwrap();
+        git(r, &["add", ".gitignore", ".cargo/config.toml"]);
+        assert_eq!(kinds(r), ["runner"]);
     }
 
     /// `git update-index --skip-worktree` hides a tracked file's changes from git; it is

@@ -43,10 +43,12 @@ pub fn mentions_publish(text: &str) -> bool {
 }
 
 /// Remove the bodies of heredocs whose command is not a shell (`cat > notes.md <<'X'`,
-/// `git commit -m "$(cat <<'EOF' … EOF)"`): they are data. A heredoc fed to a shell is a
-/// script and stays. Operators are found with the quoting context: `echo "<<X"` is text,
-/// `"$(cat <<X …)"` is a heredoc. A body that never ends means the reading was wrong (or
-/// the script is), so nothing is removed.
+/// `git commit -m "$(cat <<'EOF' … EOF)"`): they are data. A heredoc a shell runs is a
+/// script and stays: fed to a shell, piped into one (`cat <<X | sh`), or inside a
+/// substitution whose output a shell or `eval` runs (`bash -c "$(cat <<X …)"`). Operators
+/// are found with the quoting context: `echo "<<X"` is text, `"$(cat <<X …)"` is a heredoc.
+/// A body that never ends means the reading was wrong (or the script is), so nothing is
+/// removed.
 fn strip_data_heredocs(cmd: &str) -> String {
     let mut out = String::new();
     let mut pending: Vec<(String, bool)> = Vec::new(); // (delimiter, keep body)
@@ -62,12 +64,23 @@ fn strip_data_heredocs(cmd: &str) -> String {
             continue;
         }
         out.push_str(line);
-        for (at, delim) in heredoc_operators(line, &mut stack) {
-            let shell = parse(&line[..at], 0).commands.last().is_some_and(|w| {
-                w.first()
-                    .is_some_and(|p| matches!(program(p), "sh" | "bash" | "zsh" | "dash" | "ksh"))
-            });
-            pending.push((delim, shell));
+        for op in heredoc_operators(line, &mut stack) {
+            let before = parse(&line[..op.at], 0);
+            let runs = |w: &Vec<String>, eval: bool| {
+                w.first().is_some_and(|p| {
+                    matches!(program(p), "sh" | "bash" | "zsh" | "dash" | "ksh")
+                        || (eval && program(p) == "eval")
+                })
+            };
+            let script = before.commands.last().is_some_and(|w| runs(w, false))
+                || (op.in_substitution
+                    && before
+                        .outer
+                        .checked_sub(1)
+                        .and_then(|i| before.commands.get(i))
+                        .is_some_and(|w| runs(w, true)))
+                || piped_into_shell(&line[op.at..]);
+            pending.push((op.delimiter, script));
         }
     }
     if pending.is_empty() {
@@ -75,6 +88,25 @@ fn strip_data_heredocs(cmd: &str) -> String {
     } else {
         cmd.to_string()
     }
+}
+
+/// Whether the rest of a line pipes into a shell (`… | sh`, `… | sudo bash`).
+fn piped_into_shell(rest: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\|\s*(sudo\s+)?(\S*/)?(sh|bash|zsh|dash|ksh)\b")
+            .expect("a valid pattern")
+    });
+    RE.is_match(rest)
+}
+
+/// A heredoc operator found in a line.
+struct HeredocOp {
+    /// Where the operator starts.
+    at: usize,
+    /// The delimiter word with its quotes removed.
+    delimiter: String,
+    /// Inside a command substitution or backticks.
+    in_substitution: bool,
 }
 
 /// Quoting context while scanning for heredoc operators.
@@ -91,10 +123,9 @@ enum Ctx {
     Arith,
 }
 
-/// The heredoc operators (`<<X`, `<<-'X'`, not `<<<`) in `line` that the shell would see
-/// as operators: where each starts, and its delimiter. `stack` carries the quoting context
-/// across lines.
-fn heredoc_operators(line: &str, stack: &mut Vec<Ctx>) -> Vec<(usize, String)> {
+/// The heredoc operators (`<<X`, `<<-'X'`, `<<\X`, not `<<<`) in `line` that the shell
+/// would see as operators. `stack` carries the quoting context across lines.
+fn heredoc_operators(line: &str, stack: &mut Vec<Ctx>) -> Vec<HeredocOp> {
     let mut out = Vec::new();
     let b = line.as_bytes();
     let mut i = 0;
@@ -118,6 +149,10 @@ fn heredoc_operators(line: &str, stack: &mut Vec<Ctx>) -> Vec<(usize, String)> {
                 b'\\' => i += 1,
                 b'"' => {
                     stack.pop();
+                }
+                b'$' if next == Some(b'(') && b.get(i + 2) == Some(&b'(') => {
+                    stack.push(Ctx::Arith);
+                    i += 2;
                 }
                 b'$' if next == Some(b'(') => {
                     stack.push(Ctx::Subst);
@@ -148,6 +183,13 @@ fn heredoc_operators(line: &str, stack: &mut Vec<Ctx>) -> Vec<(usize, String)> {
                     stack.push(Ctx::Subst);
                     i += 1;
                 }
+                // `(( … ))` as a command is arithmetic too.
+                b'(' if next == Some(b'(')
+                    && (i == 0 || matches!(b[i - 1], b' ' | b'\t' | b';' | b'&' | b'|' | b'(')) =>
+                {
+                    stack.push(Ctx::Arith);
+                    i += 1;
+                }
                 b'(' if top == Some(Ctx::Subst) => stack.push(Ctx::Subst),
                 b')' if top == Some(Ctx::Subst) => {
                     stack.pop();
@@ -159,7 +201,7 @@ fn heredoc_operators(line: &str, stack: &mut Vec<Ctx>) -> Vec<(usize, String)> {
                 b'#' if i == 0 || matches!(b[i - 1], b' ' | b'\t' | b';' | b'&' | b'|' | b'(') => {
                     break;
                 }
-                b'<' if next == Some(b'<') && b.get(i + 2) != Some(&b'<') => {
+                b'<' if next == Some(b'<') => {
                     let start = i;
                     let mut j = i + 2;
                     if b.get(j) == Some(&b'-') {
@@ -168,26 +210,43 @@ fn heredoc_operators(line: &str, stack: &mut Vec<Ctx>) -> Vec<(usize, String)> {
                     while matches!(b.get(j), Some(b' ' | b'\t')) {
                         j += 1;
                     }
-                    let quoted = matches!(b.get(j), Some(b'\'' | b'"'));
-                    if quoted {
+                    // A number is a shift (`x<<2`), not a delimiter; `<<<` is a here-string.
+                    let word = b
+                        .get(j)
+                        .is_some_and(|c| !c.is_ascii_digit() && !b" \t\r\n;&|<>()".contains(c));
+                    // The delimiter word runs to the next unquoted metacharacter; its quotes
+                    // and backslashes are removed (`'END-MSG'`, `\EOF`, `E"O"F`).
+                    let mut delimiter = Vec::new();
+                    let mut quote: Option<u8> = None;
+                    while word && let Some(&d) = b.get(j) {
+                        match quote {
+                            Some(q) if d == q => quote = None,
+                            Some(_) => delimiter.push(d),
+                            None => match d {
+                                b'\'' | b'"' => quote = Some(d),
+                                b'\\' => {
+                                    j += 1;
+                                    if let Some(&n) = b.get(j) {
+                                        delimiter.push(n);
+                                    }
+                                }
+                                b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>'
+                                | b'(' | b')' => break,
+                                _ => delimiter.push(d),
+                            },
+                        }
                         j += 1;
                     }
-                    let from = j;
-                    // A delimiter starts like a name.
-                    if b.get(j)
-                        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
-                    {
-                        while b
-                            .get(j)
-                            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
-                        {
-                            j += 1;
-                        }
+                    if !delimiter.is_empty() {
+                        out.push(HeredocOp {
+                            at: start,
+                            delimiter: String::from_utf8_lossy(&delimiter).into_owned(),
+                            in_substitution: stack
+                                .iter()
+                                .any(|c| matches!(c, Ctx::Subst | Ctx::Backtick)),
+                        });
                     }
-                    if j > from {
-                        out.push((start, line[from..j].to_string()));
-                    }
-                    i = j + usize::from(quoted);
+                    i = j.max(i + 2);
                     continue;
                 }
                 _ => {}
@@ -200,7 +259,10 @@ fn heredoc_operators(line: &str, stack: &mut Vec<Ctx>) -> Vec<(usize, String)> {
 
 /// Simple commands (lists of words) and whether the text parsed to its end.
 struct Parsed {
+    /// Top-level commands first, then those inside double-quoted substitutions.
     commands: Vec<Vec<String>>,
+    /// How many of `commands` are top-level.
+    outer: usize,
     /// No quote or substitution was left open, and nesting stayed within `MAX_DEPTH`.
     complete: bool,
 }
@@ -213,6 +275,7 @@ type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 fn parse(s: &str, depth: usize) -> Parsed {
     let mut p = Parsed {
         commands: Vec::new(),
+        outer: 0,
         complete: depth <= MAX_DEPTH,
     };
     if !p.complete {
@@ -229,7 +292,9 @@ fn parse(s: &str, depth: usize) -> Parsed {
             *in_word = false;
         }
     };
+    let mut prev: Option<char> = None;
     while let Some(c) = chars.next() {
+        let before = prev.replace(c);
         match c {
             '\'' => {
                 in_word = true;
@@ -286,7 +351,12 @@ fn parse(s: &str, depth: usize) -> Parsed {
                     word.push(n);
                 }
             }
-            '#' if !in_word => while chars.next_if(|&c| c != '\n').is_some() {},
+            // A comment starts a word: `$(date)#` and `a#b` are not comments.
+            '#' if before
+                .is_none_or(|p| p.is_whitespace() || matches!(p, ';' | '&' | '|' | '(')) =>
+            {
+                while chars.next_if(|&c| c != '\n').is_some() {}
+            }
             ';' | '&' | '|' | '\n' | '(' | ')' | '`' => {
                 end_word(&mut word, &mut in_word, &mut words);
                 if !words.is_empty() {
@@ -310,6 +380,7 @@ fn parse(s: &str, depth: usize) -> Parsed {
     if !words.is_empty() {
         p.commands.push(words);
     }
+    p.outer = p.commands.len();
     p.commands.extend(nested);
     p
 }
@@ -659,6 +730,18 @@ mod tests {
             "true;# a comment <<EOF\ngit push origin main\nEOF",
             "echo \"<<X\"\ngit push origin main\nX",
             "(( a = 1<<2 ))\ngit push origin main\n2",
+            // The fifth review: a heredoc whose output a shell runs is a script; `#` inside a
+            // word; shifts in double quotes and in `(( ))`; `<<<` is not `<<`.
+            "bash -c \"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"",
+            "eval \"$(cat <<EOF\ngit push origin main\nEOF\n)\"",
+            "cat <<'EOF' | bash\ngit push origin main\nEOF",
+            "echo $(date)#; git push origin main",
+            "echo \"$((x<<y))\"\ngit push origin main\ny",
+            "(( a = x<<y ))\ngit push origin main\ny",
+            "cat <<<word\ngit push origin main\nword",
+            "let x=1<<2\ngit push origin main\n2",
+            "echo \"a <<X b\"\ngit push origin main\nX",
+            "echo $'it\\'s <<EOF here'\ngit push origin main\nEOF",
         ] {
             assert!(publishes(cmd), "{cmd}");
         }
@@ -704,6 +787,9 @@ mod tests {
             "git commit -m \"$(cat <<'EOF'\nIt's ready for git push later\nEOF\n)\"",
             "echo 'git push' # it's only text",
             "true;# it's a comment <<EOF\ngit status",
+            "git commit -F- <<'END-MSG'\nIt's done; next git push\nEND-MSG",
+            "cat <<\\EOF\nIt's about git push\nEOF",
+            "cat <<E\"O\"F\nIt's about git push\nEOF",
             "echo \"$(echo 'a\\')\" && echo 'remember: git push'",
         ] {
             assert!(!publishes(cmd), "{cmd}");
