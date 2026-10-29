@@ -194,6 +194,25 @@ mod tests {
         );
     }
 
+    /// Background processes a tool leaves in its group are killed when it ends, so they
+    /// cannot outlive the step (second review M9: the grace period alone hid this).
+    #[test]
+    fn processes_left_in_the_group_are_killed_when_the_tool_ends() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & echo $!; exit 0"]);
+        let o = run(cmd, Duration::from_secs(10));
+        let pid = o.output.trim().to_string();
+        std::thread::sleep(Duration::from_millis(200));
+        // A killed orphan can linger as a zombie until init reaps it; that is dead.
+        let stat = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&stat.stdout);
+        let alive = !stat.trim().is_empty() && !stat.trim().starts_with('Z');
+        assert!(!alive, "background process {pid} survived ({})", stat.trim());
+    }
+
     /// A grandchild in its own session escapes the process group; the caller still
     /// returns shortly after the deadline instead of waiting for its pipe.
     #[test]

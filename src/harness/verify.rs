@@ -141,6 +141,43 @@ pub fn workspace_root(dir: &Path) -> Result<PathBuf> {
         .context("manifest path has no parent")
 }
 
+/// The directories of the workspace's member packages (`cargo metadata --no-deps`), or the
+/// root alone when cargo cannot say.
+pub fn members(root: &Path) -> Vec<PathBuf> {
+    let found: Vec<PathBuf> = clean_command(root, "cargo")
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--offline",
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|meta| {
+            meta["packages"].as_array().map(|ps| {
+                ps.iter()
+                    .filter_map(|p| {
+                        Some(
+                            Path::new(p["manifest_path"].as_str()?)
+                                .parent()?
+                                .to_path_buf(),
+                        )
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    if found.is_empty() {
+        vec![root.to_path_buf()]
+    } else {
+        found
+    }
+}
+
 /// The nearest `Cargo.toml` at or above `dir`.
 pub fn nearest_manifest(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
@@ -335,7 +372,7 @@ fn target_dir(root: &Path, trust: &[String]) -> Option<PathBuf> {
 
 fn integrity_step(root: &Path, trust: &[String]) -> StepResult {
     let started = Instant::now();
-    let findings = integrity::scan(root, trust);
+    let findings = integrity::scan(root, &members(root), trust);
     let mut files: Vec<String> = findings.iter().map(|f| f.file.clone()).collect();
     files.sort();
     files.dedup();

@@ -110,6 +110,23 @@ fn blocked(v: &Value) -> bool {
     v["decision"] == "block"
 }
 
+/// Commit only what is staged (`common::commit` adds everything).
+fn commit_staged(d: &Path, msg: &str, time: i64) {
+    git(
+        d,
+        &[
+            "-c",
+            "user.name=Agent",
+            "-c",
+            "user.email=dev@example.com",
+            "commit",
+            "-qm",
+            msg,
+        ],
+        time,
+    );
+}
+
 fn push(d: &Path) -> Value {
     hook(
         d,
@@ -361,10 +378,42 @@ fn push_is_denied_while_the_gate_fails() {
         )
     };
     assert!(bash("git status").is_null());
-    let v = bash("git commit -am x && git push origin main");
+    commit(d, "Agent", "broken", T0 + 60);
+    let v = bash("git push origin main");
     assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{v}");
     write(d, "src/lib.rs", GOOD);
+    commit(d, "Agent", "fixed", T0 + 120);
     assert!(bash("git push origin main").is_null());
+}
+
+/// Second review M7: the gate checks the working tree, a push sends HEAD. With build
+/// inputs left uncommitted (here a module file the commit needs), the two differ.
+#[test]
+fn pushing_with_uncommitted_build_inputs_is_denied() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(d, "src/lib.rs", &format!("pub mod helper;\n{GOOD}"));
+    git(d, &["add", "src/lib.rs"], T0 + 60);
+    commit_staged(d, "uses helper", T0 + 60);
+    write(d, "src/helper.rs", "pub const ONE: u32 = 1;\n");
+    write(d, "notes.md", "scratch\n");
+    let v = push(d);
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{v}");
+    let why = v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(
+        why.contains("src/helper.rs") && !why.contains("notes.md"),
+        "{why}"
+    );
+    git(d, &["add", "src/helper.rs"], T0 + 120);
+    commit_staged(d, "helper", T0 + 120);
+    let v = push(d);
+    assert!(
+        v.is_null(),
+        "only build inputs count, notes.md may stay: {v}"
+    );
 }
 
 /// Final review M1: the gate passes only when every step passes. A failure only in files
@@ -395,7 +444,16 @@ fn failures_in_untouched_files_block_once_then_ask_for_a_report() {
     assert!(!blocked(&v), "{v}");
     let msg = v["systemMessage"].as_str().unwrap();
     assert!(msg.contains("gate NOT passed"), "{msg}");
-    assert_eq!(push(d)["hookSpecificOutput"]["permissionDecision"], "deny");
+    commit(d, "Agent", "change", T0 + 60);
+    let v = push(d);
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{v}");
+    assert!(
+        v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("## fmt"),
+        "{v}"
+    );
 }
 
 /// Final review M1(a): a change can break a file it never touched. Removing the only
@@ -426,6 +484,173 @@ fn breaking_an_untouched_file_is_not_a_pass() {
         v["reason"].as_str().unwrap().contains("src/other.rs"),
         "{v}"
     );
+}
+
+const UNWRAP: &str = "pub fn add(a: u32, b: u32) -> u32 {\n    Some(a + b).unwrap()\n}\n";
+
+/// Second review M6: a session that started before the first commit owns what it commits;
+/// its failures are not "someone else's" and keep all three strikes.
+#[test]
+fn a_session_started_before_the_first_commit_owns_its_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    init(d);
+    write(d, ".gitignore", IGNORE);
+    write(d, "Cargo.toml", CARGO_TOML);
+    write(d, "src/lib.rs", GOOD);
+    lockfile(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", UNWRAP);
+    commit(d, "Agent", "first", T0);
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    assert!(
+        v["reason"]
+            .as_str()
+            .unwrap()
+            .contains("src/lib.rs (changed in this session)"),
+        "{v}"
+    );
+    assert!(
+        blocked(&stop(d, true)),
+        "its own failure: second strike blocks"
+    );
+}
+
+/// The same when the session starts before there is any Cargo project: the agent runs
+/// `cargo init` and commits.
+#[test]
+fn a_session_started_before_the_cargo_project_owns_its_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    init(d);
+    write(d, ".gitignore", IGNORE);
+    start(d, "startup");
+    write(d, "Cargo.toml", CARGO_TOML);
+    write(d, "src/lib.rs", UNWRAP);
+    lockfile(d);
+    commit(d, "Agent", "first", T0);
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    assert!(
+        blocked(&stop(d, true)),
+        "its own failure: second strike blocks"
+    );
+}
+
+/// The baseline commit is recorded the first time a session is seen, whatever the source:
+/// a session first seen at a compaction still owns what it commits afterwards.
+#[test]
+fn a_session_first_seen_at_compaction_owns_its_later_commits() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "compact");
+    write(d, "src/lib.rs", UNWRAP);
+    commit(d, "Agent", "unwrap", T0 + 60);
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    assert!(
+        blocked(&stop(d, true)),
+        "its own failure: second strike blocks"
+    );
+}
+
+/// Second review B1: `--force-warn` keeps a lint a warning under `-D warnings`.
+#[test]
+fn force_warn_in_a_hidden_config_fails_the_gate() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(d, "src/lib.rs", UNWRAP);
+    write(d, ".git/info/exclude", "/.cargo\n");
+    write(
+        d,
+        ".cargo/config.toml",
+        "[build]\nrustflags = [\"--force-warn\", \"clippy::unwrap_used\"]\n",
+    );
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("allow-flag"), "{v}");
+}
+
+/// `RUSTFMT` pointing at `true` made the fmt step pass; it is removed like the others.
+#[test]
+fn a_fake_rustfmt_from_the_environment_is_ignored() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "a   +   b"));
+    let v = hook_env(
+        d,
+        "stop",
+        &json!({"session_id": "s1", "stop_hook_active": false}),
+        &[("RUSTFMT", "true")],
+    );
+    assert!(blocked(&v), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("## fmt"), "{v}");
+}
+
+/// When git cannot fingerprint the tree, the gate still runs (it used to report "did not
+/// run" and let the stop through).
+#[test]
+fn the_gate_runs_when_git_cannot_read_the_repository() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    let config = std::fs::read_to_string(d.join(".git/config")).unwrap();
+    write(d, ".git/config", &format!("{config}[core\n"));
+    let v = stop(d, false);
+    assert!(blocked(&v), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("adds"), "{v}");
+}
+
+/// The pass report covers new untracked files and manifest settings that switch checks
+/// off (second review M4 and M9).
+#[test]
+fn passing_changes_report_untracked_suppressions_and_manifest_settings() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(d, "src/lib.rs", &format!("mod extra;\n{GOOD}"));
+    write(d, "src/extra.rs", "#[allow(dead_code)]\nfn unused() {}\n");
+    write(
+        d,
+        "Cargo.toml",
+        &format!(
+            "{}\n[profile.dev]\ndebug-assertions = false\n",
+            CARGO_TOML.replace("unwrap_used = \"warn\"", "unwrap_used = 'allow'")
+        ),
+    );
+    let v = stop(d, false);
+    assert!(!blocked(&v), "{v}");
+    let msg = v["systemMessage"].as_str().unwrap();
+    assert!(msg.contains("allow (src/extra.rs)"), "{msg}");
+    assert!(msg.contains("lint allowed in a manifest"), "{msg}");
+    assert!(msg.contains("checks switched off in a manifest"), "{msg}");
+}
+
+/// A post-edit check waits for one already running instead of skipping the edit.
+#[test]
+fn post_edit_waits_for_a_running_check() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    let lock = d.join(".git/fsmap-harness/check.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, "").unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::fs::remove_file(lock).unwrap();
+    });
+    write(d, "src/lib.rs", TYPE_ERROR);
+    let v = hook(
+        d,
+        "post-edit",
+        &json!({"session_id": "s1", "tool_input": {"file_path": d.join("src/lib.rs")}}),
+    );
+    release.join().unwrap();
+    assert!(blocked(&v), "{v}");
 }
 
 /// Final review M2: a session that starts on a broken commit changed nothing, so its turn
@@ -687,6 +912,28 @@ fn template_hooks_tolerate_a_missing_or_old_fsmap() {
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let crashing = tempfile::tempdir().unwrap();
+    let fake = crashing.path().join("fsmap");
+    std::fs::write(&fake, "#!/bin/sh\nkill -9 $$\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let crash_path = format!("{}:/usr/bin:/bin", crashing.path().display());
+    for event in ["UserPromptSubmit", "PostToolUse", "PreToolUse", "Stop"] {
+        let out = Command::new("sh")
+            .args(["-c", &command(event)])
+            .env("PATH", &crash_path)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{event}");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            v["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("failed (exit 137)"),
+            "{event}: {v}"
+        );
+    }
     for path in [
         "/usr/bin:/bin".to_string(),
         format!("{}:/usr/bin:/bin", old.path().display()),
@@ -761,5 +1008,4 @@ fn stats_summarise_the_log() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("gate block"), "{text}");
     assert!(text.contains("session-start"), "{text}");
-    let _ = git; // shared helper module
 }

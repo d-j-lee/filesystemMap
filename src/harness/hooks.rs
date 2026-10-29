@@ -32,6 +32,10 @@ const MAX_STRIKES: u32 = 3;
 const UNTOUCHED_STRIKES: u32 = 2;
 /// How long a post-edit check waits for one already running in the same worktree.
 const CHECK_WAIT: Duration = Duration::from_secs(30);
+/// `start_head` of a session that began before the repository's first commit: its
+/// changes are judged against the empty tree, not against a HEAD it created itself
+/// (second review M6).
+const UNBORN: &str = "unborn";
 /// Background task types that edit the tree; the gate waits for them.
 const AGENT_TASKS: &[&str] = &["subagent", "workflow", "teammate", "cloud session"];
 
@@ -202,8 +206,18 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
     let (ws, cfg) = match workspace(project) {
         Ws::Ready(ws, cfg) => (ws, cfg),
         Ws::NotRust => {
+            // The agent may create the Cargo project later in this session: remember where
+            // the session started so that what it commits is judged as its own.
+            let head = state::head(project);
+            state::update(project, |st| {
+                let s = st.session(&sid);
+                s.last_seen = state::now();
+                if s.start_head.is_none() {
+                    s.start_head = Some(head.unwrap_or_else(|| UNBORN.to_string()));
+                }
+            });
             out.system.push(format!(
-                "[harness] no Cargo workspace at {}: the Rust gate is inactive in this session",
+                "[harness] no Cargo workspace at {}: the Rust gate is inactive until there is one",
                 project.display()
             ));
             return Ok(out);
@@ -231,7 +245,7 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
         // Which files the session changed is judged from here; recorded the first time the
         // session is seen, whatever the source (final review M1).
         if s.start_head.is_none() {
-            s.start_head.clone_from(&head);
+            s.start_head = Some(head.clone().unwrap_or_else(|| UNBORN.to_string()));
         }
     });
     if fp.is_some() && fp != snapshot.last_pass_fp && source != "startup" {
@@ -256,7 +270,7 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
         );
     }
     out.context.push(briefing(&ws, &cfg));
-    let findings = super::integrity::scan(&ws, &cfg.trust);
+    let findings = super::integrity::scan(&ws, &verify::members(&ws), &cfg.trust);
     if !findings.is_empty() {
         let list: Vec<String> = findings
             .iter()
@@ -573,12 +587,16 @@ impl Drop for CheckLock {
 enum Gate {
     /// Nothing to do: the tree already passed, or (for a stop) the session changed nothing.
     Unchanged,
-    /// Every step passed; notes for the user (added suppressions).
-    Pass { fp: String, notes: Vec<String> },
+    /// Every step passed; notes for the user (added suppressions). `fp` is `None` when the
+    /// tree could not be fingerprinted: the verdict is then not remembered.
+    Pass {
+        fp: Option<String>,
+        notes: Vec<String>,
+    },
     /// Something failed. `untouched_only`: every failure is in files the session did not
     /// change, so after one block Claude reports instead of editing unrelated files.
     Fail {
-        fp: String,
+        fp: Option<String>,
         reason: String,
         untouched_only: bool,
     },
@@ -596,21 +614,24 @@ fn gate(
     me: &state::Session,
     publishing: bool,
 ) -> Result<Gate> {
-    let fp = state::fingerprint(ws, &cfg.trust)
-        .context("could not read the git status of the working tree")?;
-    if snapshot.last_pass_fp.as_deref() == Some(fp.as_str())
-        || (!publishing && me.start_fp.as_deref() == Some(fp.as_str()))
-    {
-        return Ok(Gate::Unchanged);
-    }
-    if snapshot.last_fail_fp.as_deref() == Some(fp.as_str())
-        && let Some(reason) = &snapshot.last_fail_reason
-    {
-        return Ok(Gate::Fail {
-            fp,
-            reason: reason.clone(),
-            untouched_only: snapshot.last_fail_untouched_only,
-        });
+    // Without a fingerprint (no git, or git refusing the repository) the gate still
+    // runs, every time: skipping it would fail open.
+    let fp = state::fingerprint(ws, &cfg.trust);
+    if let Some(fp) = fp.as_deref() {
+        if snapshot.last_pass_fp.as_deref() == Some(fp)
+            || (!publishing && me.start_fp.as_deref() == Some(fp))
+        {
+            return Ok(Gate::Unchanged);
+        }
+        if snapshot.last_fail_fp.as_deref() == Some(fp)
+            && let Some(reason) = &snapshot.last_fail_reason
+        {
+            return Ok(Gate::Fail {
+                fp: Some(fp.to_string()),
+                reason: reason.clone(),
+                untouched_only: snapshot.last_fail_untouched_only,
+            });
+        }
     }
     let exe = std::env::current_exe().context("locating the fsmap binary")?;
     let steps = verify::plan(ws, Mode::Quick, &exe, cfg);
@@ -779,17 +800,21 @@ fn release_text(failures: u32, reason: &str) -> String {
     )
 }
 
-fn record_pass(st: &mut state::State, fp: String) {
-    st.last_pass_fp = Some(fp);
-    st.last_fail_fp = None;
-    st.last_fail_reason = None;
-    st.last_fail_untouched_only = false;
+fn record_pass(st: &mut state::State, fp: Option<String>) {
+    if fp.is_some() {
+        st.last_pass_fp = fp;
+        st.last_fail_fp = None;
+        st.last_fail_reason = None;
+        st.last_fail_untouched_only = false;
+    }
 }
 
-fn record_fail(st: &mut state::State, fp: String, reason: &str, untouched_only: bool) {
-    st.last_fail_fp = Some(fp);
-    st.last_fail_reason = Some(reason.to_string());
-    st.last_fail_untouched_only = untouched_only;
+fn record_fail(st: &mut state::State, fp: Option<String>, reason: &str, untouched_only: bool) {
+    if fp.is_some() {
+        st.last_fail_fp = fp;
+        st.last_fail_reason = Some(reason.to_string());
+        st.last_fail_untouched_only = untouched_only;
+    }
 }
 
 /// Note that the session was active; returns whether the state could be written.
@@ -817,6 +842,16 @@ fn pre_bash(project: &Path, input: &Value) -> Result<Out> {
         Ws::Broken(e) => return Ok(deny(broken_message(&e))),
     };
     let sid = session_id(input);
+    let pending = uncommitted_inputs(&ws);
+    if !pending.is_empty() {
+        log_gate(&ws, &sid, "push-uncommitted", 0);
+        return Ok(deny(format!(
+            "[harness] the gate checks the working tree, but these build inputs are not \
+             committed, so the push would send something the gate did not check: {}. Commit \
+             or stash them, then push.",
+            pending.join(", ")
+        )));
+    }
     let snapshot = state::load(&ws);
     let me = snapshot.sessions.get(&sid).cloned().unwrap_or_default();
     let started = std::time::Instant::now();
@@ -877,7 +912,7 @@ fn log_gate(ws: &Path, sid: &str, result: &str, ms: u64) {
 /// paths differ in form (Windows `\\?\` canonical paths vs cargo's), and a mismatch would
 /// turn a new failure into a "pre-existing" one.
 fn touched_files(ws: &Path, start_head: Option<&str>) -> Vec<String> {
-    let Some((root, _)) = brief::locate(ws) else {
+    let Some(root) = toplevel(ws) else {
         return Vec::new();
     };
     let prefix = crate::git::run({
@@ -887,11 +922,91 @@ fn touched_files(ws: &Path, start_head: Option<&str>) -> Vec<String> {
     })
     .map(|o| String::from_utf8_lossy(&o).trim().to_string())
     .unwrap_or_default();
-    brief::changed_files(&root, start_head.unwrap_or("HEAD"))
+    brief::changed_files(&root, &diff_base(ws, start_head))
         .unwrap_or_default()
         .into_iter()
         .filter_map(|f| f.strip_prefix(&prefix).map(String::from))
         .collect()
+}
+
+/// The work tree's top directory (works before the first commit, unlike `brief::locate`).
+fn toplevel(ws: &Path) -> Option<PathBuf> {
+    crate::git::run({
+        let mut c = crate::git::git(ws);
+        c.args(["rev-parse", "--show-toplevel"]);
+        c
+    })
+    .ok()
+    .map(|o| PathBuf::from(String::from_utf8_lossy(&o).trim()))
+}
+
+/// What the session's changes are compared with: where it started, the empty tree when
+/// it started before the first commit, else HEAD.
+fn diff_base(ws: &Path, start_head: Option<&str>) -> String {
+    match start_head {
+        Some(UNBORN) => crate::git::run({
+            let mut c = crate::git::git(ws);
+            // stdin is empty: the id of the empty tree, whatever the hash function.
+            c.args(["hash-object", "-t", "tree", "--stdin"]);
+            c
+        })
+        .map(|o| String::from_utf8_lossy(&o).trim().to_string())
+        .unwrap_or_else(|_| "HEAD".into()),
+        Some(h) => h.to_string(),
+        None => "HEAD".into(),
+    }
+}
+
+/// Changed or untracked files that can change what the gate checks (Rust sources,
+/// manifests, the lock file), relative to the work tree top. A push sends HEAD; with these
+/// pending, the gate's verdict on the work tree says nothing about HEAD (second review M7).
+fn uncommitted_inputs(ws: &Path) -> Vec<String> {
+    let status = crate::git::run({
+        let mut c = crate::git::git_worktree(ws);
+        c.args([
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=dirty",
+        ]);
+        c
+    })
+    .unwrap_or_default();
+    let mut out: Vec<String> = state::dirty_paths(&status)
+        .into_iter()
+        .filter(|p| {
+            let name = p.rsplit('/').next().unwrap_or(p);
+            p.ends_with(".rs") || p.ends_with(".toml") || name == "Cargo.lock"
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A manifest line that switches checks or tests off (second review M4): manifests are
+/// tracked, so this is reported on a pass rather than failed.
+fn manifest_weakening(line: &str) -> Option<&'static str> {
+    static RE: std::sync::LazyLock<[(regex::Regex, &'static str); 4]> =
+        std::sync::LazyLock::new(|| {
+            let re = |p: &str| regex::Regex::new(p).expect("a valid pattern");
+            [
+                (
+                    re(r#"=\s*\{?[^#]*['"]allow['"]"#),
+                    "lint allowed in a manifest",
+                ),
+                (
+                    re(r"^\s*(debug-assertions|overflow-checks)\s*=\s*false"),
+                    "checks switched off in a manifest",
+                ),
+                (
+                    re(r"^\s*(test|autotests|harness|doctest)\s*=\s*false"),
+                    "tests switched off in a manifest",
+                ),
+                (re(r"^\s*\[patch"), "dependency patched in a manifest"),
+            ]
+        });
+    RE.iter().find(|(re, _)| re.is_match(line)).map(|(_, k)| *k)
 }
 
 /// The block reason: every failing step with the end of its output, and, where the
@@ -939,7 +1054,8 @@ fn failure_reason(report: &Report, touched: &[String]) -> String {
 /// should-panic tests, `cfg(any())`, removed assertions, lints allowed in a manifest, and
 /// changed lint or format configuration. New untracked files count as added lines.
 fn suppression_summary(ws: &Path, start_head: Option<&str>) -> Option<String> {
-    let (root, _) = brief::locate(ws)?;
+    let root = toplevel(ws)?;
+    let base = diff_base(ws, start_head);
     let pathspecs = [
         "*.rs",
         ":(glob)**/Cargo.toml",
@@ -961,7 +1077,7 @@ fn suppression_summary(ws: &Path, start_head: Option<&str>) -> Option<String> {
             "--src-prefix=a/",
             "--dst-prefix=b/",
             "--ignore-submodules=dirty",
-            start_head.unwrap_or("HEAD"),
+            &base,
             "--",
         ])
         .args(pathspecs);
@@ -1001,14 +1117,15 @@ fn suppression_summary(ws: &Path, start_head: Option<&str>) -> Option<String> {
         let kind = if !file.ends_with(".rs") && name != "Cargo.toml" {
             "lint or format configuration changed"
         } else if name == "Cargo.toml" {
-            if *sign == '+' && text.contains("\"allow\"") {
-                "lint allowed in a manifest"
-            } else {
-                continue;
+            match manifest_weakening(text) {
+                Some(kind) if *sign == '+' => kind,
+                _ => continue,
             }
         } else if *sign == '+' {
             let attr = text.contains("#[") || text.contains("#![");
-            if attr && (text.contains("allow(") && !text.contains("expect(")) {
+            if attr && text.contains("cfg_attr") && text.contains("ignore") {
+                "ignored test"
+            } else if attr && (text.contains("allow(") && !text.contains("expect(")) {
                 "allow"
             } else if attr && text.contains("expect(") {
                 "expect"
@@ -1018,8 +1135,8 @@ fn suppression_summary(ws: &Path, start_head: Option<&str>) -> Option<String> {
                 "ignored test"
             } else if text.contains("#[should_panic") {
                 "should_panic"
-            } else if text.contains("cfg(any())") {
-                "cfg(any())"
+            } else if text.contains("cfg(any())") || text.contains("cfg(false)") {
+                "code compiled out"
             } else {
                 continue;
             }
