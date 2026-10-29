@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Bash(cargo publish *)",
+      "Bash(cargo yank *)",
+      "Bash(cargo owner *)",
+      "Bash(cargo login *)"
+    ],
+    "ask": [
+      "Edit(/**/Cargo.toml)",
+      "Edit(/deny.toml)",
+      "Edit(/**/clippy.toml)",
+      "Edit(/**/.clippy.toml)",
+      "Edit(/**/rustfmt.toml)",
+      "Edit(/**/.rustfmt.toml)",
+      "Edit(/rust-toolchain.toml)",
+      "Edit(/rust-toolchain)",
+      "Edit(/.cargo/**)",
+      "Edit(/.claude/**)",
+      "Edit(/AGENTS.md)",
+      "Edit(/.github/workflows/**)",
+      "Bash(cargo add *)",
+      "Bash(cargo remove *)",
+      "Bash(cargo update *)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v fsmap >/dev/null 2>&1 && exec fsmap hook session-start; printf '%s\\n' '{\"systemMessage\":\"[harness] fsmap is not installed: the Rust verification hooks are OFF in this session. Install: cargo install --locked --git https://github.com/d-j-lee/filesystemMap fsmap\",\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"[harness] OFF: fsmap is not installed, so nothing checks your edits or gates the end of a turn. Before calling a change done, run cargo fmt --check, cargo clippy --all-targets -- -D warnings and cargo test yourself, and tell the user that the harness is not active.\"}}'",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "fsmap", "args": ["hook", "prompt"], "timeout": 30 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          { "type": "command", "command": "fsmap", "args": ["hook", "post-edit"], "timeout": 120 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "fsmap", "args": ["hook", "pre-bash"], "timeout": 900 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "fsmap", "args": ["hook", "stop"], "timeout": 900 }
+        ]
+      }
+    ]
+  }
+}

@@ -1,5 +1,7 @@
 # CLAUDE.md — working on fsmap
 
+@AGENTS.md
+
 fsmap is a Rust CLI. It maps a directory into an arena tree, enriches it (classification,
 content metrics, git status and history, imports, duplicates), derives findings, and renders
 HTML/JSON/Markdown/SARIF. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before structural

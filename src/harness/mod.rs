@@ -3,6 +3,7 @@
 //!
 //! The hooks are guardrails against an agent's shortcuts, not a security boundary: the
 //! agent can edit what the hooks read. CI, running the same gate, is the gate of record.
+//! Guide: docs/agent-harness.md.
 
 pub mod hooks;
 pub mod integrity;

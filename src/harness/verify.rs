@@ -269,7 +269,11 @@ fn removed_env(trust: &[String]) -> Vec<String> {
 /// variables, with the build directory inside the repository.
 pub fn step_command(root: &Path, program: &str, cfg: &Config) -> Command {
     let mut c = Command::new(program);
-    c.current_dir(root).env("CARGO_TERM_COLOR", "never");
+    // Panic message and location are what an agent needs; backtraces push them out of
+    // the kept tail.
+    c.current_dir(root)
+        .env("CARGO_TERM_COLOR", "never")
+        .env("RUST_BACKTRACE", "0");
     for k in removed_env(&cfg.trust) {
         c.env_remove(k);
     }

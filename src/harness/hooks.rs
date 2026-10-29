@@ -266,17 +266,17 @@ fn briefing(ws: &Path, cfg: &Config) -> String {
 
 /// `name version: dir` for the workspace's direct registry dependencies (at most 20).
 fn dependency_sources(ws: &Path) -> Vec<String> {
-    let mut c = std::process::Command::new("cargo");
-    c.args(["metadata", "--format-version", "1", "--offline"])
-        .current_dir(ws);
-    let o = proc::run(c, Duration::from_secs(30));
-    if !o.success() {
-        return Vec::new();
-    }
-    let Some(json_start) = o.output.find('{') else {
+    // The whole graph is needed (it is larger than proc::run keeps), and --offline cannot
+    // hang on the network, so this reads the full output directly.
+    let Ok(o) = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--offline"])
+        .current_dir(ws)
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
         return Vec::new();
     };
-    let Ok(meta) = serde_json::from_str::<Value>(&o.output[json_start..]) else {
+    let Ok(meta) = serde_json::from_slice::<Value>(&o.stdout) else {
         return Vec::new();
     };
     let empty = Vec::new();
@@ -903,6 +903,17 @@ mod tests {
         assert_eq!(
             verify::diagnostic(r"C:\w\src\a.rs:3:5: error[E0308]: x"),
             Some((r"C:\w\src\a.rs", "error"))
+        );
+    }
+
+    /// The full dependency graph is larger than proc::run keeps; reading it truncated
+    /// silently produced no paths.
+    #[test]
+    fn dependency_sources_of_this_crate() {
+        let lines = dependency_sources(Path::new(env!("CARGO_MANIFEST_DIR")));
+        assert!(
+            lines.iter().any(|l| l.trim_start().starts_with("regex ")),
+            "{lines:?}"
         );
     }
 
