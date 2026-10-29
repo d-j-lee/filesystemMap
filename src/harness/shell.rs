@@ -66,19 +66,15 @@ fn strip_data_heredocs(cmd: &str) -> String {
         out.push_str(line);
         for op in heredoc_operators(line, &mut stack) {
             let before = parse(&line[..op.at], 0);
-            let runs = |w: &Vec<String>, eval: bool| {
-                w.first().is_some_and(|p| {
-                    matches!(program(p), "sh" | "bash" | "zsh" | "dash" | "ksh")
-                        || (eval && program(p) == "eval")
-                })
-            };
-            let script = before.commands.last().is_some_and(|w| runs(w, false))
+            let own = before.commands.len().saturating_sub(1);
+            // Fed to a shell (`timeout 60 bash <<X`), inside a substitution or process
+            // substitution that a shell or `eval` around it runs, or piped into a shell.
+            let script = before
+                .commands
+                .last()
+                .is_some_and(|w| runs_script(w, false))
                 || (op.in_substitution
-                    && before
-                        .outer
-                        .checked_sub(1)
-                        .and_then(|i| before.commands.get(i))
-                        .is_some_and(|w| runs(w, true)))
+                    && before.commands[..own].iter().any(|w| runs_script(w, true)))
                 || piped_into_shell(&line[op.at..]);
             pending.push((op.delimiter, script));
         }
@@ -90,13 +86,33 @@ fn strip_data_heredocs(cmd: &str) -> String {
     }
 }
 
-/// Whether the rest of a line pipes into a shell (`… | sh`, `… | sudo bash`).
+/// Whether a simple command runs a shell script (`bash`, `sudo -u x sh`, `timeout 60
+/// bash`, `env -S …`), or, with `eval`, evaluates its arguments.
+fn runs_script(words: &[String], eval: bool) -> bool {
+    match program_index(words) {
+        Program::At(i) => {
+            let p = program(&words[i]);
+            matches!(p, "sh" | "bash" | "zsh" | "dash" | "ksh") || (eval && p == "eval")
+        }
+        Program::SplitString(_) => true,
+        Program::None => false,
+    }
+}
+
+/// Whether the rest of a line, from a heredoc operator, pipes into a shell before the
+/// command ends (`<<X | timeout 60 bash`; not `<<X > f && bash build.sh`).
 fn piped_into_shell(rest: &str) -> bool {
-    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\|\s*(sudo\s+)?(\S*/)?(sh|bash|zsh|dash|ksh)\b")
-            .expect("a valid pattern")
-    });
-    RE.is_match(rest)
+    let end = [";", "&&", "||", "\n"]
+        .iter()
+        .filter_map(|sep| rest.find(sep))
+        .min()
+        .unwrap_or(rest.len());
+    rest[..end].split('|').skip(1).any(|segment| {
+        parse(segment, 0)
+            .commands
+            .first()
+            .is_some_and(|w| runs_script(w, false))
+    })
 }
 
 /// A heredoc operator found in a line.
@@ -180,6 +196,11 @@ fn heredoc_operators(line: &str, stack: &mut Vec<Ctx>) -> Vec<HeredocOp> {
                     i += 2;
                 }
                 b'$' if next == Some(b'(') => {
+                    stack.push(Ctx::Subst);
+                    i += 1;
+                }
+                // Process substitution: a command whose output another one reads.
+                b'<' | b'>' if next == Some(b'(') => {
                     stack.push(Ctx::Subst);
                     i += 1;
                 }
@@ -491,9 +512,17 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
-fn simple_publishes(words: &[String], whole: &str, depth: usize) -> bool {
+/// Where the program of a simple command is, past reserved words, assignments and
+/// wrappers with their options.
+enum Program {
+    At(usize),
+    /// `env -S <line>`: the word at this index is run as a command line.
+    SplitString(usize),
+    None,
+}
+
+fn program_index(words: &[String]) -> Program {
     let mut i = 0;
-    // Reserved words, assignments and wrappers (with their options) before the program.
     loop {
         while words
             .get(i)
@@ -502,19 +531,16 @@ fn simple_publishes(words: &[String], whole: &str, depth: usize) -> bool {
             i += 1;
         }
         let Some(w) = words.get(i) else {
-            return false;
+            return Program::None;
         };
         let p = program(w);
         let Some((_, value_options)) = WRAPPERS.iter().find(|(name, _)| *name == p) else {
-            break;
+            return Program::At(i);
         };
         i += 1;
         while let Some(w) = words.get(i) {
             if p == "env" && (w == "-S" || w == "--split-string") {
-                // `env -S 'git push'` runs its value as a command line.
-                return words
-                    .get(i + 1)
-                    .is_some_and(|s| publishes_at(s, whole, depth + 1));
+                return Program::SplitString(i + 1);
             }
             if value_options.contains(&w.as_str()) {
                 i += 2;
@@ -532,6 +558,19 @@ fn simple_publishes(words: &[String], whole: &str, depth: usize) -> bool {
             i += 1;
         }
     }
+}
+
+fn simple_publishes(words: &[String], whole: &str, depth: usize) -> bool {
+    let i = match program_index(words) {
+        Program::At(i) => i,
+        // `env -S 'git push'` runs its value as a command line.
+        Program::SplitString(at) => {
+            return words
+                .get(at)
+                .is_some_and(|s| publishes_at(s, whole, depth + 1));
+        }
+        Program::None => return false,
+    };
     let rest = &words[i + 1..];
     match program(&words[i]) {
         "sh" | "bash" | "zsh" | "dash" | "ksh" => shell_publishes(rest, whole, depth),
@@ -742,6 +781,15 @@ mod tests {
             "let x=1<<2\ngit push origin main\n2",
             "echo \"a <<X b\"\ngit push origin main\nX",
             "echo $'it\\'s <<EOF here'\ngit push origin main\nEOF",
+            // The sixth review: shells behind wrappers, in pipes and process substitutions.
+            "timeout 60 bash <<'EOF'\ngit push origin main\nEOF",
+            "GIT_TERMINAL_PROMPT=0 bash <<'EOF'\ngit push origin main\nEOF",
+            "env bash <<'EOF'\ngit push origin main\nEOF",
+            "sudo bash <<'EOF'\ngit push origin main\nEOF",
+            "cat <<'EOF' | timeout 60 bash\ngit push origin main\nEOF",
+            "cat <<'EOF' | sudo -u dev bash\ngit push origin main\nEOF",
+            "eval $(cat <<'EOF'\ngit push origin main\nEOF\n)",
+            "bash <(cat <<'EOF'\ngit push origin main\nEOF\n)",
         ] {
             assert!(publishes(cmd), "{cmd}");
         }
@@ -790,6 +838,11 @@ mod tests {
             "git commit -F- <<'END-MSG'\nIt's done; next git push\nEND-MSG",
             "cat <<\\EOF\nIt's about git push\nEOF",
             "cat <<E\"O\"F\nIt's about git push\nEOF",
+            "cat <<'EOF' > notes.md && bash build.sh\nremember to git push\nEOF",
+            "cat <<'EOF' > notes.md || bash fallback.sh\nremember to git push\nEOF",
+            "cat <<'EOF' > notes.md; echo ok | bash\nremember to git push\nEOF",
+            "python3 - <<'EOF'\nprint('git push')\nEOF",
+            "timeout 60 cat <<'EOF'\ngit push origin main\nEOF",
             "echo \"$(echo 'a\\')\" && echo 'remember: git push'",
         ] {
             assert!(!publishes(cmd), "{cmd}");

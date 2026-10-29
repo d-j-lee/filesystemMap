@@ -1040,6 +1040,20 @@ fn uncommitted_inputs(ws: &Path) -> Result<Vec<String>> {
             })
         })
     };
+    // Cargo configuration under any name (an `include`d file, a link's target) is a build
+    // input too (sixth review).
+    let configs: Vec<String> = super::integrity::config_files(ws)
+        .into_iter()
+        .filter_map(|p| {
+            let p = std::fs::canonicalize(&p).ok()?;
+            Some(
+                p.strip_prefix(&top)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            )
+        })
+        .collect();
     let mut entries: Vec<(String, bool)> = state::status_entries(&status)
         .into_iter()
         .map(|e| (e.path, e.untracked))
@@ -1063,7 +1077,8 @@ fn uncommitted_inputs(ws: &Path) -> Result<Vec<String>> {
                     | ".rustfmt.toml"
                     | "clippy.toml"
                     | ".clippy.toml"
-            ) || p.ends_with(".cargo/config")
+            ) || configs.contains(p)
+                || p.ends_with(".cargo/config")
                 || p.ends_with(".cargo/config.toml")
                 || (p.ends_with(".rs") && (!*untracked || read_by_a_target(p)))
         })

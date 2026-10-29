@@ -39,9 +39,9 @@ is the gate of record.
 |---|---|---|---|
 | Session starts | `SessionStart` → `fsmap hook session-start` | Records the baseline (only on `startup`, never on resume or compact). Tells Claude the real `rustc`/`cargo` versions and where each direct dependency's source is, and warns about settings that weaken the gate and about other sessions in the same worktree. Warms the brief index. | 0.4 s |
 | After each `Edit`/`Write` | `PostToolUse` → `fsmap hook post-edit` | For `.rs`, `Cargo.toml` and `build.rs`: `cargo check --all-targets --offline` on the edited package. Errors go back to Claude as a block reason (first 20, de-duplicated); the fsmap brief for notable files goes along as context. One check at a time per worktree: a later edit waits up to 30 s for the running one, then checks the tree as it is. 60 s budget. | 1.1 s median |
-| Claude ends a turn | `Stop` → `fsmap hook stop` | If the tree changed since the session started or last passed, runs the gate in quick mode. The gate passes only when every step passes. A failure blocks the stop with the failing steps' output, marking which files the session changed. After three blocked stops in a row it lets go and asks Claude to report; when every failure is in files the session did not change, it lets go after one block instead, telling the user the gate did **not** pass. A pass shows the user any added suppressions, ignored tests, removed assertions, and changed lint, format, cargo or toolchain configuration; those already pending when the session started are listed apart. While background agents (subagents, workflows) are still working, it waits for the real end of the turn. | 47 s |
+| Claude ends a turn | `Stop` → `fsmap hook stop` | If the tree changed since the session started or last passed, runs the gate in quick mode. The gate passes only when every step passes. A failure blocks the stop with the failing steps' output, marking which files the session changed. After three blocked stops in a row it lets go and asks Claude to report; when every failure is in files the session did not change, it lets go after one block instead, telling the user the gate did **not** pass. A pass shows the user any added suppressions, ignored tests, removed assertions, and changed lint, format, cargo or toolchain configuration; those already pending when the session started are listed apart. While background agents (subagents, workflows) are still working, it waits for the real end of the turn. | 48 s |
 | The user writes | `UserPromptSubmit` → `fsmap hook prompt` | Resets the failure streak. | ms |
-| Before `git push`, `gh pr create` | `PreToolUse` (Bash) → `fsmap hook pre-bash` | Denies the command while build inputs are uncommitted (the gate checks the working tree; a push sends HEAD): manifests, `Cargo.lock`, cargo, rustfmt, clippy and toolchain configuration, every change to a tracked `.rs` file (renames, deletions and edits to `--skip-worktree` files included; an unchanged one, or one a sparse checkout leaves out, does not count), and untracked `.rs` files in a directory a target reads (a scratch file elsewhere does not count). Otherwise runs the quick gate unless this exact tree already passed, and denies on failure, when the gate cannot run, or when the hook itself fails. Commands are read with their quoting (`$'…'` too), comments, command substitutions (inside double quotes too), heredocs inside them (Claude Code's own `git commit -m "$(cat <<'EOF' … EOF)"`; a heredoc whose output a shell or `eval` runs, or that is piped into a shell, is a script), delimiter words (`<<'END-MSG'`, `<<\EOF`), arithmetic (`$(( … ))`, `(( … ))`), reserved words, wrappers and their options (`env -u`, `sudo -u`, `timeout -k` …), `sh -c`/`eval`/`env -S` scripts, here-strings, git's and gh's global options, `git -c alias.x=…` and `git subtree`. When the reading is unsure (a quote or substitution left open, nesting past 16 levels, a shell reading its script from stdin), mentioning a push is enough; a heredoc that never ends is not taken as data. Not publishing: heredoc bodies fed to other programs, `--dry-run`, `--help`, pushes that only delete remote refs, and `gh pr merge` (it merges what was already pushed). | 5 ms for other commands |
+| Before `git push`, `gh pr create` | `PreToolUse` (Bash) → `fsmap hook pre-bash` | Denies the command while build inputs are uncommitted (the gate checks the working tree; a push sends HEAD): manifests, `Cargo.lock`, cargo, rustfmt, clippy and toolchain configuration, every file a cargo configuration `include`s, every change to a tracked `.rs` file (renames, deletions and edits to `--skip-worktree` files included; an unchanged one, or one a sparse checkout leaves out, does not count), and untracked `.rs` files in a directory a target reads (a scratch file elsewhere does not count). Otherwise runs the quick gate unless this exact tree already passed, and denies on failure, when the gate cannot run, or when the hook itself fails. Commands are read with their quoting (`$'…'` too), comments, command substitutions (inside double quotes too), heredocs inside them (Claude Code's own `git commit -m "$(cat <<'EOF' … EOF)"`; a heredoc whose output a shell or `eval` runs, also behind wrappers (`timeout 60 bash`, `sudo -u x sh`) or through a pipe or process substitution, is a script), delimiter words (`<<'END-MSG'`, `<<\EOF`), arithmetic (`$(( … ))`, `(( … ))`), reserved words, wrappers and their options (`env -u`, `sudo -u`, `timeout -k` …), `sh -c`/`eval`/`env -S` scripts, here-strings, git's and gh's global options, `git -c alias.x=…` and `git subtree`. When the reading is unsure (a quote or substitution left open, nesting past 16 levels, a shell reading its script from stdin), mentioning a push is enough; a heredoc that never ends is not taken as data. Not publishing: heredoc bodies fed to other programs, `--dry-run`, `--help`, pushes that only delete remote refs, and `gh pr merge` (it merges what was already pushed). | 5 ms for other commands |
 
 When cargo cannot read the project (a broken manifest, a malformed verify table, an unsafe
 toolchain setting), the gate cannot run: the stop is blocked and a push denied with the reason,
@@ -110,16 +110,16 @@ target directory stay); and always `RUSTC`, `RUSTDOC`, `RUSTFMT`, `RUSTUP_TOOLCH
 (600 s for the hooks). A step that overruns has its process tree killed; background processes it
 left behind cannot hold the gate past the budget.
 
-Timings: a 4-core cloud container, 2026-10-29, this repository (140 tests). Session start and
+Timings: a 4-core cloud container, 2026-10-29, this repository (142 tests). Session start and
 pre-bash on a clean clone, three runs each; post-edit from the live session's log; the gate is
-`fsmap verify` run by hand with nothing to rebuild, three runs: 45.9–47.1 s. Nearly all of it is
-`cargo test`, whose 42 end-to-end hook tests each build a small Cargo project; a repository
+`fsmap verify` run by hand with nothing to rebuild, three runs: 47.3–47.9 s. Nearly all of it is
+`cargo test`, whose 43 end-to-end hook tests each build a small Cargo project; a repository
 without such tests pays its own test time.
 
 ## What it catches
 
 Each row has an end-to-end test in [`tests/harness.rs`](../tests/harness.rs) or a unit test next
-to the guard. 111 guards were checked by removing each and watching its test fail (D-15 lists
+to the guard. 118 guards were checked by removing each and watching its test fail (D-15 lists
 them); the rows below without one are noted.
 
 | Shortcut or failure | Guard |
@@ -195,8 +195,11 @@ log in `<git-dir>/fsmap-harness/log.jsonl`.
   The ask rules make the agent's edits to these files ask first, but a shell command can still
   write them. Review the note.
 - **What the pre-push check cannot see.** A git alias for `push` in the git configuration, a
-  script file or a shell function that pushes, and a push of a ref other than the checked-out
-  one. A new untracked source outside every target's directory (`#[path]`, `include!`, a path
+  script file or a shell function that pushes, a push of a ref other than the checked-out
+  one, and shell forms the detector does not model: it is a heuristic over shell syntax, and
+  six review rounds each found new ones. When it cannot read a command to its end it falls
+  back to "mentions a push", which errs toward gating. A git `pre-push` hook as a second
+  detector is a ROADMAP seed. A new untracked source outside every target's directory (`#[path]`, `include!`, a path
   dependency that is not a workspace member) is not counted as a build input. The stop gate
   still runs at the end of the turn.
 - **clippy.toml is not judged.** Raising a lint threshold there is a legitimate choice as often
@@ -224,7 +227,8 @@ findings), and the implementation four times after it, each time by a fresh agen
 and 6 major findings, then 1 blocker and 10 major findings, then 8 findings and a list of minor
 ones from a review scoped to whether the code matched the threat model above, then 1 blocker
 and 7 major findings from a convergence check of that round's fixes, then 3 major and 4 minor
-findings, and no blocker, from a convergence check of those. Among them were
+findings, and no blocker, from a convergence check of those, then 3 major findings and no
+blocker from a last check limited to blockers and majors. Among them were
 bypasses of the integrity check, legitimate configurations it failed, fixes whose tests did not
 fail without them, and claims in this guide that were not true. What was adopted, and what was
 not, is in D-15.

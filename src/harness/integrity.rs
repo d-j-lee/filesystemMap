@@ -231,7 +231,7 @@ fn configs(root: &Path) -> Vec<ConfigFile> {
                     Some((_, true)) => Place::Tracked,
                     Some((_, false)) => Place::Hidden,
                     // Not a config file name (an included file): ask git about it alone.
-                    None => place_of_file(path),
+                    None => place_of_file(Some(top), path),
                 }
             }
         }
@@ -353,20 +353,23 @@ fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Where a single file is: tracked by the repository around it, inside one but not
-/// tracked, or in no repository.
-fn place_of_file(path: &Path) -> Place {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+/// Where a single file is relative to the project's work tree at `top` (canonical):
+/// tracked there, inside it but not tracked, or outside it. Asked of `top` itself, not of
+/// the repository nearest the file: a file in an ignored nested repository is hidden from
+/// this one (sixth review). `path` has its directory resolved (`canon_file`).
+fn place_of_file(top: Option<&Path>, path: &Path) -> Place {
+    let Some(rel) = top.and_then(|t| path.strip_prefix(t).ok()) else {
         return Place::Outside;
     };
+    let rel = rel.to_string_lossy().replace('\\', "/");
     match git::run({
-        let mut c = git::git(dir);
-        c.args(["ls-files", "-v", "-z", "--"]).arg(name);
+        let mut c = git::git(top.unwrap_or(path));
+        c.args(["ls-files", "-v", "-z", "--"])
+            .arg(format!(":(literal){rel}"));
         c
     }) {
         Ok(o) if o.first().is_some_and(|t| index_tag_tracked(*t)) => Place::Tracked,
-        Ok(_) => Place::Hidden,
-        Err(_) => Place::Outside,
+        _ => Place::Hidden,
     }
 }
 
@@ -611,13 +614,14 @@ pub fn toolchain_scan(dir: &Path, trust: &[String]) -> Vec<Finding> {
 
 fn toolchain_scan_with(dir: &Path, trust: &[String], rustup: Option<&Path>) -> Vec<Finding> {
     let mut out = Vec::new();
+    let top = toplevel(dir).map(|t| canon(&t));
     for d in dir.ancestors() {
         for name in ["rust-toolchain.toml", "rust-toolchain"] {
             let path = d.join(name);
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let place = place_of_file(&path);
+            let place = place_of_file(top.as_deref(), &canon_file(&path));
             if place == Place::Tracked {
                 continue;
             }
@@ -1520,6 +1524,32 @@ mod tests {
         write(r, ".cargo/shared.toml", "[env]\nMY_SETTING = \"1\"\n");
         git(r, &["add", ".cargo/config.toml", ".cargo/shared.toml"]);
         assert!(kinds(r).is_empty(), "{:?}", kinds(r));
+    }
+
+    /// A file inside an ignored nested repository is hidden from this one, whatever the
+    /// nested one tracks (sixth review).
+    #[test]
+    fn an_include_in_an_ignored_nested_repository_is_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "-q"]);
+        write(r, ".gitignore", "/.local/\n");
+        write(
+            r,
+            ".cargo/config.toml",
+            "include = [\"../.local/w.toml\"]\n",
+        );
+        git(r, &["add", ".gitignore", ".cargo/config.toml"]);
+        let nested = r.join(".local");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-q"]);
+        write(
+            &nested,
+            "w.toml",
+            &format!("[target.{}]\nrunner = \"true\"\n", host()),
+        );
+        git(&nested, &["add", "w.toml"]);
+        assert_eq!(kinds(r), ["runner"]);
     }
 
     /// A tracked symlink to an ignored file: git tracks only the link text, so the content

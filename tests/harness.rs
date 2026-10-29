@@ -550,6 +550,27 @@ fn tracked_source_changes_always_count_for_a_push() {
     );
 }
 
+/// A config reached through `include` is a build input like `.cargo/config.toml`: an
+/// uncommitted edit to it denies a push (sixth review).
+#[test]
+fn an_uncommitted_included_config_blocks_a_push() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, ".cargo/config.toml", "include = [\"shared.toml\"]\n");
+    write(d, ".cargo/shared.toml", "[build]\njobs = 2\n");
+    commit(d, "A", "shared config", T0 + 10);
+    start(d, "startup");
+    write(d, ".cargo/shared.toml", "[build]\njobs = 3\n");
+    let v = push(d);
+    let why = v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        why.contains("not committed") && why.contains(".cargo/shared.toml"),
+        "{v}"
+    );
+}
+
 /// An edit git was told not to show (`--skip-worktree`) still changes the fingerprint, so
 /// the gate runs again (fourth review, M4).
 #[test]

@@ -431,8 +431,33 @@ decides. A test was added for reading configs through links, which had none. Dur
 Python edit with an empty match range garbled `state.rs`; it was restored from the last commit
 and redone with checked ranges. Nothing of it was committed.
 
-**Costs.** Every turn that changed the tree pays one gate run: on this repository 46–47 s with nothing
-to rebuild (4-core container, 140 tests, three runs). Nearly all of it is `cargo test`, whose 42 end-to-end
+**Sixth implementation review (last convergence check, blockers and majors only).** A seventh
+fresh agent confirmed the fifth round's fixes. It found no blocker and 3 major findings, two of
+them regressions from that round:
+
+| Finding | Fix | Alternative and why not |
+|---|---|---|
+| 1. An uncommitted edit to a tracked file a config `include`s, under another name, was neither judged (tracked) nor counted as an uncommitted input, so a push sent a commit the gate never ran. | Every config file `integrity` finds is an uncommitted input for a push, whatever its name. | — |
+| 2. Files were placed by asking the repository nearest to them, so a file in an ignored nested repository counted as tracked. | Files are placed by asking the project's work tree top about them (`:(literal)` paths). | — |
+| 3. A heredoc fed to a shell behind a wrapper (`timeout 60 bash <<EOF`, `sudo bash`, `VAR=1 bash`, `… \| sudo -u x bash`), or read through `eval $(…)` or `bash <(…)`, was stripped as data (mostly from before). | One helper finds a command's program past reserved words, assignments and wrappers; push detection and the heredoc decision both use it. A pipe is followed to the end of its command only, and process substitutions count as substitutions. | — |
+
+**Mutation check, after the sixth round.** 118 guards removed one at a time; each matching test
+failed, after one new case (a `||` must not count as a pipe) gave the "pipe ends at its
+command" guard a test only it decides. A corpus of 25 commands an agent commonly runs (commit
+and PR heredocs with apostrophes, loops, pipelines, retries, tags) gave no false denial and no
+missed push.
+
+**Where the review loop stopped.** Six implementation reviews in a row found new ways around the
+shell detector, the later ones mostly regressions from the round before. The integrity step
+converged: the last two rounds found edge cases in file placement, not bypasses of the model.
+The command-line detector did not, and cannot: it is a heuristic over a language it does not
+fully parse. It now errs toward gating, by falling back to "mentions a push" when unsure. The
+structural answer is a second detector that does not read shell at all: a git `pre-push` hook
+(ROADMAP). The loop stopped here on purpose; the next round would most likely find more shell
+forms, not a flaw in the model.
+
+**Costs.** Every turn that changed the tree pays one gate run: on this repository 47–48 s with nothing
+to rebuild (4-core container, 142 tests, three runs). Nearly all of it is `cargo test`, whose 43 end-to-end
 hook tests each build a small Cargo project. Every Rust edit
 pays a `cargo check` (median 1.1 s in the session that wired the hooks). The hooks run build scripts, proc macros and tests without asking, so they
 are for repositories you trust. The ask rules add prompts when the agent edits manifests, lint
