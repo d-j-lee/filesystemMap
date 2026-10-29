@@ -122,7 +122,7 @@ Measured 2026-10-28 on a 4-core cloud container, release build.
 | `/usr`, 93 k entries, `--no-git` | scan 0.14 s; content 1.6 s warm / 10.8 s cold (456 MiB text); peak RSS 88 MB |
 | `/usr --sizes-only` → HTML | 0.57 s, 6.6 MiB report |
 | `brief --hook` on ripgrep with a warm cache (one git call) | 8 ms (median of 30) |
-| `verify` (quick gate) on this repository, 2026-10-29, 106 tests | 37 s with nothing to rebuild (3 runs); 42 s after a source change; nearly all `cargo test` |
+| `verify` (quick gate) on this repository, 2026-10-29, 120 tests | 41 s with nothing to rebuild; nearly all `cargo test` (34 end-to-end hook tests) |
 | `hook session-start` / `hook pre-bash` (non-publishing command) on a clean clone | 0.4 s / 5 ms (3 runs each) |
 
 ## 7. Safety and privacy
@@ -167,7 +167,10 @@ session's starting point, is not checked again (for a push, only a recorded pass
 gate passes only when every step passes. Failures are attributed to files; when all of them are
 in files the session did not change (never integrity failures), the stop is blocked once and then
 released with a report, and the user is told the gate did not pass. When cargo cannot read the
-project, the gate cannot run: the stop is blocked and a push denied.
+project, the gate cannot run: the stop is blocked and a push denied. Without a fingerprint (no
+git) the gate runs every time. A push is denied while build inputs are uncommitted, since the
+gate checks the work tree and the push sends HEAD. The threat model (hidden configuration fails,
+tracked changes are reported) is in [agent-harness.md](agent-harness.md).
 
 Templates for other repositories are in `harness/`; this repository uses copies of them in
 `.claude/` and `AGENTS.md`, which `tests/harness.rs` checks are identical.

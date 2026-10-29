@@ -324,9 +324,40 @@ fixture's own "could not compile" output for the mutant's, and one, a real gap, 
 used an `[alias]` that also broke the clippy step, so "integrity failures are never someone
 else's" was never isolated. That test now uses an `[env]` table that breaks nothing else.
 
-**Costs.** Every turn that changed the tree pays one gate run: on this repository 37 s with nothing
-to rebuild and 42 s after a source change (4-core container, 106 tests). Nearly all of it is
-`cargo test`, whose 25 end-to-end hook tests each build a small Cargo project. Every Rust edit
+**Second implementation review.** A third fresh agent reviewed the fixes. It found 1 blocker and
+10 major findings, and showed that six of the fixes above had no test that failed without them.
+Two rounds in a row had found new ways around the integrity step, which made the threat model
+the real question. It is now stated in the guide: an agent that takes the shortest path to green.
+**Hidden configuration** (untracked or ignored files, configs outside the repository,
+environment variables) is what makes the local gate disagree with CI, and fails. **Tracked
+changes** to manifests and configs are in the diff and run the same in CI, and are reported to
+the user on every pass. An agent determined to defeat the gate is out of scope; CI on a clean
+checkout is the gate of record.
+
+| Finding | Fix | Alternative and why not |
+|---|---|---|
+| B1''. `--force-warn` was on the safe list; a force-warned lint stays a warning under `-D warnings`. | Its own finding (`allow-flag`). | — |
+| M1''. `-C opt-level` above 0 switches debug assertions and overflow checks off. | `opt-level=0` only; `debug-assertions`/`overflow-checks` only when explicitly on. | — |
+| M2''. `[source]` replacement could swap in a modified dependency. | A `source` kind that vendoring repositories trust. | Hash vendored sources against `Cargo.lock`: cargo already does for registries; directory sources carry their own checksums. |
+| M3''. A `clippy.toml` above the repository was never judged. | Counts as untracked. | — |
+| M4''. `Cargo.toml` settings (`debug-assertions = false`, `test = false`, `[patch]`, lints allowed) passed silently. | Reported on pass (tracked: see the threat model). | Fail on them: a person decides whether a manifest change is legitimate; CI runs it too. |
+| M5''. rustup accepts official-looking link names (`stable-evil`). | A channel whose rustup toolchain directory is a link is refused. | Validate the triple against `rustc --print target-list`: runs the toolchain being judged. |
+| M6''. A session that started before the first commit treated its own commits as someone else's. | Changes are judged against the empty tree; a session that starts before the Cargo project exists also records where it started. | — |
+| M7''. The pre-push gate checked the working tree while the push sent HEAD. | Push denied while Rust sources, manifests or `Cargo.lock` are uncommitted. | Verify a temporary worktree of HEAD: a second build per push; seeded (a clean-worktree gate). |
+| M8''. Push detection missed reserved words, wrapper options, `sh -c --`, stdin shells, `git -c alias.p=push`, `git subtree push`; denied heredoc bodies and `--dry-run`. | Handled; a shell reading its script from stdin is gated when the command line mentions a push. | — |
+| M9''. Six fixes had no test that failed without them. | Tests added; one of them first passed vacuously (the cut output gave an empty pid) and was fixed. | — |
+| M10''. A git-ignored `vendor/` with its crates' `clippy.toml` files failed integrity. | Only files that can apply to a workspace member are judged. | — |
+| Minor | Common settings pass by value: mold (`-fuse-ld`), clang/gcc linkers, sccache, `--cfg`, ordinary `[env]` variables. Without a fingerprint the gate runs every time. `RUSTFMT` is removed. `cfg_attr(…, ignore)`, `cfg(false)` and single-quoted lint levels are reported. Template hooks report crashes other than "missing" and "too old". | Value-level trust (`rustflag:--cfg x`): more surface than the known-good list needs today. |
+
+**Mutation check, after the second round.** 45 guards removed one at a time; each matching test
+failed. Live evidence from the same session: the pre-push hook of the previous build ran the full
+gate three times on commands that only mentioned a push in a commit message or a heredoc (37, 42
+and 56 s), the false positive this round removed; the third run also caught a formatting slip in
+a commit that had just been made.
+
+**Costs.** Every turn that changed the tree pays one gate run: on this repository 41 s with nothing
+to rebuild (4-core container, 120 tests). Nearly all of it is `cargo test`, whose 34 end-to-end
+hook tests each build a small Cargo project. Every Rust edit
 pays a `cargo check` (median 1.1 s in the session that wired the hooks). The hooks run build scripts, proc macros and tests without asking, so they
 are for repositories you trust. The ask rules add prompts when the agent edits manifests, lint
 configs, workflows or `.claude/`.
