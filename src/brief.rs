@@ -236,20 +236,33 @@ impl CodeOwners {
     }
 }
 
-fn likely_tests<'a>(idx: &'a Index, path: &str) -> Vec<&'a str> {
-    let stem = Path::new(path)
+/// The name a file is known by for test pairing: its stem, or for module roots (`mod.rs`,
+/// `lib.rs`, `index.ts`, `__init__.py`, …) its directory's name. Otherwise every `mod.rs`
+/// pairs with `tests/common/mod.rs`.
+fn pairing_name(path: &str) -> String {
+    let p = Path::new(path);
+    let stem = p
         .file_stem()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
+    // `index.test.ts` tests a module root too: look at the part before the first dot.
+    let base = stem.split('.').next().unwrap_or(&stem);
+    if matches!(base, "mod" | "lib" | "main" | "index" | "__init__" | "init")
+        && let Some(dir) = p.parent().and_then(Path::file_name)
+    {
+        return dir.to_string_lossy().to_ascii_lowercase();
+    }
+    stem
+}
+
+fn likely_tests<'a>(idx: &'a Index, path: &str) -> Vec<&'a str> {
+    let stem = pairing_name(path);
     let mut out: Vec<&str> = Vec::new();
     for (p, f) in &idx.files {
         if !f.test || p == path {
             continue;
         }
-        let other = Path::new(p)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
+        let other = pairing_name(p);
         let named = other.contains(&stem) && stem.len() >= 3;
         let imports = idx
             .imports
@@ -587,6 +600,10 @@ mod tests {
         assert!(s.contains("Usually changes with: `src/b.rs` (80%"));
         let s = brief_file(&idx, None, "src/alpha.rs", &HashSet::new());
         assert!(s.contains("Likely tests: `tests/alpha_test.rs`"));
+        assert_eq!(pairing_name("src/harness/mod.rs"), "harness");
+        assert_eq!(pairing_name("tests/common/mod.rs"), "common");
+        assert_eq!(pairing_name("src/scan.rs"), "scan");
+        assert_eq!(pairing_name("src/helper/css/index.test.ts"), "css");
     }
 
     #[test]
