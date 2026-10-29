@@ -122,7 +122,14 @@ findings; what was adopted and what was not is in D-15). Each guard in the table
 by removing it and watching its test fail.
 
 The hooks took effect in the Claude Code cloud session that wrote them, without a restart. Its log
-shows the first `Edit` after `.claude/settings.json` existed running `post-edit` (cargo check,
-median 1.1 s over 4 edits) and an automatic compaction firing `SessionStart` with source `compact`,
-which left the baseline alone and told Claude the tree had unverified changes. A turn end in a
-live session had not been logged yet when this was written.
+shows:
+
+- the first `Edit` after `.claude/settings.json` existed running `post-edit` (cargo check, median
+  1.1 s over 10 edits);
+- an automatic compaction firing `SessionStart` with source `compact`, which left the baseline
+  alone and told Claude the tree had unverified changes;
+- the first turn end firing `Stop` while a review subagent ran in the background: the gate was
+  postponed (`skip-background`), which also confirms that Claude Code lists subagents in the
+  Stop payload's `background_tasks`.
+
+A gate run at a live turn end had not been logged yet when this was written.
