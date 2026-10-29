@@ -217,3 +217,93 @@ Doc corrections, by kind:
   the fix commit to catch it. Before/after zone and finding diffs now cover eight
   repositories (ripgrep, flask, hono, redis, gevent, better-sqlite3, actions/checkout,
   fsmap).
+
+## D-15 An agent harness inside fsmap: `fsmap verify` and Claude Code hooks
+
+**Context.** Two other workstreams built Rust × AI harnesses next to fsmap: a template
+repository (`rust-ai-template`, lost with its session) and a harness repository
+(`rust-ai-harness`, not reachable from here; its design survives as a published page). Both had
+the verification layer (the compiler and tests in the agent's loop, a gate before "done") but no
+knowledge of the repository. fsmap has that knowledge (`brief`, `context`, `insights`) but put
+nothing in the agent's loop. The owner chose to fold both into this repository and to
+re-implement the harness from its design rather than port code.
+
+**Decision.** The harness is part of the fsmap binary: `fsmap verify` (the gate) and
+`fsmap hook session-start|post-edit|stop|prompt|pre-bash|stats`. Templates live in `harness/`
+(settings, `AGENTS.md`, a reviewer subagent); this repository uses copies of them, checked
+equal by a test. Guide: [agent-harness.md](agent-harness.md).
+
+- **One binary, installed from a trusted ref**, not shell scripts and not a binary built from
+  the tree under test. Hooks are JSON in, JSON out, exit 0; every failure to run becomes a
+  `systemMessage` the user sees.
+- **One gate for people, hooks and CI.** CI keeps its explicit fmt/clippy/test steps as the gate
+  of record and adds a job running `fsmap verify --mode full --strict`; a change that weakens
+  `verify` cannot pass CI by grading itself.
+- **Guardrail, not boundary.** The agent can edit what the hooks read. Ask rules make the
+  obvious edits visible; the rest is documented as a limit.
+- **Lints for agent-written code**: `allow_attributes(_without_reason)`, `unwrap_used`
+  (tests exempt), `map_err_ignore`, `redundant_clone`, `clone_on_ref_ptr`, on top of the
+  existing `todo`/`unimplemented`/`dbg_macro` denies. `cargo-deny` policy in `deny.toml`. An
+  MSRV job keeps `rust-version = "1.88"` true (it is the exact floor: let-chains, and globset
+  and sha2 declare 1.88).
+
+**Design review.** An independent agent reviewed the draft before implementation, reproducing
+the important findings on copies of the repository. Each fix has an end-to-end test in
+`tests/harness.rs` (or `tests/review_regressions.rs`), and each of the ten main guards was
+checked by removing it and confirming its test fails.
+
+| Finding | Fix | Alternative and why not |
+|---|---|---|
+| B1. `.cargo/config.toml` with `--cap-lints allow` and `runner = "true"` turned failing clippy and tests green; `.rustfmt.toml` `disable_all_formatting` did the same for fmt; `.git/info/exclude` hid the file from git. The same through `RUSTFLAGS`, `RUSTC_WRAPPER`, `CARGO_TARGET_*_RUNNER`, `[env]`. | An `integrity` step reads every cargo, rustfmt, clippy and rustup config in effect (ancestors, `CARGO_HOME`, XDG) and fails on settings that weaken the gate unless `trust` lists the kind. Steps run with the weakening variables removed and the build directory inside the repository. Config files and remaining variables are part of the fingerprint, ignored or not. Integrity failures always block, even in untouched files. | Detect `--config` flags only (the other harness's fix): rejected, files and variables are the general form. |
+| B2. A self-hosting bootstrap (build the gate from this tree at session start) failed open after `cargo clean`, gave a session started mid-refactor no gate, and let one session weaken the next session's gate. | Cut. This repository uses `fsmap` from PATH like any other; the SessionStart command says loudly when it is missing. `tests/harness.rs` covers changes to the harness itself. | Build from `git archive <merge-base>` outside the tree: rejected for a 40 s start and races between sessions. |
+| B3. SessionStart also fires on resume, compact and clear; re-recording the baseline there let a broken tree become "where the session started". | The baseline is written once, on `startup`, per session; a missing one means "unknown" and the gate runs. Compaction tells Claude the tree has unverified changes. | — |
+| M1. A permanent release after three failures. | The next user prompt resets the streak; an unchanged failing tree re-blocks from the cached reason without re-running. | — |
+| M2. Any background shell (a dev server) postponed the gate forever. | Only background agents (subagent, workflow, teammate, cloud session) postpone it, and the user is told. | — |
+| M3. Failing open silently (timeouts, missing binary, unwritable state, git refusing the repository). | `systemMessage` on each; own deadlines below the hook timeouts; the whole process tree is killed on expiry (`kill -s KILL -- -<pgid>`, `taskkill /T`). | — |
+| M4. Git-ignored files cargo still compiles (`tests/scratch.rs` behind `.git/info/exclude`) left the fingerprint unchanged. | Ignored `*.rs`, `Cargo.toml`, `Cargo.lock`, the config files, `rustc -vV` and the fsmap version are fingerprinted, with the contents of every dirty file and HEAD. | Path dependencies outside the repository and non-Rust `include_str!` inputs are not covered (documented). |
+| M5. A submodule's own `filter.<x>.clean` ran during superproject `git status`, and in the existing `brief --diff`. | `--ignore-submodules=dirty` everywhere the work tree is compared (`git_worktree` sets it); submodules are fingerprinted separately with their filters neutralised. The `brief --diff` hole predated the harness and was fixed in the original PR with a regression test. | — |
+| M6. CI gated by the code under review; dogfood on a shallow clone checks nothing. | Explicit CI steps stay; the `gate` job uses full history. | — |
+| M7. Lints from a new stable toolchain or breakage from before the session blocked the agent in files it never touched. | fmt and clippy failures are attributed to files; failures only in untouched files are reported to the user, not blocked on. | Pin the toolchain: rejected for now, every fresh cloud session would download it, and attribution already keeps drift from blocking. Revisit if drift reaches touched files often. |
+| M8. Two sessions in one worktree overwrote each other's state. | Per-session records, atomic writes, 14-day expiry, a warning when another session was active in the last hour. | Pid heartbeats: rejected, hooks are short-lived processes. |
+| m1–m3. Post-edit used exit 2 (losing the brief), showed the last errors, ran unlocked, queued in parallel. | Exit 0 with `decision: block` and the brief as context; the first 20 errors, de-duplicated; `--offline --locked`; one check per worktree. | — |
+| m6. A suppression keeps the gate green. | A pass shows the user added `#[allow]`/`#[expect]`/`#[ignore]`/`#[should_panic]`/`cfg(any())` and removed assertions. | Block on them: rejected, some are legitimate; the user decides. |
+| m7. Gate output contains compiler and test output, against the rule that outputs never contain file contents. | **Exception, recorded here:** the gate's failure text (short-format diagnostics, the last 40 lines of a failing step, capped at 8 000 characters, control characters removed) goes only to the agent and user of the same session. Reports, snapshots and `context` keep the rule. | Test names and panic locations only: rejected, the assertion values are what an agent needs to fix a test. |
+| m4, m5, m9, m10, m12 | Documented limits (running repository code, `settings.local.json`, LFS stat noise); `CARGO_TARGET_DIR` forced inside the repository; registry sources from `cargo metadata` `manifest_path`; an XDG state fallback. | `harness install --trust`: cut with the install command. |
+
+**Not adopted from the review**, with reasons:
+
+- *A `--deny` flag instead of quick/full modes*: equivalent today; the mode leaves room for
+  slower checks that belong only in CI.
+- *Test only changed packages and their reverse dependencies*: the target is single-crate and
+  small-workspace repositories; seeded in the roadmap.
+- *A per-turn bypass keyword only the user can type*: the user can already tell the agent to stop;
+  seeded.
+- *`redundant_clone` is a nursery lint* and can misfire under `-D warnings`: kept because it
+  catches the copying agents use to get past the borrow checker, and it is clean on this code. It
+  is the first lint to drop if it misfires.
+
+**Cut on purpose**: `harness install` (copying three files is documented instead, as with
+`agent-ignore`), the bootstrap launcher, and a Stop-time "forgotten co-change partner"
+continuation (the post-edit brief already says it, and each forced turn costs a round trip).
+
+**Found while implementing**, each now covered by a test:
+
+- procps `kill -KILL -<pgid>` kills nothing; `kill -s KILL -- -<pgid>` does.
+- A git-ignored weakening config was classified as a pre-existing failure, so the gate passed
+  with `runner = "true"`. Integrity now always blocks.
+- `dependency_sources` came back empty: the bounded output buffer kept the last 256 KiB of a
+  400 KB `cargo metadata` document.
+- Two end-to-end tests passed for the wrong reason: the hooks' own cache directory and a
+  generated `Cargo.lock` changed the fingerprint. The fixture now ignores the former and commits
+  the latter.
+- Windows drive letters broke diagnostic parsing, and canonical path forms could turn a new
+  failure into a "pre-existing" one; paths are compared as relative strings.
+
+**Costs.** Every turn that changed the tree pays one gate run (11–23 s on this repository on a
+4-core container, most of it `cargo test`); every Rust edit pays a `cargo check` (median 1.1 s in
+the session that wired the hooks). The hooks run build scripts, proc macros and tests without asking, so they
+are for repositories you trust. The ask rules add prompts when the agent edits manifests, lint
+configs, workflows or `.claude/`.
+
+**Evidence still missing.** Whether the gate reduces broken "done" claims, and how often it
+blocks falsely, needs logs from real sessions. `fsmap hook stats` reads them.

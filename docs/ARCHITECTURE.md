@@ -18,6 +18,7 @@ and history, import structure, and a ranked list of things worth acting on.
 | Versioned JSON snapshot | scripts, diffing | `fsmap scan`, `fsmap diff` |
 | Findings: text, JSON, SARIF, Markdown | CI gates with a baseline ratchet | `fsmap insights` |
 | Read-deny suggestions | agents | `fsmap agent-ignore` |
+| Verification gate and Claude Code hooks | agents writing Rust (§8) | `fsmap verify`, `fsmap hook` |
 
 ## 2. Pipeline
 
@@ -121,19 +122,49 @@ Measured 2026-10-28 on a 4-core cloud container, release build.
 | `/usr`, 93 k entries, `--no-git` | scan 0.14 s; content 1.6 s warm / 10.8 s cold (456 MiB text); peak RSS 88 MB |
 | `/usr --sizes-only` → HTML | 0.57 s, 6.6 MiB report |
 | `brief --hook` on ripgrep with a warm cache (one git call) | 8 ms (median of 30) |
+| `verify` (quick gate) on this repository, 2026-10-29 | 11 s with nothing to rebuild; 16–23 s after a source edit (3 runs) |
+| `hook session-start` / `hook pre-bash` (non-publishing command) on a clean clone | 0.4 s / 5 ms (3 runs each) |
 
 ## 7. Safety and privacy
 
 - No `unsafe` (`[lints.rust] unsafe_code = "forbid"`).
-- fsmap writes only the output you name, plus the `brief` cache under `$XDG_CACHE_HOME/fsmap`.
+- fsmap writes only the output you name, plus the `brief` cache under `$XDG_CACHE_HOME/fsmap`
+  and, for the hooks, state and a log in `<git-dir>/fsmap-harness/`.
 - Git runs with a fixed prefix so an untrusted repository's config cannot break parsing or
   execute programs (fsmonitor, textconv, external diff). Commands that compare the work
   tree with the index additionally neutralise every configured `filter.<driver>` (clean
-  filters would otherwise run on stat-dirty files; decision D-13). `GIT_OPTIONAL_LOCKS=0` avoids
+  filters would otherwise run on stat-dirty files; decision D-13) and do not enter submodules,
+  whose own filters the prefix cannot reach (D-15). `GIT_OPTIONAL_LOCKS=0` avoids
   `index.lock` races with concurrent agents. `GIT_NO_LAZY_FETCH=1` prevents network fetches
   in partial clones.
 - Outputs contain paths, sizes, metrics and author names; never file contents or commit
-  messages. Emails are never output. `--authors hashed|none` exists for sharing.
+  messages. Emails are never output. `--authors hashed|none` exists for sharing. The one
+  exception is the gate's failure text (compiler and test output, sanitised and capped), which
+  goes only to the agent and user of the session (D-15).
 - HTML: data is embedded as inert JSON with `<` escaped; the viewer renders text through
   `textContent` only; a CSP allows only the bundled script's hash. Terminal output strips
   control characters from names.
+
+## 8. Agent harness
+
+`src/harness/` puts the compiler, the tests and fsmap's repository knowledge into an AI agent's
+loop. Usage and limits: [agent-harness.md](agent-harness.md); decision record: D-15.
+
+| Module | Role |
+|---|---|
+| `verify` | The gate: plan the steps, run each in the workspace root with weakening variables removed and `CARGO_TARGET_DIR` inside the repository, attribute fmt/clippy failures to files, render text or JSON |
+| `integrity` | Find cargo, rustfmt, clippy and rustup settings that make the gate pass without the code changing; list the config files and variables the fingerprint covers |
+| `proc` | Run a command with a deadline; kill its whole process tree on expiry; keep the last 256 KiB of output |
+| `state` | Per-worktree state (per-session baseline, last pass and failure) with atomic writes; the outcome log; the work-tree fingerprint |
+| `hooks` | The five Claude Code hooks and `stats`: JSON in, one JSON answer out, exit 0 |
+
+The stop gate keys on a **fingerprint** of what the gate depends on: HEAD, `git status`
+(filters neutralised, submodules fingerprinted separately), the contents of dirty files,
+git-ignored files cargo still compiles, the config files and weakening variables above,
+`rustc -vV` and the fsmap version. A tree whose fingerprint already passed, or equals the
+session's starting point, is not checked again. A failure is attributed to files: failures only
+in files the session did not touch are reported, not blocked on, except integrity failures,
+which always block.
+
+Templates for other repositories are in `harness/`; this repository uses copies of them in
+`.claude/` and `AGENTS.md`, which `tests/harness.rs` checks are identical.

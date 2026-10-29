@@ -2,7 +2,7 @@
 //! small Cargo project in a git repository. Each test pins one way the gate could fail
 //! open; most come from the design review and from the two parallel harnesses' findings.
 
-#![allow(
+#![expect(
     clippy::unwrap_used,
     reason = "allow-unwrap-in-tests does not cover helper functions in integration tests"
 )]

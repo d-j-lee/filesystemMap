@@ -43,3 +43,11 @@ The paper's "matches, rather than exceeds" sentence compares a $2 SWE-agent run 
 | Claude Code cloud sessions: no plugin language servers and no `/plugin`; the repository's `.claude/settings.json` hooks and permission rules apply **only in a session with one repository, outside a Project thread**; `.claude/agents` load outside Project threads; managed `allowManagedPermissionRulesOnly` overrides repo permission rules. `rust-analyzer-lsp` needs the `rust-analyzer` binary. | [cloud-environments](https://code.claude.com/docs/en/cloud-environments.md), [code-intelligence](https://code.claude.com/docs/en/plugins/code-intelligence.md) | sub-agent |
 | Claude Code hooks: PostToolUse cannot block (exit 2 shows stderr to Claude); Stop `decision: "block"` keeps the turn going, with `stop_hook_active` and an 8-consecutive-continuation cap; SessionStart stdout is added to context; hooks run in parallel; default timeout 600 s. Permissions: ask rules prompt even in auto mode; argument-constraining Bash patterns are bypassable; only `Edit(path)`/`Read(path)` path rules match. | [hooks](https://code.claude.com/docs/en/hooks), [permissions](https://code.claude.com/docs/en/permissions) | ✔ |
 | Stack Overflow 2026: Rust used by 18.0 % (12th), admired 67.4 %. | [survey](https://survey.stackoverflow.co/2026/technology/data/languages) | ✔ (2026-10 file) |
+
+## Reproduced in this repository's container (cargo, clippy 1.97.0)
+
+| Claim from the parallel write-up | Result |
+|---|---|
+| clippy's own help text suggests `#[allow]` | Confirmed: `cast_possible_truncation` under `clippy::pedantic` prints "if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]`". |
+| `[workspace] exclude` does not take globs | Confirmed: with `members = ["crates/*"]` and `exclude = ["crates/b*"]`, `cargo metadata` still lists `crates/bx`. |
+| `allow-…-in-tests` does not reach helper functions in integration tests | Consistent with this repository: `tests/*.rs` helpers needed a crate-level `#![expect(clippy::unwrap_used)]` despite `allow-unwrap-in-tests = true`. |

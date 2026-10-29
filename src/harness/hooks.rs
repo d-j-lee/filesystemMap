@@ -9,7 +9,7 @@
 //! | `post-edit` | PostToolUse `Edit\|Write` | `cargo check` on the edited package; errors back to Claude; the fsmap brief |
 //! | `stop` | Stop | the gate: `fsmap verify` when the tree changed; blocks the stop on new failures |
 //! | `prompt` | UserPromptSubmit | the user wrote: reset the failure streak |
-//! | `pre-bash` | PreToolUse `Bash` | the gate before `git push` / `gh pr create` |
+//! | `pre-bash` | PreToolUse `Bash` | the gate before `git push` / `gh pr create` / `gh pr merge` |
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

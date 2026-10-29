@@ -28,7 +28,7 @@ use fsmap::{dupes, prune, util};
     name = "fsmap",
     version,
     about = "Map a filesystem or codebase: sizes, code, git history, imports — and the findings worth acting on.",
-    after_help = "Examples:\n  fsmap report .                     interactive HTML report\n  fsmap context . > REPO_MAP.md      repo map for AI agents\n  fsmap insights . --fail-on high    CI gate\n  fsmap brief --diff                 files you probably forgot to change\n  fsmap report ~ --no-git            where did my disk go?"
+    after_help = "Examples:\n  fsmap report .                     interactive HTML report\n  fsmap context . > REPO_MAP.md      repo map for AI agents\n  fsmap insights . --fail-on high    CI gate\n  fsmap brief --diff                 files you probably forgot to change\n  fsmap verify                       the gate to pass before calling a change done\n  fsmap report ~ --no-git            where did my disk go?"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -122,8 +122,9 @@ enum Cmd {
         #[arg(long, default_value_t = 15)]
         top: usize,
     },
-    /// The verification gate: fmt, clippy -D warnings, tests, the repository's extra steps
-    /// (`[workspace.metadata.fsmap.verify] extra`), and cargo-deny in full mode.
+    /// The verification gate: settings that weaken it, fmt, clippy -D warnings, tests, the
+    /// repository's extra steps (`[workspace.metadata.fsmap.verify] extra`), and cargo-deny in
+    /// full mode.
     Verify {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -543,9 +544,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 if !json {
                     let _ = writeln!(
                         std::io::stderr(),
-                        "verify: {} {}",
+                        "verify: {} {} ({:.1}s)",
                         r.name,
-                        serde_json::to_string(&r.status).unwrap_or_default()
+                        r.status.label(),
+                        r.ms as f64 / 1000.0
                     );
                 }
             });

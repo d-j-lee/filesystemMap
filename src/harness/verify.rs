@@ -48,6 +48,17 @@ pub enum Status {
     Skip,
 }
 
+impl Status {
+    /// How people read it: `ok`, `FAIL`, `skip`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Pass => "ok",
+            Status::Fail => "FAIL",
+            Status::Skip => "skip",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct StepResult {
     pub name: String,
@@ -497,13 +508,9 @@ pub fn render(report: &Report) -> String {
         ));
     }
     for s in &report.steps {
-        let mark = match s.status {
-            Status::Pass => "ok  ",
-            Status::Fail => "FAIL",
-            Status::Skip => "skip",
-        };
         out.push_str(&format!(
-            "{mark} {:<9} {:>6.1}s  {}\n",
+            "{:<4} {:<9} {:>6.1}s  {}\n",
+            s.status.label(),
             s.name,
             s.ms as f64 / 1000.0,
             s.cmd

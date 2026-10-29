@@ -3,10 +3,13 @@
 **Map any directory — a repository, a home folder, a server disk — into one picture of
 what is there, how it got there, and what deserves attention.** One Rust binary; outputs
 for humans (interactive HTML), AI agents (budgeted Markdown, hooks) and CI (SARIF, exit codes).
+For Rust repositories it also puts the compiler and tests into an AI agent's loop: a
+verification gate and Claude Code hooks ([agent harness](docs/agent-harness.md)).
 
 > **한국어 요약** — 파일시스템 전체(디스크 용량·빌드 산출물·중복)와 코드베이스(언어·의존성·순환·git 이력 기반
 > 핫스팟·소유권·같이 바뀌는 파일)를 하나의 지도로 합쳐 보여주는 Rust CLI입니다. 사람용 HTML 리포트, AI 에이전트용
-> 컨텍스트/훅, CI용 래칫을 함께 제공합니다. 만든 배경과 Rust × AI 활용 가이드는
+> 컨텍스트/훅, CI용 래칫을 함께 제공합니다. Rust 저장소에서는 AI 에이전트의 작업 루프에 컴파일러·테스트
+> 게이트를 거는 하네스(`fsmap verify`, Claude Code 훅)도 됩니다. 만든 배경과 Rust × AI 활용 가이드는
 > [docs/rust-ai-playbook.md](docs/rust-ai-playbook.md)에 있습니다.
 
 ![Overview: ranked findings with evidence and next steps](docs/images/overview.png)
@@ -35,7 +38,7 @@ findings possible that no single tool can produce:
 ## Install
 
 ```bash
-cargo install --git https://github.com/d-j-lee/filesystemMap fsmap
+cargo install --locked --git https://github.com/d-j-lee/filesystemMap fsmap
 ```
 
 Or build from a checkout with `cargo build --release` (Rust ≥ 1.88). The binary is
@@ -72,6 +75,8 @@ it to a ticket. Its tabs:
 | `insights [PATH] [--format text\|json\|sarif\|markdown] [--fail-on SEV] [--baseline F] [--write-baseline F]` | Findings; exit 1 when a (new) finding ≥ SEV |
 | `brief [FILES…] [--diff [BASE]] [--hook] [--root DIR] [--refresh]` | Pre/post-edit briefing; forgotten co-change partners; Claude Code hook protocol. The index is cached per repository and HEAD |
 | `diff OLD.json NEW.json [--top N]` | Growth, new large files, new/resolved findings |
+| `verify [PATH] [--mode quick\|full] [--strict] [--json] [--timeout S]` | Rust gate: settings that weaken it, fmt, clippy `-D warnings`, tests, the repository's extra steps, cargo-deny in `full`. Exit 1 on failure |
+| `hook session-start\|post-edit\|stop\|prompt\|pre-bash\|stats` | Claude Code hooks for the [agent harness](docs/agent-harness.md); `stats` summarises their log |
 | `agent-ignore [PATH] [--format claude\|gitignore]` | Read-deny rules for dependency, build-output and vendored directories; `gitignore` format adds reasons and token costs |
 
 Common analysis flags:
@@ -90,7 +95,8 @@ Common analysis flags:
 | `--no-csp` | `report`: omit the Content-Security-Policy tag, for hosts that inject scripts |
 | `-j N`, `-q` | Worker threads; no progress display |
 
-Exit codes: `0` ok, `1` findings at or above `--fail-on`, `2` error.
+Exit codes: `0` ok, `1` findings at or above `--fail-on` or a failing `verify`, `2` error.
+`hook` always exits `0` and reports problems in its JSON answer.
 
 ## What the numbers mean
 
@@ -113,6 +119,10 @@ See [docs/ai-agents.md](docs/ai-agents.md):
 - read-deny rules;
 - a baseline ratchet with SARIF output for GitHub code scanning.
 
+For Rust repositories, [docs/agent-harness.md](docs/agent-harness.md) adds the verification
+layer: `cargo check` after each edit, `fsmap verify` before a turn ends or a push, and checks
+that catch an agent weakening the gate to get green.
+
 ## Documentation
 
 | Document | Contents |
@@ -121,6 +131,7 @@ See [docs/ai-agents.md](docs/ai-agents.md):
 | [decisions.md](docs/decisions.md) | Decision log with alternatives and costs |
 | [snapshot-schema.md](docs/snapshot-schema.md) | JSON contract `fsmap/1` |
 | [ai-agents.md](docs/ai-agents.md) | Context, hooks, agent-ignore, CI ratchet |
+| [agent-harness.md](docs/agent-harness.md) | Verification gate and Claude Code hooks for Rust repositories |
 | [ROADMAP.md](docs/ROADMAP.md) | Seeds: MCP server, cache, WASM, Chromium profile… |
 | [rust-ai-playbook.md](docs/rust-ai-playbook.md) | (한국어) Rust × AI adoption guide, with this repo as the worked example |
 | [research/](docs/research/) | Dated evidence behind the playbook |
