@@ -249,8 +249,8 @@ equal by a test. Guide: [agent-harness.md](agent-harness.md).
 
 **Design review.** An independent agent reviewed the draft before implementation, reproducing
 the important findings on copies of the repository. Each fix has an end-to-end test in
-`tests/harness.rs` (or `tests/review_regressions.rs`), and each of the ten main guards was
-checked by removing it and confirming its test fails.
+`tests/harness.rs` (or `tests/review_regressions.rs`). Three of these fixes (B1, M3, M7) and
+one claim about M8 turned out incomplete; the final review below records how.
 
 | Finding | Fix | Alternative and why not |
 |---|---|---|
@@ -299,9 +299,35 @@ continuation (the post-edit brief already says it, and each forced turn costs a 
 - Windows drive letters broke diagnostic parsing, and canonical path forms could turn a new
   failure into a "pre-existing" one; paths are compared as relative strings.
 
-**Costs.** Every turn that changed the tree pays one gate run (11–23 s on this repository on a
-4-core container, most of it `cargo test`); every Rust edit pays a `cargo check` (median 1.1 s in
-the session that wired the hooks). The hooks run build scripts, proc macros and tests without asking, so they
+**Final review (of the implementation).** A second independent agent reviewed the finished
+harness on scratch clones, without the author's context. It reproduced 2 blockers and 6 major
+findings, and showed that this entry and the guide claimed more than the code did: "each guard's
+test fails without it" was false for three guards, "never fails open silently" was false, and
+the M8 fix lost records under concurrency. Each finding below has a test that fails on the
+previous code.
+
+| Finding | Fix | Alternative and why not |
+|---|---|---|
+| B1'. The integrity step read TOML line by line against a denylist. Bypasses, each turning a failing step green while integrity said `ok`: an `[alias]` for `clippy`/`fmt`, a fake `linker`, `#` inside a rustflags string, a TOML escape, a nested `src/rustfmt.toml`, a dotted `toolchain.path`, `CARGO_ALIAS_*` and `*_LINKER` variables. A toolchain `path` was also detected only after cargo had already run the fake cargo. | Parse with the `toml` crate (the standard parser; a hand-written one was the defect) and judge against an allowlist: named kinds for known shortcuts, `config:<table>` for anything unknown. Nested rustfmt and clippy files, ignored ones included. Toolchain files checked before the first cargo call; non-official channels refused (a `rustup toolchain link` target is any binary). Whole variable families removed (`CARGO_BUILD_*`, `CARGO_TARGET_*`, `CARGO_ALIAS_*`, `CARGO_PROFILE_*`, `RUSTUP_TOOLCHAIN`, `RUSTC_BOOTSTRAP` …). | Add each bypass to the denylist: rejected, the review found seven in one pass; an allowlist fails closed. Run steps from a neutral directory so repository configs are not read: rejected, it also drops legitimate settings (source replacement, toolchain pins) and diverges from CI. |
+| B2'. When cargo could not locate the workspace (a broken manifest, a relative toolchain path) or the verify table was malformed, stop, pre-bash and post-edit printed nothing: a failing tree could be pushed. | A project with a Cargo.toml that cannot be read blocks the stop (three strikes) and denies a push, with the reason. The verify table is read directly with `toml`; unknown keys and bad entries are errors in the hooks and the CLI alike. | — |
+| M1'. "Failures only in untouched files do not block" let new failures through: a change that leaves a helper without a caller makes dead code in the untouched file; `-D warnings` hides lints in dependent targets; after `/clear` committed changes counted as untouched. | The gate passes only when every step passes. When every failure is in files the session did not change (never integrity failures), the stop is blocked once and then released with a report, the user is told the gate did not pass, and a push stays denied. `start_head` is recorded the first time a session is seen. | Baseline diagnostics from a worktree at the session's start: sound, but a second build per session; seeded. Keep the old rule: rejected, it reported passes that were not. |
+| M2'. A session that started on a broken commit could push it: "unchanged since the session started" also skipped the pre-push gate. | For a push only a recorded pass counts. | — |
+| M3'. An fsmap from before the harness on `PATH` answers `fsmap hook …` with a usage error and exit 2, which Claude Code reads as "block" for prompts and tools. | The template runs `fsmap hook … 2>/dev/null \|\| true`; session start says the harness is OFF when the hook command is missing. Panics in a hook become a message. | A version check in every hook: more moving parts for the same result. |
+| M4'. The deadline waited for output pipes that a background grandchild kept open (25 s past a 8 s budget). | Leftover group members are killed when the tool ends; the readers get a 2 s grace and are then abandoned. | — |
+| M5'. A long gate run saved a snapshot loaded before it, erasing a record another session wrote meanwhile. | Outcomes are recorded through a locked read-modify-write of the freshest state. | Hold a lock for the whole gate: rejected, a session start would wait minutes. |
+| M6'. Push detection denied `git stash push` and `git log --grep push` and missed `sh -c 'git push'` and `gh -R o/r pr create`. | A quote-aware reader of commands, wrappers, `sh -c`/`eval` scripts and git's and gh's global options (`harness::shell`). Git aliases and scripts that push remain unseen (documented). | — |
+| Minor | Post-edit waited for nothing and said a running check "covers this edit"; it now waits up to 30 s. The suppression report runs `git diff` with `--no-textconv` and fixed prefixes, and covers `cfg_attr`, `rustfmt::skip`, manifest lint levels, config changes and new untracked files. Duplicate config paths, macOS and Windows rustfmt user directories, `stats` without cargo, a shared test module's `#![allow]` split into `allow(dead_code)` and `expect(unwrap_used)`. | Detect git aliases by reading `alias.*`: deferred; the stop gate still runs. |
+
+**Mutation check, after the fixes.** 21 guards were removed one at a time and the matching test
+run; each test failed. Two first looked wrong: one because the checking script mistook the
+fixture's own "could not compile" output for the mutant's, and one, a real gap, because the test
+used an `[alias]` that also broke the clippy step, so "integrity failures are never someone
+else's" was never isolated. That test now uses an `[env]` table that breaks nothing else.
+
+**Costs.** Every turn that changed the tree pays one gate run: on this repository 37 s with nothing
+to rebuild and 42 s after a source change (4-core container, 106 tests). Nearly all of it is
+`cargo test`, whose 25 end-to-end hook tests each build a small Cargo project. Every Rust edit
+pays a `cargo check` (median 1.1 s in the session that wired the hooks). The hooks run build scripts, proc macros and tests without asking, so they
 are for repositories you trust. The ask rules add prompts when the agent edits manifests, lint
 configs, workflows or `.claude/`.
 

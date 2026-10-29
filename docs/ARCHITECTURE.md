@@ -122,7 +122,7 @@ Measured 2026-10-28 on a 4-core cloud container, release build.
 | `/usr`, 93 k entries, `--no-git` | scan 0.14 s; content 1.6 s warm / 10.8 s cold (456 MiB text); peak RSS 88 MB |
 | `/usr --sizes-only` → HTML | 0.57 s, 6.6 MiB report |
 | `brief --hook` on ripgrep with a warm cache (one git call) | 8 ms (median of 30) |
-| `verify` (quick gate) on this repository, 2026-10-29 | 11 s with nothing to rebuild; 16–23 s after a source edit (3 runs) |
+| `verify` (quick gate) on this repository, 2026-10-29, 106 tests | 37 s with nothing to rebuild (3 runs); 42 s after a source change; nearly all `cargo test` |
 | `hook session-start` / `hook pre-bash` (non-publishing command) on a clean clone | 0.4 s / 5 ms (3 runs each) |
 
 ## 7. Safety and privacy
@@ -153,18 +153,21 @@ loop. Usage and limits: [agent-harness.md](agent-harness.md); decision record: D
 | Module | Role |
 |---|---|
 | `verify` | The gate: plan the steps, run each in the workspace root with weakening variables removed and `CARGO_TARGET_DIR` inside the repository, attribute fmt/clippy failures to files, render text or JSON |
-| `integrity` | Find cargo, rustfmt, clippy and rustup settings that make the gate pass without the code changing; list the config files and variables the fingerprint covers |
-| `proc` | Run a command with a deadline; kill its whole process tree on expiry; keep the last 256 KiB of output |
-| `state` | Per-worktree state (per-session baseline, last pass and failure) with atomic writes; the outcome log; the work-tree fingerprint |
-| `hooks` | The five Claude Code hooks and `stats`: JSON in, one JSON answer out, exit 0 |
+| `integrity` | Parse every cargo, rustfmt, clippy and rustup file that applies (ancestors, `CARGO_HOME`, every nested `rustfmt.toml`/`clippy.toml`, ignored ones included) as TOML and judge it against an allowlist; check toolchain files before any cargo runs; list the variables removed from the steps |
+| `proc` | Run a command with a deadline; kill its process group on expiry and after exit; stop waiting for output a background process keeps open; keep the last 256 KiB |
+| `state` | Per-worktree state (per-session baseline, last pass and failure); hooks record outcomes through a locked read-modify-write; the outcome log; the work-tree fingerprint |
+| `shell` | Recognise publishing commands (`git push`, `gh pr create\|merge`) through quoting, wrappers, `sh -c` and global options |
+| `hooks` | The five Claude Code hooks and `stats`: JSON in, one JSON answer out, exit 0; panics become a message |
 
 The stop gate keys on a **fingerprint** of what the gate depends on: HEAD, `git status`
 (filters neutralised, submodules fingerprinted separately), the contents of dirty files,
 git-ignored files cargo still compiles, the config files and weakening variables above,
 `rustc -vV` and the fsmap version. A tree whose fingerprint already passed, or equals the
-session's starting point, is not checked again. A failure is attributed to files: failures only
-in files the session did not touch are reported, not blocked on, except integrity failures,
-which always block.
+session's starting point, is not checked again (for a push, only a recorded pass counts). The
+gate passes only when every step passes. Failures are attributed to files; when all of them are
+in files the session did not change (never integrity failures), the stop is blocked once and then
+released with a report, and the user is told the gate did not pass. When cargo cannot read the
+project, the gate cannot run: the stop is blocked and a push denied.
 
 Templates for other repositories are in `harness/`; this repository uses copies of them in
 `.claude/` and `AGENTS.md`, which `tests/harness.rs` checks are identical.

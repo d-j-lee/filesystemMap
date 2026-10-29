@@ -22,6 +22,8 @@ Ordered by expected value per effort.
 | Harness: workspaces below the root | A repository with several Cargo workspaces, or one in a subdirectory, has no gate today | Find workspaces from changed paths in `hooks::gate` |
 | Harness: user-only bypass for work in progress | A keyword in the user's prompt pauses the stop gate for one turn; only the user can type it | `hooks::prompt` sets a per-turn flag in `state` |
 | Harness: wider fingerprint | Path dependencies outside the repository and non-Rust `include_str!` inputs do not re-trigger the gate | `cargo metadata` path packages → `state::fingerprint` |
+| Harness: baseline diagnostics | Tell a failure the session caused from one it found, soundly: run clippy and fmt once on a worktree of the session's start and compare diagnostics | `git worktree add` under the state directory, cached per start commit |
+| Harness: faster self-tests | The 25 end-to-end hook tests make this repository's own gate 37 s; a shared prebuilt fixture would cut most of it | `tests/harness.rs` fixture |
 | Harness: does the gate help? | Measure blocks, false blocks, time added and bypasses across real sessions before claiming value | `fsmap hook stats` over many logs |
 | tree-sitter extractors | Fewer heuristic misses (macro-built includes, JS re-exports) | Swap per language behind `deps::extract::extract` |
 | Exact package graphs (`cargo metadata`, `go list`, `compile_commands.json`) | Ground truth where available | Feed `Resolver` instead of manifest parsing |
