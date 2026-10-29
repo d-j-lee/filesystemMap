@@ -199,9 +199,11 @@ mod tests {
     #[test]
     fn processes_left_in_the_group_are_killed_when_the_tool_ends() {
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "sleep 30 & echo $!; exit 0"]);
+        // The sleeper does not hold the output pipe: only the group kill can end it.
+        cmd.args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!; exit 0"]);
         let o = run(cmd, Duration::from_secs(10));
         let pid = o.output.trim().to_string();
+        assert!(pid.parse::<u32>().is_ok(), "no pid in {:?}", o.output);
         std::thread::sleep(Duration::from_millis(200));
         // A killed orphan can linger as a zombie until init reaps it; that is dead.
         let stat = Command::new("ps")
@@ -210,7 +212,11 @@ mod tests {
             .unwrap();
         let stat = String::from_utf8_lossy(&stat.stdout);
         let alive = !stat.trim().is_empty() && !stat.trim().starts_with('Z');
-        assert!(!alive, "background process {pid} survived ({})", stat.trim());
+        assert!(
+            !alive,
+            "background process {pid} survived ({})",
+            stat.trim()
+        );
     }
 
     /// A grandchild in its own session escapes the process group; the caller still
