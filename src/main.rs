@@ -606,7 +606,7 @@ fn repo_root(dir: &Path) -> (PathBuf, Option<String>) {
     match brief::locate(dir) {
         Some((top, head)) => (top, Some(head)),
         None => (
-            std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+            dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
             None,
         ),
     }
@@ -685,7 +685,7 @@ fn run_brief(
             } else {
                 cwd.join(&p)
             };
-            let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
+            let abs = dunce::canonicalize(&abs).unwrap_or(abs);
             let rel = abs
                 .strip_prefix(&root)
                 .map(|r| r.to_string_lossy().replace('\\', "/"))

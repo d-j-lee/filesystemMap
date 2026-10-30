@@ -225,7 +225,7 @@ pub fn discover(tree: &Tree, root: &Path, max_repos: usize) -> (Vec<Repo>, usize
         c
     }) {
         let top = PathBuf::from(text(top));
-        let top = std::fs::canonicalize(&top).unwrap_or(top);
+        let top = dunce::canonicalize(&top).unwrap_or(top);
         let prefix = root
             .strip_prefix(&top)
             .ok()
@@ -263,7 +263,7 @@ pub fn discover(tree: &Tree, root: &Path, max_repos: usize) -> (Vec<Repo>, usize
             })
             .ok()?;
             let top = PathBuf::from(text(top));
-            let same = std::fs::canonicalize(&top).ok()? == std::fs::canonicalize(&dir).ok()?;
+            let same = dunce::canonicalize(&top).ok()? == dunce::canonicalize(&dir).ok()?;
             same.then(|| Repo {
                 node: id,
                 path: tree.rel_path(id),

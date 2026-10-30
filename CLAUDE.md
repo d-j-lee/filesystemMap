@@ -54,6 +54,8 @@ release build to "see if it works".
   Commands that compare the work tree with the index (`status`, `diff` against the work tree)
   use `git::git_worktree()`, which also disables the repository's filter drivers (D-13).
   Never call `Command::new("git")` directly in library code.
+- **Canonical paths come from `dunce::canonicalize`** (`clippy.toml` forbids std's). On Windows
+  std returns `\\?\C:\…`, which never compares equal to the paths git, cargo and rustfmt print.
 - **Determinism**: sort anything that reaches an output; `context` must stay byte-identical for
   the same tree (there is a test).
 - **Never put file contents or commit messages into outputs.** Paths and metrics only. The

@@ -179,7 +179,7 @@ fn project_dir(input: &Value) -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| input["cwd"].as_str().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."));
-    std::fs::canonicalize(&p).unwrap_or(p)
+    dunce::canonicalize(&p).unwrap_or(p)
 }
 
 fn session_id(input: &Value) -> String {
@@ -536,9 +536,9 @@ fn post_edit(project: &Path, input: &Value) -> Result<Out> {
 
 /// The nearest `Cargo.toml` at or above the edited file, inside the workspace.
 fn package_manifest(ws: &Path, file: &Path) -> Option<PathBuf> {
-    let file = std::fs::canonicalize(file).ok().or_else(|| {
+    let file = dunce::canonicalize(file).ok().or_else(|| {
         Some(
-            std::fs::canonicalize(file.parent()?)
+            dunce::canonicalize(file.parent()?)
                 .ok()?
                 .join(file.file_name()?),
         )
@@ -1014,7 +1014,7 @@ fn diff_base(ws: &Path, start_head: Option<&str>) -> String {
 /// target reads it, so a scratch file does not (third review, finding 3; fourth, M2).
 fn uncommitted_inputs(ws: &Path) -> Result<Vec<String>> {
     let top = toplevel(ws).context("finding the work tree")?;
-    let top = std::fs::canonicalize(&top).unwrap_or(top);
+    let top = dunce::canonicalize(&top).unwrap_or(top);
     let status = crate::git::run({
         let mut c = crate::git::git_worktree(ws);
         c.args([
@@ -1045,7 +1045,7 @@ fn uncommitted_inputs(ws: &Path) -> Result<Vec<String>> {
     let configs: Vec<String> = super::integrity::config_files(ws)
         .into_iter()
         .filter_map(|p| {
-            let p = std::fs::canonicalize(&p).ok()?;
+            let p = dunce::canonicalize(&p).ok()?;
             Some(
                 p.strip_prefix(&top)
                     .ok()?
@@ -1178,9 +1178,9 @@ fn suppression_summary(ws: &Path, me: &state::Session) -> Option<String> {
     .map(String::from)
     .into();
     // Files a cargo configuration includes, under any name (fifth review).
-    let top = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    let top = dunce::canonicalize(&root).unwrap_or_else(|_| root.clone());
     for path in super::integrity::config_files(ws) {
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let path = dunce::canonicalize(&path).unwrap_or(path);
         if let Ok(rel) = path.strip_prefix(&top) {
             pathspecs.push(format!(
                 ":(literal){}",

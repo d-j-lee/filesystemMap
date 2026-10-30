@@ -1,2 +1,9 @@
 # Tests may unwrap: a failing unwrap is a failing test. See [lints.clippy] in Cargo.toml.
 allow-unwrap-in-tests = true
+
+# On Windows std's canonical paths are verbatim (`\\?\C:\…`) and never compare equal to the
+# plain paths cargo and git print; dunce gives the plain form when it names the same file.
+disallowed-methods = [
+    { path = "std::fs::canonicalize", reason = "use dunce::canonicalize: std's verbatim Windows paths do not compare with what cargo and git print" },
+    { path = "std::path::Path::canonicalize", reason = "use dunce::canonicalize: std's verbatim Windows paths do not compare with what cargo and git print" },
+]

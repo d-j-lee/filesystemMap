@@ -230,7 +230,7 @@ pub fn fingerprint(root: &Path, trust: &[String]) -> Option<String> {
     }
     // Through links: a tracked link's target is what cargo reads (fifth review).
     for path in integrity::config_files(root) {
-        hash_file(&mut h, &std::fs::canonicalize(&path).unwrap_or(path));
+        hash_file(&mut h, &dunce::canonicalize(&path).unwrap_or(path));
     }
     let vars = super::verify::env_vars();
     for name in integrity::weakening_env(

@@ -456,6 +456,23 @@ structural answer is a second detector that does not read shell at all: a git `p
 (ROADMAP). The loop stopped here on purpose; the next round would most likely find more shell
 forms, not a flaw in the model.
 
+**Windows CI, first end-to-end run.** The hook tests had never run on Windows; until then the unit
+tests failed first. Four failed for one cause. On Windows `std::fs::canonicalize` returns
+verbatim paths (`\\?\C:\…`), which never compare equal to the plain paths cargo and git print,
+and rustfmt prints verbatim paths itself. So post-edit found no package for the edited file and
+checked nothing. A failure from rustfmt in a file from before the session could not be
+attributed, so the gate blocked the turn as if the session had caused it. The same mismatch hid
+a rustup directory override on Windows. Its test used the verbatim form as the key, so it passed
+for the wrong reason.
+
+The fix has three parts. Every canonical path now comes from `dunce::canonicalize`, which returns
+the plain form when that names the same file. `clippy.toml` forbids std's. Printed paths are
+simplified before they are compared, and an override key matches in either spelling.
+
+The alternative was to strip the prefix by hand: no dependency, about 20 lines. It was not taken.
+The cases where stripping changes which file a path names (reserved device names, paths over 260
+characters) are the ones dunce already handles, and dunce has no dependencies of its own.
+
 **Costs.** Every turn that changed the tree pays one gate run: on this repository 47–48 s with nothing
 to rebuild (4-core container, 142 tests, three runs). Nearly all of it is `cargo test`, whose 43 end-to-end
 hook tests each build a small Cargo project. Every Rust edit

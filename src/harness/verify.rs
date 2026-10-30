@@ -186,7 +186,7 @@ pub fn source_dirs(root: &Path) -> Option<Vec<(PathBuf, bool)>> {
         .flatten()
     {
         let src = Path::new(t["src_path"].as_str()?);
-        let dir = std::fs::canonicalize(src.parent()?).ok()?;
+        let dir = dunce::canonicalize(src.parent()?).ok()?;
         let build_script = t["kind"]
             .as_array()
             .is_some_and(|k| k.iter().any(|k| k == "custom-build"));
@@ -550,9 +550,12 @@ pub fn diagnostic(line: &str) -> Option<(&str, &str)> {
 pub fn rel_path(root: &Path, path: &str) -> Option<String> {
     let p = Path::new(path);
     // Rooted, not only absolute: on Windows `/elsewhere/d.rs` is rooted but has no drive,
-    // and is no more relative to the workspace than `C:\elsewhere\d.rs`.
+    // and is no more relative to the workspace than `C:\elsewhere\d.rs`. rustfmt prints
+    // verbatim paths there (`\\?\C:\…`) and cargo plain ones, so both are simplified.
     let rel = if p.has_root() {
-        p.strip_prefix(root).ok()?
+        dunce::simplified(p)
+            .strip_prefix(dunce::simplified(root))
+            .ok()?
     } else {
         p
     };
@@ -686,5 +689,21 @@ mod tests {
             attributed_files(root, out),
             ["src/a.rs", "src/b.rs", "src/c.rs"]
         );
+    }
+
+    /// rustfmt names files by their verbatim path on Windows, cargo by the plain one; either
+    /// may be the workspace root's form.
+    #[cfg(windows)]
+    #[test]
+    fn attributes_verbatim_and_plain_windows_paths() {
+        let out = "Diff in \\\\?\\C:\\w\\src\\a.rs:1:\n-x\n+y\n\
+                   C:\\w\\src\\b.rs:1:1: error[E0308]: mismatched types\n";
+        for root in [r"C:\w", r"\\?\C:\w"] {
+            assert_eq!(
+                attributed_files(Path::new(root), out),
+                ["src/a.rs", "src/b.rs"],
+                "{root}"
+            );
+        }
     }
 }

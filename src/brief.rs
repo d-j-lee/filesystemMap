@@ -165,7 +165,7 @@ pub fn locate(dir: &Path) -> Option<(PathBuf, String)> {
     // HEAD is the last line; the top-level path before it may itself contain newlines.
     let text = String::from_utf8_lossy(&out);
     let (top, head) = text.trim_end().rsplit_once('\n')?;
-    let top = std::fs::canonicalize(top.trim_end_matches('\r')).ok()?;
+    let top = dunce::canonicalize(top.trim_end_matches('\r')).ok()?;
     Some((top, head.trim().to_string()))
 }
 
@@ -492,8 +492,8 @@ pub fn hook_context(
     // The root is canonical; make the file canonical too (symlinked project paths). A
     // file that does not exist yet (Write) is resolved through its parent directory.
     let abs = PathBuf::from(file);
-    let abs = std::fs::canonicalize(&abs).ok().or_else(|| {
-        let parent = std::fs::canonicalize(abs.parent()?).ok()?;
+    let abs = dunce::canonicalize(&abs).ok().or_else(|| {
+        let parent = dunce::canonicalize(abs.parent()?).ok()?;
         Some(parent.join(abs.file_name()?))
     })?;
     let rel = abs
@@ -610,7 +610,7 @@ mod tests {
     fn hook_protocol() {
         let idx = idx();
         let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "").unwrap();
         let event = |file: &str| {

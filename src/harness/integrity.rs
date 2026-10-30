@@ -350,7 +350,7 @@ fn canon_file(p: &Path) -> PathBuf {
 }
 
 fn canon(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Where a single file is relative to the project's work tree at `top` (canonical):
@@ -659,8 +659,9 @@ fn toolchain_scan_with(dir: &Path, trust: &[String], rustup: Option<&Path>) -> V
             .unwrap_or_default();
         let dir = canon(dir);
         for (path, toolchain) in &overrides {
+            // Compared simplified: on Windows the key may be verbatim (`\\?\C:\…`) or plain.
             if let Some(name) = toolchain.as_str()
-                && dir.starts_with(path)
+                && dir.starts_with(dunce::simplified(Path::new(path)))
             {
                 let mut push = |kind: &str, text: String| {
                     out.push(Finding {
@@ -1476,6 +1477,16 @@ mod tests {
         assert!(f[0].file.ends_with("settings.toml"), "{f:?}");
         settings("1.97.0");
         assert!(toolchain_scan_with(&sub, &[], Some(home.path())).is_empty());
+        // Windows: a key in either spelling of the same directory applies.
+        if cfg!(windows) {
+            let key = format!(r"\\?\{key}");
+            write(
+                home.path(),
+                "settings.toml",
+                &format!("version = \"12\"\n[overrides]\n'{key}' = \"my-linked-toolchain\"\n"),
+            );
+            assert_eq!(toolchain_scan_with(&sub, &[], Some(home.path())).len(), 1);
+        }
     }
 
     #[test]

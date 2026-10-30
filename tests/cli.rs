@@ -203,7 +203,7 @@ fn brief_diff_reports_forgotten_partner() {
     assert!(text.contains("proto/schema.txt"), "{text}");
 
     // Hook mode: JSON for Claude Code, silent for unremarkable files.
-    let abs = std::fs::canonicalize(d.join("client/api.py")).unwrap();
+    let abs = dunce::canonicalize(d.join("client/api.py")).unwrap();
     let out = hook(d, &abs, &[]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("hook JSON");
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
