@@ -523,14 +523,16 @@ Six review rounds each found command forms the reading missed. The reading had f
 **Decision.**
 - Outside a cloud session, git's own pre-push hook decides. A shim installed in the common hooks
   directory hands each push from Claude Code (`CLAUDECODE=1`) to `fsmap hook git-pre-push`.
-- A push is verified when each commit it publishes falls in one of three cases:
+- A push is verified when the commit each updated ref ends at falls in one of three cases:
   - its tree is one the gate passed on, with the same configuration, judged environment and
     toolchain;
-  - it is HEAD of a work tree whose fingerprint passed with every build input committed;
+  - it is HEAD of a work tree whose fingerprint passed, with no tracked change and no build
+    input left out of it;
   - it publishes nothing the remote's tracking refs lack.
 - The hook never runs the gate itself: Stop and pre-bash produce the verdicts within their
   budgets, and the hook only reads them.
-- The Stop hook audits the remote-tracking reflogs and reports pushes no hook run verified.
+- The Stop hook audits the remote-tracking reflogs and reports pushes no hook run verified;
+  the next prompt does the same for a turn no Stop ended.
 - With the hook in place, pre-bash refuses the usual ways around it.
 
 **Alternatives.**
@@ -583,12 +585,57 @@ timestamp tick of the last `git add` went unseen, and the verdict named the old 
 now keeps the index's mtime. A unit test reproduces the case by fixing the stat data, and 0 of
 25 runs fail after the fix.
 
+**Implementation review** (a fresh agent, with real pushes to local remotes). No blocker, 5
+majors, 8 minors; all but two (traced in the code) were reproduced. Each fix began with a test
+that failed on the code as it was:
+- M1: the HEAD rule let out a commit that left a tracked data file behind (read by
+  `include_str!`, so not a build input), and its tests failed on a fresh clone. HEAD now counts
+  only with no tracked change at all.
+- M2: `git add -A` passes over an edited `--skip-worktree` file, so the recorded tree was not the
+  one the gate built. No tree is recorded while such entries exist.
+- M3: a compaction and the next prompt moved the audit's window without auditing, so a push the
+  hook said was "reported to the user" never was. Only an audit moves the window now, and a
+  compaction leaves it open.
+- M4: deleting or disabling the shim switched the audit off too. Whether to audit follows the
+  hook's state when the window opened, and the removal is reported.
+- M5: git older than 2.31 echoes the unknown `--path-format` and exits 0, so state files landed
+  in the work tree under a name starting with `--`. Paths are now resolved relative to the
+  directory, and output with the wrong number of lines is rejected.
+- Minors fixed:
+  - m1: a known commit pushed to a new branch was reported as a bypass.
+  - m2: in a repository with a clean filter, every push after a pass was refused, because the
+    recorded tree skipped the filter. The tree is now recorded with filters on; the harness runs
+    the repository's own code anyway.
+  - m3: any push from a checkout without the workspace got through.
+  - m5: verdicts were not shared across worktrees once a config file was tracked, because the
+    digest hashed absolute paths.
+  - m6: a refspec with spaces was refused.
+  - m7: pre-bash refused reading `core.hooksPath` and environment changes on commands that do
+    not push, and missed `sudo`, `exec -c`, `GIT_CONFIG_GLOBAL`, and an alias with
+    `--no-verify`.
+- Documented instead (Limits in the guide):
+  - m4: only each ref's tip is checked. Checking every commit would refuse nearly every push,
+    since intermediate commits never ran the gate.
+  - m8: one shim names one workspace.
+
+Reading the diff of the M3 fix found a regression: the prompt now audited the gap between turns,
+so a person's own push made there was reported. The session now records whether a turn is open
+(set by the prompt and by a Stop that blocks or waits for background agents, cleared by a Stop
+that ends the turn), and the prompt audits only an open one.
+
+The 18 guards the review fixes added and the 5 of the turn flag were then removed one at a time,
+like the first 31. Two survived at first: a test that an earlier Stop's report already satisfied,
+and a branch no test told apart (`git config core.hooksPath` followed only by flags, which
+reads). Each got the test it lacked, and all 54 now fail a test when removed.
+
 **Costs** (this repository, 4 cores):
-- the hook takes 55–74 ms when nothing new is published, 128–136 ms when it checks;
-- recording a verified tree adds 21–36 ms of git work to a pass;
-- the 13 new end-to-end tests raised this repository's gate from about 48 s to 57–60 s.
+- the hook takes 55–96 ms when nothing new is published, 112–180 ms when it checks (eight runs
+  each, after the implementation review);
+- recording a verified tree adds 17–27 ms of git work to a pass (173 ms once, cold);
+- the 23 new end-to-end tests raised this repository's gate from about 48 s to 62–65 s.
 
 **Not covered.** Publishing outside `git push` in this clone (`gh api`, MCP tools, another
-clone, `send-pack`). The audit misses tags, URL pushes, untracked branches of single-branch
+clone, `send-pack`). Commits between a ref's old and new tip. Sessions in two workspaces of one
+repository. The audit misses tags, URL pushes, untracked branches of single-branch
 clones, `core.logAllRefUpdates=false`, and entries pruned before Stop. In a cloud session
 the command reading still decides, so a form it misses is reported rather than stopped.

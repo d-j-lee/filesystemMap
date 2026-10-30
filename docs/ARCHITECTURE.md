@@ -122,9 +122,9 @@ Measured 2026-10-28 on a 4-core cloud container, release build.
 | `/usr`, 93 k entries, `--no-git` | scan 0.14 s; content 1.6 s warm / 10.8 s cold (456 MiB text); peak RSS 88 MB |
 | `/usr --sizes-only` → HTML | 0.57 s, 6.6 MiB report |
 | `brief --hook` on ripgrep with a warm cache (one git call) | 8 ms (median of 30) |
-| `verify` (quick gate) on this repository, 2026-10-30, 161 tests | 57–60 s with nothing to rebuild, five runs; nearly all `cargo test` (57 end-to-end hook tests) |
+| `verify` (quick gate) on this repository, 2026-10-30, 171 tests | 62–65 s with nothing to rebuild, five runs; nearly all `cargo test` (67 end-to-end hook tests) |
 | `hook session-start` / `hook pre-bash` (non-publishing command) on a clean clone | 0.4 s / 5 ms (3 runs each) |
-| `hook git-pre-push` on this repository, 2026-10-30 | 55–74 ms for a push that publishes nothing new, 128–136 ms for one it checks (3 runs each) |
+| `hook git-pre-push` on this repository, 2026-10-30 | 55–96 ms for a push that publishes nothing new, 112–180 ms for one it checks (8 runs each) |
 
 ## 7. Safety and privacy
 
@@ -176,15 +176,16 @@ git) the gate runs every time.
 
 A pass also records the tree a commit of the work tree would hold, with a digest of the
 fingerprint's non-file part (configuration, judged environment, toolchain). git's pre-push hook,
-through a shim the session-start hook installs, lets a push from Claude Code through when every
-commit it publishes holds such a tree, or is HEAD of a work tree whose fingerprint passed with
-every build input committed, or is already on the remote; it refuses otherwise, except in a
-cloud session, where it only reports (D-16). Where the hook enforces, the pre-bash hook runs the
+through a shim the session-start hook installs, lets a push from Claude Code through when the
+commit each updated ref ends at holds such a tree, or is HEAD of a work tree whose fingerprint
+passed with nothing tracked left uncommitted, or is already on the remote; it refuses otherwise,
+except in a cloud session, where it only reports (D-16). Where the hook enforces, the pre-bash hook runs the
 gate before a push so a verdict exists, and leaves the decision to git; elsewhere it denies a
 push while build inputs are uncommitted (manifests, configuration, and sources in a directory a
 target reads, from `cargo metadata`), since the gate checks the work tree and the push sends
 HEAD. At the end of a turn the Stop hook reports pushes in the remote-tracking reflogs since the
-user last wrote that no pre-push run verified. The threat model (hidden configuration fails,
+last audit that no pre-push run verified; the next prompt does the same for a turn no Stop
+ended (the user interrupted it), and otherwise leaves the gap between turns, a person's, alone. The threat model (hidden configuration fails,
 tracked changes are reported) is in [agent-harness.md](agent-harness.md).
 
 Templates for other repositories are in `harness/`; this repository uses copies of them in

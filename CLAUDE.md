@@ -52,8 +52,11 @@ release build to "see if it works".
 - **No `unsafe`** (forbidden in `Cargo.toml`). No `todo!`/`unimplemented!`/`dbg!` (denied).
 - **Every git call goes through `git::git()`.** It pins safe config for untrusted repositories.
   Commands that compare the work tree with the index (`status`, `diff` against the work tree)
-  use `git::git_worktree()`, which also disables the repository's filter drivers (D-13).
-  Never call `Command::new("git")` directly in library code.
+  use `git::git_worktree()`, which also disables the repository's filter drivers (D-13). One
+  exception: the harness records a passed tree (`githook::verified_key`) with filters on, as a
+  commit would store it; the harness runs a repository's own build scripts and tests anyway and
+  is only for repositories one trusts (D-16). Never call `Command::new("git")` directly in
+  library code.
 - **Canonical paths come from `dunce::canonicalize`** (`clippy.toml` forbids std's). On Windows
   std returns `\\?\C:\…`, which never compares equal to the paths git, cargo and rustfmt print.
 - **Determinism**: sort anything that reaches an output; `context` must stay byte-identical for

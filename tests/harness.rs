@@ -2014,3 +2014,267 @@ fn a_broken_fsmap_never_blocks_a_cloud_push() {
     );
     assert!(ok, "{err}");
 }
+
+// ------------------------------------------------- implementation review of D-16 (e759166)
+
+/// Review M1: HEAD of a work tree that passed counts only when the work tree holds nothing
+/// tracked that the commit lacks; a data file read by `include_str!` is not a build input.
+#[test]
+fn head_counts_only_when_nothing_tracked_is_left_out() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "data.txt", "1");
+    write(
+        d,
+        "src/lib.rs",
+        "pub fn data() -> &'static str {\n    include_str!(\"../data.txt\")\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn data() {\n        assert_eq!(super::data(), \"1\");\n    }\n}\n",
+    );
+    commit(d, "A", "data", T0 + 10);
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "data.txt", "2");
+    let lib = std::fs::read_to_string(d.join("src/lib.rs")).unwrap();
+    write(d, "src/lib.rs", &lib.replace("\"1\"", "\"2\""));
+    git(d, &["add", "src/lib.rs"], T0 + 60);
+    commit_staged(d, "expects 2", T0 + 60);
+    let v = stop(d, false);
+    assert!(!blocked(&v), "passes on the work tree: {v}");
+    let before = rev(remote.path(), "main");
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "data.txt is not in the commit: {err}");
+    assert_eq!(rev(remote.path(), "main"), before);
+}
+
+/// Review M2: an edited `--skip-worktree` file is not in the tree `git add -A` makes.
+#[test]
+fn an_edited_skip_worktree_file_keeps_its_commit_unverified() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "src/lib.rs", &format!("pub mod cfg;\n{GOOD}"));
+    write(d, "src/cfg.rs", "pub const X: u32 = 1;\n");
+    commit(d, "A", "cfg", T0 + 10);
+    let _remote = origin(d);
+    start(d, "startup");
+    git(
+        d,
+        &["update-index", "--skip-worktree", "src/cfg.rs"],
+        T0 + 20,
+    );
+    write(d, "src/cfg.rs", "pub const X: u32 = 2;\n");
+    write(
+        d,
+        "src/lib.rs",
+        &format!("pub mod cfg;\n{GOOD}\n#[test]\nfn x() {{\n    assert_eq!(cfg::X, 2);\n}}\n"),
+    );
+    git(d, &["add", "src/lib.rs"], T0 + 60);
+    commit_staged(d, "expects 2", T0 + 60);
+    assert!(stop(d, false).is_null(), "passes with the local copy");
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "the commit holds X = 1: {err}");
+}
+
+/// Review M3: the audit's window moves only after an audit. A compaction in between, or a
+/// turn the user interrupts (no Stop), does not lose a push.
+#[test]
+fn an_unverified_push_is_reported_across_compaction_and_interruption() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    start(d, "compact");
+    let v = stop(d, false);
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("origin/main"),
+        "reported after a compaction: {v}"
+    );
+    // Interrupted: a push, then the next prompt without a Stop in between.
+    write(d, "src/lib.rs", &FAILING_TEST.replace("+ 1", "+ 2"));
+    commit(d, "Agent", "still broken", T0 + 90);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let second = rev(d, "HEAD");
+    let v = hook(d, "prompt", &json!({"session_id": "s1"}));
+    assert!(
+        v.to_string().contains(&second[..10]),
+        "the second push is reported at the prompt: {v}"
+    );
+}
+
+/// What happens between turns is not the agent's: the prompt audits only a turn no Stop
+/// closed (one the user interrupted), so a person's own push after a turn is not reported.
+#[test]
+fn a_persons_push_between_turns_is_not_reported() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(!blocked(&stop(d, false)), "the turn ends");
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Person", "theirs", T0 + 60);
+    let ok = Command::new("git")
+        .args(["push", "-q", "origin", "main"])
+        .current_dir(d)
+        .env_remove("CLAUDECODE")
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let theirs = rev(d, "HEAD");
+    let v = hook(d, "prompt", &json!({"session_id": "s1"}));
+    assert!(
+        !v.to_string().contains("did not verify"),
+        "a person's push between turns: {v}"
+    );
+    // The prompt opened a turn: the agent's push in it is audited when the user interrupts.
+    write(d, "src/lib.rs", &FAILING_TEST.replace("+ 1", "+ 2"));
+    commit(d, "Agent", "broken", T0 + 90);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let ours = rev(d, "HEAD");
+    let v = hook(d, "prompt", &json!({"session_id": "s1"})).to_string();
+    assert!(v.contains(&ours[..10]), "the agent's push: {v}");
+    assert!(
+        !v.contains(&theirs[..10]),
+        "the person's push stays out: {v}"
+    );
+}
+
+/// Work after a turn ended, while background agents run (a Stop that waits for them), is the
+/// agent's: a push in it is audited at the next prompt.
+#[test]
+fn a_push_while_background_agents_work_is_audited_at_the_prompt() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(!blocked(&stop(d, false)), "the turn ends");
+    // Woken by a background agent's notification; its Stop waits for the agents.
+    hook(
+        d,
+        "stop",
+        &json!({"session_id": "s1", "hook_event_name": "Stop", "stop_hook_active": false,
+                "background_tasks": [{"id": "x", "type": "subagent", "status": "running"}]}),
+    );
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let ours = rev(d, "HEAD");
+    let v = hook(d, "prompt", &json!({"session_id": "s1"})).to_string();
+    assert!(v.contains(&ours[..10]), "{v}");
+}
+
+/// Review M4: removing the hook does not also remove the audit; the removal is reported.
+#[test]
+fn removing_the_hook_does_not_hide_the_push() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    std::fs::remove_file(d.join(".git/hooks/pre-push")).unwrap();
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(ok, "no hook ran: {err}");
+    let v = stop(d, false);
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(msg.contains("origin/main"), "{v}");
+    assert!(
+        msg.contains("pre-push hook"),
+        "the removal is reported: {v}"
+    );
+}
+
+/// Review m1: an existing commit pushed to a new branch publishes nothing; it is not a push
+/// around the hook.
+#[test]
+fn a_known_commit_on_a_new_branch_is_not_reported() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    let (ok, err) = git_push(d, &["origin", "HEAD:refs/heads/copy"], &[]);
+    assert!(ok, "{err}");
+    let v = stop(d, false);
+    assert!(
+        !v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("origin/copy"),
+        "{v}"
+    );
+}
+
+/// Review m3: from a work tree without the Cargo workspace (an orphan `gh-pages`), a push of
+/// a branch that has it is not let through unchecked.
+#[test]
+fn a_push_from_a_checkout_without_the_workspace_is_checked() {
+    let repo = fixture();
+    let d = repo.path();
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    git(d, &["checkout", "-q", "--orphan", "pages"], T0 + 70);
+    git(d, &["rm", "-rqf", "."], T0 + 70);
+    write(d, "index.html", "<p>hi</p>\n");
+    commit(d, "Agent", "pages", T0 + 80);
+    let before = rev(remote.path(), "main");
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "{err}");
+    assert_eq!(rev(remote.path(), "main"), before);
+}
+
+/// Review m5: a verdict reached in one worktree holds in another, also with configuration
+/// files in the tree (their paths differ per worktree).
+#[test]
+fn a_verdict_holds_across_worktrees_with_config_in_the_tree() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "rustfmt.toml", "edition = \"2021\"\n");
+    commit(d, "A", "rustfmt", T0 + 10);
+    let remote = origin(d);
+    let wt = tempfile::tempdir().unwrap();
+    let w = wt.path().join("wt");
+    git(
+        d,
+        &["worktree", "add", "-q", "-b", "side", &w.to_string_lossy()],
+        T0 + 20,
+    );
+    start(&w, "startup");
+    write(&w, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(stop(&w, false).is_null());
+    commit(&w, "Agent", "change", T0 + 60);
+    let (ok, err) = git_push(d, &["origin", "side"], &[]);
+    assert!(ok, "verified in the other worktree: {err}");
+    assert_eq!(rev(remote.path(), "side"), rev(&w, "HEAD"));
+}
+
+/// Review m2: with a clean filter (as Git LFS has), the verified tree is the one a commit
+/// makes, so committing what passed is accepted.
+#[test]
+fn a_verdict_follows_clean_filters() {
+    let repo = fixture();
+    let d = repo.path();
+    git(d, &["config", "filter.up.clean", "tr a-z A-Z"], T0);
+    git(d, &["config", "filter.up.smudge", "cat"], T0);
+    write(d, ".gitattributes", "*.txt filter=up\n");
+    write(d, "notes.txt", "one\n");
+    commit(d, "A", "filtered", T0 + 10);
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "notes.txt", "two\n");
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(stop(d, false).is_null());
+    commit(d, "Agent", "change", T0 + 60);
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(ok, "{err}");
+    assert_eq!(rev(remote.path(), "main"), rev(d, "HEAD"));
+}

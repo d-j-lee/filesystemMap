@@ -40,10 +40,18 @@ pub struct Session {
     pub released: bool,
     /// Unix seconds of the last hook call for this session.
     pub last_seen: i64,
-    /// Remote-tracking refs and their commits when the user last wrote, and when: the push
-    /// audit at the end of the turn reads the reflogs of the refs that moved (D-16).
+    /// Remote-tracking refs and their commits when the last push audit ran (or the session
+    /// was first seen), and when; the next audit reads the reflogs of the refs that moved
+    /// since (D-16). `refs_at` is 0 before the first snapshot.
     pub remote_refs: BTreeMap<String, String>,
     pub refs_at: i64,
+    /// The git pre-push hook was in place when that snapshot was taken: the next audit runs
+    /// even if the hook is gone by then (review M4).
+    pub audit: bool,
+    /// A prompt started a turn that no Stop has ended: pushes in the window are the agent's.
+    /// The next prompt audits such a turn (one the user interrupted fires no Stop); after a
+    /// turn ends, pushes until the next prompt are a person's.
+    pub in_turn: bool,
     /// For Claude at the next prompt (a Stop hook cannot add context).
     pub pending_context: Vec<String>,
 }
@@ -151,13 +159,8 @@ fn read_json<T: Default + DeserializeOwned>(path: &Path) -> T {
 
 /// The common git directory's state directory (shared by all worktrees), if there is one.
 pub fn common_dir(root: &Path) -> Option<PathBuf> {
-    let out = git::run({
-        let mut c = git::git(root);
-        c.args(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-        c
-    })
-    .ok()?;
-    let d = PathBuf::from(String::from_utf8_lossy(&out).trim()).join("fsmap-harness");
+    let common = super::githook::rev_parse(root, &["--git-common-dir"])?.pop()?;
+    let d = root.join(common).join("fsmap-harness");
     std::fs::create_dir_all(&d).ok()?;
     Some(d)
 }
@@ -295,12 +298,24 @@ pub fn context_digest(root: &Path, trust: &[String]) -> String {
 }
 
 fn hash_context(h: &mut xxhash_rust::xxh3::Xxh3, root: &Path, trust: &[String]) {
+    // Named relative to the root where they are inside it, so that the same tree gives the
+    // same digest in every worktree (review m5).
+    let croot = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let name = |p: &Path| {
+        p.strip_prefix(root)
+            .or_else(|_| p.strip_prefix(&croot))
+            .map_or_else(
+                |_| p.to_string_lossy().into_owned(),
+                |r| r.to_string_lossy().replace('\\', "/"),
+            )
+    };
     for path in ignored_build_inputs(root) {
-        hash_file(h, &root.join(path));
+        hash_file_as(h, &path, &root.join(&path));
     }
     // Through links: a tracked link's target is what cargo reads (fifth review).
     for path in integrity::config_files(root) {
-        hash_file(h, &dunce::canonicalize(&path).unwrap_or(path));
+        let target = dunce::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        hash_file_as(h, &name(&path), &target);
     }
     let vars = super::verify::env_vars();
     for name in integrity::weakening_env(
@@ -580,7 +595,12 @@ fn toplevel(dir: &Path) -> Option<PathBuf> {
 }
 
 fn hash_file(h: &mut xxhash_rust::xxh3::Xxh3, path: &Path) {
-    h.update(path.to_string_lossy().as_bytes());
+    hash_file_as(h, &path.to_string_lossy(), path);
+}
+
+/// The file at `path`, hashed under `name`.
+fn hash_file_as(h: &mut xxhash_rust::xxh3::Xxh3, name: &str, path: &Path) {
+    h.update(name.as_bytes());
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         h.update(b"\0missing");
         return;

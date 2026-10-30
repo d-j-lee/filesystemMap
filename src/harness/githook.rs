@@ -80,8 +80,10 @@ pub fn parse_updates(stdin: &str) -> Result<Vec<RefUpdate>> {
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let [local_ref, local, remote_ref, remote] = fields[..] else {
+            // The local ref is what was typed and may hold spaces (`main@{1 hour ago}`); the
+            // other three fields cannot.
+            let fields: Vec<&str> = line.trim_end().rsplitn(4, ' ').collect();
+            let [remote, remote_ref, local, local_ref] = fields[..] else {
                 bail!("unexpected pre-push input line: {line:?}");
             };
             let oid = |s: &str| Oid::parse(s).with_context(|| format!("not an object id: {s:?}"));
@@ -160,27 +162,32 @@ fn shim_text(rel: &str) -> String {
     )
 }
 
-/// The hooks directory git uses, the common one the shim belongs in, and the workspace's
-/// path from the work tree top.
-fn locate(ws: &Path) -> Option<(PathBuf, PathBuf, String)> {
+/// `git rev-parse <args>` run in `dir`, one line per argument, paths resolved against `dir`
+/// (git prints them relative to where it ran). `--path-format=absolute` would do that but
+/// needs git 2.31; older git echoes an option it does not know as if it were output.
+pub fn rev_parse(dir: &Path, args: &[&str]) -> Option<Vec<String>> {
     let out = git::run({
-        let mut c = git::git(ws);
-        c.args([
-            "rev-parse",
-            "--show-prefix",
-            "--path-format=absolute",
-            "--git-path",
-            "hooks",
-            "--git-common-dir",
-        ]);
+        let mut c = git::git(dir);
+        c.arg("rev-parse").args(args);
         c
     })
     .ok()?;
     let text = String::from_utf8_lossy(&out);
-    let mut lines = text.lines();
-    let prefix = lines.next()?.trim().trim_end_matches('/');
-    let used = PathBuf::from(lines.next()?.trim());
-    let common = PathBuf::from(lines.next()?.trim()).join("hooks");
+    let lines: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
+    let expected = args.iter().filter(|a| a.starts_with("--")).count();
+    (lines.len() == expected && !lines.iter().any(|l| l.starts_with("--"))).then_some(lines)
+}
+
+/// The hooks directory git uses, the common one the shim belongs in, and the workspace's
+/// path from the work tree top.
+fn locate(ws: &Path) -> Option<(PathBuf, PathBuf, String)> {
+    let lines = rev_parse(
+        ws,
+        &["--show-prefix", "--git-path", "hooks", "--git-common-dir"],
+    )?;
+    let prefix = lines[0].trim_end_matches('/');
+    let used = ws.join(&lines[1]);
+    let common = ws.join(&lines[2]).join("hooks");
     let rel = if prefix.is_empty() { "." } else { prefix };
     Some((used, common, rel.to_string()))
 }
@@ -292,20 +299,19 @@ pub fn install(ws: &Path, cfg: &Config) -> Result<Shim> {
 }
 
 /// `<tree> <context digest>` for the work tree as `git add -A` would commit it, computed on
-/// a copy of the index (the real one is not touched), with filter drivers neutralised as
-/// for every work-tree comparison (D-13). `None` where a tree does not say what the gate
-/// saw: submodules (their work trees are not in it) and git-ignored files cargo compiles.
+/// a copy of the index (the real one is not touched). `None` where a tree does not say what
+/// the gate saw: submodules (their work trees are not in it), git-ignored files cargo
+/// compiles, and index entries hidden from `git add`.
 pub fn verified_key(ws: &Path, trust: &[String]) -> Option<String> {
-    if !state::submodules(ws).is_empty() || !state::ignored_build_inputs(ws).is_empty() {
+    // `git add -A` leaves `--skip-worktree` and assume-unchanged entries as the index has
+    // them, so an edited one is in the gate's build but not in the tree (review M2).
+    if !state::submodules(ws).is_empty()
+        || !state::ignored_build_inputs(ws).is_empty()
+        || !state::hidden_index_entries(ws).is_empty()
+    {
         return None;
     }
-    let index = git::run({
-        let mut c = git::git(ws);
-        c.args(["rev-parse", "--path-format=absolute", "--git-path", "index"]);
-        c
-    })
-    .ok()?;
-    let index = PathBuf::from(String::from_utf8_lossy(&index).trim());
+    let index = ws.join(rev_parse(ws, &["--git-path", "index"])?.pop()?);
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let copy = Scratch(state::dir(ws).join(format!("index.{}.{n}.tmp", std::process::id())));
@@ -321,8 +327,13 @@ pub fn verified_key(ws: &Path, trust: &[String]) -> Option<String> {
             .and_then(|f| f.set_modified(mtime))
             .ok()?;
     }
+    // With the repository's clean filters (Git LFS and the like) running, as they do for a
+    // real commit: the tree must be the one a commit stores, or committing what passed would
+    // be refused (review m2). Work-tree comparisons neutralise filters because fsmap reads
+    // repositories it does not trust (D-13); the harness runs the repository's build scripts
+    // and tests anyway, and is only for repositories one trusts.
     let with_index = |args: &[&str]| {
-        let mut c = git::git_worktree(ws);
+        let mut c = git::git(ws);
         c.args(args).env("GIT_INDEX_FILE", &copy.0);
         git::run(c)
     };
@@ -355,6 +366,17 @@ pub fn tree_of(ws: &Path, oid: &Oid) -> Option<String> {
     })
     .ok()?;
     Some(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// Whether `commit` holds `path` (relative to the top, `/`-separated).
+pub fn commit_has(dir: &Path, commit: &Oid, path: &str) -> bool {
+    git::run({
+        let mut c = git::git(dir);
+        c.args(["cat-file", "-e"])
+            .arg(format!("{}:{path}", commit.as_str()));
+        c
+    })
+    .is_ok()
 }
 
 /// The commit an object names, tags peeled; `None` for anything else.
@@ -461,6 +483,9 @@ mod tests {
         assert!(!u[0].local.is_zero() && u[0].remote.is_zero());
         assert!(u[1].local.is_zero());
         assert!(parse_updates("").unwrap().is_empty());
+        let spaced = parse_updates(&format!("main@{{1 hour ago}} {a} refs/heads/x {z}\n")).unwrap();
+        assert_eq!(spaced[0].local_ref, "main@{1 hour ago}");
+        assert_eq!(spaced[0].remote_ref, "refs/heads/x");
         assert!(parse_updates("refs/heads/x abc refs/heads/x def\n").is_err());
         assert!(parse_updates("only three fields\n").is_err());
         assert!(Oid::parse(&"b".repeat(64)).is_some());
