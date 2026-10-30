@@ -41,7 +41,7 @@ findings possible that no single tool can produce:
 cargo install --locked --git https://github.com/d-j-lee/filesystemMap fsmap
 ```
 
-Or build from a checkout with `cargo build --release` (Rust ≥ 1.88). The binary is
+Or build from a checkout with `cargo build --release` (Rust ≥ 1.89). The binary is
 `target/release/fsmap`. `git` on `PATH` enables history features; everything else works without it.
 
 ## Quick start

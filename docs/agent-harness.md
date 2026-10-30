@@ -115,7 +115,8 @@ left behind cannot hold the gate past the budget.
 
 Timings: a 4-core cloud container, this repository. Session start and pre-bash on a clean clone
 (2026-10-29), three runs each; post-edit from the live session's log; the gate is `fsmap verify`
-run by hand with nothing to rebuild (2026-10-30, 143 tests), three runs: 47.1–47.8 s. Nearly all
+run by hand with nothing to rebuild (2026-10-30, 144 tests), three runs: 49.3–51.0 s while another
+agent was running on the machine (47.1–47.8 s without it, 143 tests). Nearly all
 of it is `cargo test`, whose 44 end-to-end hook tests each build a small Cargo project; a
 repository without such tests pays its own test time.
 
@@ -148,7 +149,7 @@ them); the rows below without one are noted.
 | Failures from before the session in files nobody touched | Blocked once, then a report; the user is told the gate did not pass |
 | A broken manifest or verify table; a git configuration git cannot read | The stop is blocked and a push denied; without a fingerprint the gate runs anyway |
 | A suppression, `cfg(false)`, an ignored test, a deleted assertion, a lint allowed or checks switched off in a manifest, also in new untracked files | Shown to the user on pass |
-| Two sessions in one worktree | Announced at session start; state updates under a lock keep both records |
+| Two sessions in one worktree | Announced at session start; state updates under an operating-system file lock keep both records |
 | fsmap not installed, an older fsmap without `fsmap hook`, or a hook that crashes | Session start says the harness is OFF; the other hooks stay out of the way; a crash is reported (template test, not in the mutation run) |
 
 ## Setting it up in a Rust repository
