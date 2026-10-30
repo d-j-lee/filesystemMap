@@ -479,6 +479,12 @@ commits in a scratch directory write to the user's repository; fsmap's own fixtu
 that. The steps now run without the repository variables that `git::git()` already removed (one
 shared list).
 
+**CI with a cold cache.** The session briefing lists the direct dependencies' source directories
+from `cargo metadata --offline`. Without `--filter-platform`, cargo needs every package in the
+lock file, other platforms' included. On a machine that had only built for its own platform,
+cargo failed and the list was silently empty; CI's gate job hit this when a new lock file missed
+the cache. It now asks for the host's part only.
+
 **Costs.** Every turn that changed the tree pays one gate run: on this repository 47–48 s with nothing
 to rebuild (4-core container, 142 tests, three runs). Nearly all of it is `cargo test`, whose 43 end-to-end
 hook tests each build a small Cargo project. Every Rust edit

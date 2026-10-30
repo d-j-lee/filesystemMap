@@ -369,12 +369,14 @@ fn briefing(ws: &Path, cfg: &Config) -> String {
 /// `name version: dir` for the workspace's direct registry dependencies (at most 20).
 fn dependency_sources(ws: &Path) -> Vec<String> {
     // The whole graph is needed (it is larger than proc::run keeps), and --offline cannot
-    // hang on the network, so this reads the full output directly.
-    let Ok(o) = verify::clean_command(ws, "cargo")
-        .args(["metadata", "--format-version", "1", "--offline"])
-        .stderr(std::process::Stdio::null())
-        .output()
-    else {
+    // hang on the network, so this reads the full output directly. Only the host's part:
+    // offline, cargo fails on packages for other platforms that were never downloaded.
+    let mut c = verify::clean_command(ws, "cargo");
+    c.args(["metadata", "--format-version", "1", "--offline"]);
+    if let Some(host) = super::integrity::host_triple(ws) {
+        c.args(["--filter-platform", &host]);
+    }
+    let Ok(o) = c.stderr(std::process::Stdio::null()).output() else {
         return Vec::new();
     };
     let Ok(meta) = serde_json::from_slice::<Value>(&o.stdout) else {

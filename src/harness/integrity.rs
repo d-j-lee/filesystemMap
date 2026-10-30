@@ -496,7 +496,7 @@ fn build_targets(files: &[ConfigFile]) -> Vec<String> {
 }
 
 /// The host triple, for deciding which `[target.<triple>]` tables apply.
-fn host_triple(dir: &Path) -> Option<String> {
+pub fn host_triple(dir: &Path) -> Option<String> {
     let out = super::verify::clean_command(dir, "rustc")
         .arg("-vV")
         .output()
