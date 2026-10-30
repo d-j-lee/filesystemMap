@@ -549,7 +549,9 @@ pub fn diagnostic(line: &str) -> Option<(&str, &str)> {
 /// `path` relative to `root` with forward slashes; `None` for a path outside `root`.
 pub fn rel_path(root: &Path, path: &str) -> Option<String> {
     let p = Path::new(path);
-    let rel = if p.is_absolute() {
+    // Rooted, not only absolute: on Windows `/elsewhere/d.rs` is rooted but has no drive,
+    // and is no more relative to the workspace than `C:\elsewhere\d.rs`.
+    let rel = if p.has_root() {
         p.strip_prefix(root).ok()?
     } else {
         p

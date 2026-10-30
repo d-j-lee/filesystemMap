@@ -694,7 +694,9 @@ fn rustfmt_rules_from_the_home_directory_fail_the_gate() {
     let d = repo.path();
     let home = tempfile::tempdir().unwrap();
     write(home.path(), ".rustfmt.toml", "max_width = 40\n");
-    let real_home = std::env::var("HOME").unwrap_or_default();
+    let real_home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
     let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| format!("{real_home}/.cargo"));
     let rustup_home =
         std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{real_home}/.rustup"));

@@ -1356,13 +1356,16 @@ mod tests {
                  rustflags = [\"--cfg\", \"tokio_unstable\", \"-C\", \"opt-level=0\", \"-Cdebug-assertions=on\"]\n\
                  rustdocflags = [\"--cfg\", \"docsrs\"]\n\
                  [target.{}]\nlinker = \"clang\"\n\
-                 rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\", \"-C\", \"link-arg=-fuse-ld=/usr/local/bin/mold\"]\n\
+                 rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\", \"-C\", 'link-arg=-fuse-ld={}']\n\
                  [target.wasm32-unknown-unknown]\nrunner = \"wasm-bindgen-test-runner\"\n\
                  [target.thumbv7em-none-eabihf]\nrustflags = [\"-C\", \"link-arg=-Tlink.x\"]\n\
                  [source.crates-io]\nreplace-with = \"corp\"\n\
                  [source.corp]\nregistry = \"sparse+https://mirror.example.com/index/\"\n\
                  [env]\nSQLX_OFFLINE = \"true\"\n",
-                host()
+                host(),
+                // An absolute path outside the repository on every platform; a TOML
+                // literal string, since Windows paths hold backslashes.
+                std::env::temp_dir().join("bin").join("mold").display()
             ),
         );
         assert!(sc(r, &[]).is_empty(), "{:?}", sc(r, &[]));
@@ -1380,7 +1383,7 @@ mod tests {
             &format!(
                 "[build]\nrustdocflags = [\"-Z\", \"unstable-options\", \"--extern-html-root-url\", \"x=y\"]\n\
                  rustflags = [\"-A\", \"dead_code\", \"-Aunused\"]\n\
-                 [target.{}]\nrustflags = [\"-C\", \"link-arg=-fuse-ld={}\"]\n",
+                 [target.{}]\nrustflags = [\"-C\", 'link-arg=-fuse-ld={}']\n",
                 host(),
                 r.join("tools/mold").display()
             ),
