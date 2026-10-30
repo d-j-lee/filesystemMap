@@ -2,7 +2,7 @@
 name = "fsmap"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Map a filesystem or codebase: sizes, code, git history, imports, and the findings worth acting on."
 publish = false
 

@@ -485,6 +485,24 @@ lock file, other platforms' included. On a machine that had only built for its o
 cargo failed and the list was silently empty; CI's gate job hit this when a new lock file missed
 the cache. It now asks for the host's part only.
 
+**A lost state update.** Once, in the first gate run after the container restarted, the test
+that 8 threads × 15 state updates keep every record counted 119. It did not reproduce: 0 of
+200 runs under CPU load, 5 full-suite runs with the lock's give-up and write-failure paths
+instrumented, and no clock adjustment in the kernel log. The cause stays unconfirmed. The lock
+had two ways to let two writers overwrite each other, both decided by time. It treated a lock
+file as stale 30 s after its mtime, so a clock jump made a held one look old. And it went ahead
+unlocked after 5 s of waiting. A test now holds the lock with an hour-old mtime; the old lock
+wrote through it.
+
+State updates now take an operating-system lock (`File::lock`: `flock`, `LockFileEx`). The
+system releases it when the holder exits, so nothing goes stale and no clock is read. Where a
+file system cannot lock, the update is not written and the caller reports it.
+
+`File::lock` is stable from Rust 1.89, so the MSRV moves from 1.88 to 1.89 (checked: 1.88 rejects
+`file_lock` as unstable, 1.89 builds the crate). The alternative kept the lock file, made
+staleness depend on the holder's pid, and wrote nothing after the wait. It was not taken:
+checking whether a pid is alive is platform-specific, and a pid can be reused.
+
 **Costs.** Every turn that changed the tree pays one gate run: on this repository 47–48 s with nothing
 to rebuild (4-core container, 142 tests, three runs). Nearly all of it is `cargo test`, whose 43 end-to-end
 hook tests each build a small Cargo project. Every Rust edit

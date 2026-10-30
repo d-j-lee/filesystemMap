@@ -37,11 +37,11 @@ jobs:
         run: node --check viewer/app.js
 
   msrv:
-    # Cargo.toml declares rust-version = "1.88"; this keeps the claim true.
+    # Cargo.toml declares rust-version = "1.89"; this keeps the claim true.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --locked
 

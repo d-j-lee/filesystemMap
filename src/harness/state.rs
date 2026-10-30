@@ -119,51 +119,38 @@ fn update_in(d: &Path, f: impl FnOnce(&mut State)) -> bool {
     if std::fs::create_dir_all(d).is_err() {
         return false;
     }
-    let _lock = Lock::acquire(&d.join("state.lock"));
+    let Some(_lock) = Lock::acquire(&d.join("state.lock")) else {
+        return false;
+    };
     let mut st = load_in(d);
     f(&mut st);
     save_in(d, &mut st)
 }
 
-/// An exclusive lock file. Held for a read-modify-write only, so a hook never waits
-/// long; one left behind by a crashed hook goes stale after 30 s, and after 5 s of
-/// waiting the update proceeds unlocked rather than hang the hook.
-struct Lock(Option<PathBuf>);
+/// An exclusive operating-system lock on `state.lock` (`flock`, `LockFileEx`), held for one
+/// read-modify-write. The system releases it when its holder exits, so a crashed hook
+/// leaves nothing behind and no clock decides that a lock is stale. Where the file system
+/// cannot lock, the update is not written and the caller says so: writing unlocked could
+/// overwrite another hook's record.
+struct Lock(std::fs::File);
 
 impl Lock {
-    fn acquire(path: &Path) -> Lock {
-        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .is_ok()
-            {
-                return Lock(Some(path.to_path_buf()));
-            }
-            let stale = std::fs::metadata(path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > std::time::Duration::from_secs(30));
-            if stale {
-                let _ = std::fs::remove_file(path);
-                continue;
-            }
-            if std::time::Instant::now() >= give_up {
-                return Lock(None);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+    fn acquire(path: &Path) -> Option<Lock> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .ok()?;
+        file.lock().ok()?;
+        Some(Lock(file))
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        if let Some(p) = &self.0 {
-            let _ = std::fs::remove_file(p);
-        }
+        // Closing the file releases the lock as well.
+        let _ = self.0.unlock();
     }
 }
 
@@ -580,9 +567,10 @@ mod tests {
                 let d = d.clone();
                 std::thread::spawn(move || {
                     for i in 0..15 {
-                        update_in(&d, |st| {
+                        // A write that fails is reported, not lost: say which it was.
+                        assert!(update_in(&d, |st| {
                             st.session(&format!("s{t}-{i}")).last_seen = now();
-                        });
+                        }));
                     }
                 })
             })
@@ -593,6 +581,37 @@ mod tests {
         let st: State =
             serde_json::from_slice(&std::fs::read(d.join("state.json")).unwrap()).unwrap();
         assert_eq!(st.sessions.len(), 8 * 15);
+    }
+
+    /// A held lock is never taken over, however old its file looks. The lock file used
+    /// before counted as stale 30 s after its mtime (a clock jump ages a fresh one) and
+    /// was given up on after 5 s of waiting; either way two writers could overwrite each
+    /// other's records.
+    #[test]
+    fn a_held_lock_is_never_taken_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().to_path_buf();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(d.join("state.lock"))
+            .unwrap();
+        held.lock().unwrap();
+        held.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        let writer = {
+            let d = d.clone();
+            std::thread::spawn(move || update_in(&d, |st| st.last_pass_fp = Some("x".into())))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !d.join("state.json").exists(),
+            "written while the lock was held"
+        );
+        held.unlock().unwrap();
+        assert!(writer.join().unwrap());
+        assert_eq!(load_in(&d).last_pass_fp.as_deref(), Some("x"));
     }
 
     #[test]
