@@ -2073,6 +2073,32 @@ fn an_edited_skip_worktree_file_keeps_its_commit_unverified() {
     assert!(!ok, "the commit holds X = 1: {err}");
 }
 
+/// Convergence check: the same with a data file the build reads, which is not a build input.
+/// HEAD does not count while an edited hidden entry exists.
+#[test]
+fn an_edited_skip_worktree_data_file_keeps_head_unverified() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "data.txt", "1\n");
+    commit(d, "A", "data", T0 + 10);
+    let _remote = origin(d);
+    start(d, "startup");
+    git(d, &["update-index", "--skip-worktree", "data.txt"], T0 + 20);
+    write(d, "data.txt", "2\n");
+    write(
+        d,
+        "src/lib.rs",
+        &format!(
+            "{GOOD}\n#[test]\nfn x() {{\n    assert_eq!(include_str!(\"../data.txt\").trim(), \"2\");\n}}\n"
+        ),
+    );
+    git(d, &["add", "src/lib.rs"], T0 + 60);
+    commit_staged(d, "expects 2", T0 + 60);
+    assert!(stop(d, false).is_null(), "passes with the local copy");
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "the commit holds 1: {err}");
+}
+
 /// Review M3: the audit's window moves only after an audit. A compaction in between, or a
 /// turn the user interrupts (no Stop), does not lose a push.
 #[test]
@@ -2171,6 +2197,40 @@ fn a_push_while_background_agents_work_is_audited_at_the_prompt() {
     assert!(v.contains(&ours[..10]), "{v}");
 }
 
+/// Convergence check: switching the hook off in the verify table during the session is
+/// reported like removing it.
+#[test]
+fn switching_the_hook_off_is_reported() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    write(
+        d,
+        "Cargo.toml",
+        &format!("{CARGO_TOML}\n[package.metadata.fsmap.verify]\ngit-hook = false\n"),
+    );
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "off", T0 + 60);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let v = stop(d, false);
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(msg.contains("origin/main"), "{v}");
+    assert!(
+        msg.contains("git-hook = false"),
+        "the switch is reported: {v}"
+    );
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", &FAILING_TEST.replace("+ 1", "+ 2"));
+    commit(d, "Agent", "broken again", T0 + 90);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let again = rev(d, "HEAD");
+    let v = stop(d, false);
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(msg.contains(&again[..10]), "a later push is audited: {v}");
+    assert!(!msg.contains("git-hook = false"), "reported once: {v}");
+}
+
 /// Review M4: removing the hook does not also remove the audit; the removal is reported.
 #[test]
 fn removing_the_hook_does_not_hide_the_push() {
@@ -2190,6 +2250,203 @@ fn removing_the_hook_does_not_hide_the_push() {
         msg.contains("pre-push hook"),
         "the removal is reported: {v}"
     );
+    // The next turn: still audited, and the removal is not reported again.
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", &FAILING_TEST.replace("+ 1", "+ 2"));
+    commit(d, "Agent", "broken again", T0 + 90);
+    assert!(git_push(d, &["origin", "main"], &[]).0);
+    let again = rev(d, "HEAD");
+    let v = stop(d, false);
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(msg.contains(&again[..10]), "a later push is audited: {v}");
+    assert!(!msg.contains("pre-push hook stopped"), "reported once: {v}");
+}
+
+/// Convergence check (B1): a later push that publishes nothing new does not approve a commit
+/// an earlier, unverified push sent.
+#[test]
+fn a_later_push_of_the_same_commit_does_not_hide_an_unverified_one() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    let cloud = [("CLAUDE_CODE_REMOTE", "true")];
+    assert!(git_push(d, &["origin", "main"], &cloud).0);
+    let x = rev(d, "HEAD");
+    assert!(git_push(d, &["origin", "HEAD:refs/heads/backup"], &cloud).0);
+    let v = stop(d, false);
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&x[..10]),
+        "{v}"
+    );
+}
+
+/// Convergence check: a push made after the gate let go (three strikes), in a continuation
+/// another Stop hook forced, is audited.
+#[test]
+fn a_push_after_the_gate_let_go_is_audited() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", FAILING_TEST);
+    assert!(blocked(&stop(d, false)));
+    assert!(blocked(&stop(d, true)));
+    assert!(!blocked(&stop(d, true)), "the third failure lets go");
+    commit(d, "Agent", "broken", T0 + 60);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let x = rev(d, "HEAD");
+    let v = stop(d, true);
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&x[..10]),
+        "{v}"
+    );
+}
+
+/// Convergence check: resuming a session whose last turn was interrupted does not report
+/// the person's own pushes made in between.
+#[test]
+fn a_resumed_session_does_not_report_a_persons_pushes() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    // Interrupted: no Stop; then the person works and pushes, and later resumes.
+    write(d, "notes.md", "theirs\n");
+    commit(d, "Person", "theirs", T0 + 60);
+    let ok = Command::new("git")
+        .args(["push", "-q", "origin", "main"])
+        .current_dir(d)
+        .env_remove("CLAUDECODE")
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    start(d, "resume");
+    let v = hook(d, "prompt", &json!({"session_id": "s1"}));
+    assert!(!v.to_string().contains("did not verify"), "{v}");
+}
+
+/// Convergence check: a branch without the Cargo workspace (`gh-pages`) is not the gate's
+/// business, pushed from the Rust checkout or from a checkout of its own; it is neither
+/// refused nor reported.
+#[test]
+fn a_branch_without_the_workspace_is_neither_refused_nor_reported() {
+    // An orphan branch with a page, made in the checkout, then left.
+    let orphan = |top: &Path, at: i64| {
+        git(top, &["checkout", "-q", "--orphan", "pages"], at);
+        git(top, &["rm", "-rqf", "."], at);
+        write(top, "index.html", "<p>hi</p>\n");
+        // Only the page: nothing of the workspace's directory, not even the hooks' state.
+        git(top, &["add", "index.html"], at);
+        commit_staged(top, "pages", at);
+        git(top, &["checkout", "-q", "-f", "main"], at);
+    };
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    orphan(d, T0 + 70);
+    let (ok, err) = git_push(d, &["origin", "pages:refs/heads/gh-pages"], &[]);
+    assert!(ok, "from the Rust checkout: {err}");
+    let site = tempfile::tempdir().unwrap();
+    let site = site.path().join("site");
+    git(
+        d,
+        &["worktree", "add", "-q", &site.to_string_lossy(), "pages"],
+        T0 + 80,
+    );
+    write(&site, "index.html", "<p>hello</p>\n");
+    commit(&site, "Agent", "page", T0 + 90);
+    let (ok, err) = git_push(&site, &["origin", "HEAD:refs/heads/gh-pages"], &[]);
+    assert!(ok, "from its own checkout: {err}");
+    let v = stop(d, false);
+    assert!(
+        !v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not verify"),
+        "{v}"
+    );
+
+    // A workspace below the top, and a checkout without its directory.
+    let repo = tempfile::tempdir().unwrap();
+    let top = repo.path();
+    init(top);
+    let w = top.join("backend");
+    write(&w, "Cargo.toml", CARGO_TOML);
+    write(&w, ".gitignore", IGNORE);
+    write(&w, "src/lib.rs", GOOD);
+    lockfile(&w);
+    commit(top, "A", "init", T0);
+    let _remote = origin(top);
+    start(&w, "startup");
+    orphan(top, T0 + 70);
+    let site = tempfile::tempdir().unwrap();
+    let site = site.path().join("site");
+    git(
+        top,
+        &["worktree", "add", "-q", &site.to_string_lossy(), "pages"],
+        T0 + 80,
+    );
+    let (ok, err) = git_push(&site, &["origin", "pages"], &[]);
+    assert!(ok, "no backend directory here: {err}");
+}
+
+/// Convergence check: an uncommitted change inside a submodule is in the gate's build but
+/// not in the commit, so HEAD does not count.
+#[test]
+fn an_uncommitted_change_in_a_submodule_keeps_head_unverified() {
+    let repo = fixture();
+    let d = repo.path();
+    let sub = tempfile::tempdir().unwrap();
+    init(sub.path());
+    write(sub.path(), "x.txt", "1\n");
+    commit(sub.path(), "A", "sub", T0);
+    git(
+        d,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &sub.path().to_string_lossy(),
+            "vendor/sub",
+        ],
+        T0 + 10,
+    );
+    commit(d, "A", "add submodule", T0 + 10);
+    let _remote = origin(d);
+    start(d, "startup");
+    write(d, "vendor/sub/x.txt", "2\n");
+    write(
+        d,
+        "src/lib.rs",
+        &format!(
+            "{GOOD}\n#[test]\nfn x() {{\n    assert_eq!(include_str!(\"../vendor/sub/x.txt\").trim(), \"2\");\n}}\n"
+        ),
+    );
+    git(d, &["add", "src/lib.rs"], T0 + 60);
+    commit_staged(d, "expects 2", T0 + 60);
+    assert!(
+        stop(d, false).is_null(),
+        "passes with the submodule's local copy"
+    );
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "the submodule's commit holds 1: {err}");
 }
 
 /// Review m1: an existing commit pushed to a new branch publishes nothing; it is not a push
@@ -2230,6 +2487,9 @@ fn a_push_from_a_checkout_without_the_workspace_is_checked() {
     let (ok, err) = git_push(d, &["origin", "main"], &[]);
     assert!(!ok, "{err}");
     assert_eq!(rev(remote.path(), "main"), before);
+    // A commit the remote already has publishes nothing new, from here too.
+    let (ok, err) = git_push(d, &["origin", &format!("{before}:refs/heads/copy")], &[]);
+    assert!(ok, "{err}");
 }
 
 /// Review m5: a verdict reached in one worktree holds in another, also with configuration

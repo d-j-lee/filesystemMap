@@ -276,6 +276,11 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
         if source == "startup" && s.start_fp.is_none() {
             s.start_fp.clone_from(&fp);
         }
+        // A resumed session's last turn ended with its process; pushes since are most likely
+        // the person's, possibly days of them (convergence check).
+        if source == "resume" {
+            s.in_turn = false;
+        }
         // Which files the session changed is judged from here; recorded the first time the
         // session is seen, whatever the source (final review M1).
         if s.start_head.is_none() {
@@ -321,7 +326,7 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
     match installed {
         Ok(Shim::Ours) => out.context.push(match githook::Mode::current() {
             githook::Mode::Enforce => "[harness] a git pre-push hook checks your pushes: git \
-                refuses one unless the gate passed on the files of every commit it sends. Do \
+                refuses one unless the gate passed on the files of the commit each branch ends at. Do \
                 not get around it (--no-verify, core.hooksPath, changing CLAUDECODE)."
                 .to_string(),
             githook::Mode::Report => "[harness] a git pre-push hook records your pushes; one \
@@ -776,6 +781,17 @@ fn stop(project: &Path, input: &Value) -> Result<Out> {
     };
     let snapshot = state::load(&ws);
     let me = snapshot.sessions.get(&sid).cloned().unwrap_or_default();
+    // Every Stop audits, whether or not the gate runs: also one in a continuation another
+    // Stop hook forced after this one let go (convergence check).
+    if let Some(text) = push_audit(&ws, &cfg, &sid, &me, true).text() {
+        out.system.push(text.clone());
+        state::update(&ws, |st| {
+            st.session(&sid).pending_context.push(format!(
+                "{text}\nTell the user whether these need attention. Do not push around the \
+                 check."
+            ));
+        });
+    }
     if active && me.released {
         touch(&ws, &sid, now);
         return Ok(out);
@@ -806,17 +822,6 @@ fn stop(project: &Path, input: &Value) -> Result<Out> {
     }
     if !snapshot.pending_notes.is_empty() {
         state::update(&ws, |st| out.system.append(&mut st.pending_notes));
-    }
-    let unchecked = push_audit(&ws, &cfg, &sid, &me);
-    if !unchecked.is_empty() {
-        let text = audit_text(&unchecked);
-        out.system.push(text.clone());
-        state::update(&ws, |st| {
-            st.session(&sid).pending_context.push(format!(
-                "{text}\nTell the user whether these need attention. Do not push around the \
-                 check."
-            ));
-        });
     }
     let started = std::time::Instant::now();
     let verdict = gate(&ws, &cfg, &snapshot, &me, false)?;
@@ -1051,8 +1056,8 @@ fn pre_bash(project: &Path, input: &Value) -> Result<Out> {
             state::update(&ws, |st| record_fail(st, fp, &reason, untouched_only));
             if hook_decides {
                 out.context.push(format!(
-                    "[harness] the gate fails on this tree, so the git pre-push hook will \
-                     refuse a push of it:\n\n{reason}"
+                    "[harness] the gate fails on this tree, so the git pre-push hook \
+                     refuses a push of it that the remote does not already have:\n\n{reason}"
                 ));
             } else {
                 out = deny(reason);
@@ -1104,7 +1109,8 @@ pub fn git_pre_push(workspace: &str, remote: &str, stdin: &str) -> (bool, String
     }
 }
 
-/// The problems with a push; none when every commit it publishes is verified.
+/// The problems with a push; none when the commit each updated ref ends at is verified
+/// (commits between a ref's old and new position are not checked one by one).
 fn check_push(
     workspace_rel: &str,
     remote: &str,
@@ -1113,70 +1119,80 @@ fn check_push(
 ) -> Result<Vec<String>> {
     let updates = githook::parse_updates(stdin)?;
     let top = std::env::current_dir().context("the pushing work tree")?;
-    let project = dunce::canonicalize(top.join(workspace_rel))
-        .with_context(|| format!("the gated workspace {workspace_rel}"))?;
-    let (ws, cfg) = match workspace(&project) {
-        Ws::Ready(ws, cfg) => (ws, cfg),
-        // No workspace in this checkout (an orphan `gh-pages`): a pushed commit that has one
-        // was not checked here (review m3).
-        Ws::NotRust => {
-            let manifest = match workspace_rel.trim_matches('/') {
-                "" | "." => "Cargo.toml".to_string(),
-                rel => format!("{rel}/Cargo.toml"),
-            };
-            return Ok(updates
-                .iter()
-                .filter(|u| !u.local.is_zero())
-                .filter(|u| githook::commit_has(&top, &u.local, &manifest))
-                .map(|u| {
-                    format!(
-                        "{} ({}): this checkout has no Cargo workspace at {workspace_rel}, so \
-                         the gate cannot have checked it; push it from a checkout that has",
-                        u.remote_ref,
-                        u.local.short()
-                    )
-                })
-                .collect());
-        }
-        Ws::Broken(e) => return Ok(vec![broken_message(&e)]),
+    let manifest = match workspace_rel.trim_matches('/') {
+        "" | "." => "Cargo.toml".to_string(),
+        rel => format!("{rel}/Cargo.toml"),
     };
-    let pushes = state::load_pushes(&ws);
+    // A checkout without the workspace (an orphan `gh-pages`, the workspace's directory
+    // absent or empty) cannot have a verdict for a commit that has one (review m3).
+    let gated = match dunce::canonicalize(top.join(workspace_rel)).map(|p| workspace(&p)) {
+        Ok(Ws::Ready(ws, cfg)) => Some((ws, cfg)),
+        Ok(Ws::Broken(e)) => return Ok(vec![broken_message(&e)]),
+        Ok(Ws::NotRust) | Err(_) => None,
+    };
+    let store = gated.as_ref().map_or(top, |(ws, _)| ws.clone());
+    let pushes = state::load_pushes(&store);
+    let head = gated.as_ref().and_then(|(ws, _)| state::head(ws));
     let context = std::cell::OnceCell::new();
-    let head = state::head(&ws);
     let head_ok = std::cell::OnceCell::new();
     let mut verified = Vec::new();
+    let mut known = Vec::new();
     let mut problems = Vec::new();
     for u in updates.iter().filter(|u| !u.local.is_zero()) {
-        let Some(commit) = githook::commit_of(&ws, &u.local) else {
+        let Some(commit) = githook::commit_of(&store, &u.local) else {
             problems.push((
                 u.local.clone(),
                 format!("{} ({}) is not a commit", u.remote_ref, u.local.short()),
             ));
             continue;
         };
-        if githook::publishes_nothing_new(&ws, &commit, remote) {
-            // Approved too, or the audit would take a new branch at a known commit for a
-            // push around the hook (review m1).
+        // A commit without the workspace (a `gh-pages` branch) is not the gate's business.
+        if !githook::commit_has(&store, &commit, &manifest) {
             verified.push(commit);
             continue;
         }
-        let key = githook::tree_of(&ws, &commit).map(|t| {
+        if githook::publishes_nothing_new(&store, &commit, remote) {
+            // This update only: approving the commit would also clear an earlier push of it
+            // that no hook saw (convergence check B1).
+            if let Some(branch) = u.remote_ref.strip_prefix("refs/heads/") {
+                known.push(format!(
+                    "refs/remotes/{remote}/{branch} {}",
+                    commit.as_str()
+                ));
+            }
+            continue;
+        }
+        let Some((ws, cfg)) = &gated else {
+            problems.push((
+                commit.clone(),
+                format!(
+                    "{} ({}): this checkout has no Cargo workspace at {workspace_rel}, so the \
+                     gate cannot have checked it; push it from a checkout that has",
+                    u.remote_ref,
+                    commit.short()
+                ),
+            ));
+            continue;
+        };
+        let key = githook::tree_of(ws, &commit).map(|t| {
             format!(
                 "{t} {}",
-                context.get_or_init(|| state::context_digest(&ws, &cfg.trust))
+                context.get_or_init(|| state::context_digest(ws, &cfg.trust))
             )
         });
         let tree_verified = key.is_some_and(|k| pushes.verified.contains(&k));
         // Where no tree was recorded: HEAD of a work tree whose fingerprint passed, with no
         // tracked change left out of the commit (a data file `include_str!` reads is not a
-        // build input; review M1) and no build input uncommitted.
+        // build input; review M1), inside submodules and in entries hidden from `git status`
+        // by `--skip-worktree` or assume-unchanged too, and no build input uncommitted.
         let head_verified = || {
             head.as_deref() == Some(commit.as_str())
                 && *head_ok.get_or_init(|| {
-                    tracked_clean(&ws)
-                        && uncommitted_inputs(&ws).is_ok_and(|p| p.is_empty())
-                        && state::fingerprint(&ws, &cfg.trust).is_some_and(|fp| {
-                            state::load(&ws).last_pass_fp.as_deref() == Some(fp.as_str())
+                    tracked_clean(ws)
+                        && state::hidden_index_entries(ws).is_empty()
+                        && uncommitted_inputs(ws).is_ok_and(|p| p.is_empty())
+                        && state::fingerprint(ws, &cfg.trust).is_some_and(|fp| {
+                            state::load(ws).last_pass_fp.as_deref() == Some(fp.as_str())
                         })
                 })
         };
@@ -1194,9 +1210,12 @@ fn check_push(
             ));
         }
     }
-    state::update_pushes(&ws, |p| {
+    state::update_pushes(&store, |p| {
         for c in &verified {
             state::remember(&mut p.approved, c.as_str().to_string());
+        }
+        for k in &known {
+            state::remember(&mut p.known, k.clone());
         }
         if mode == githook::Mode::Report {
             for (c, why) in &problems {
@@ -1205,7 +1224,7 @@ fn check_push(
         }
     });
     state::log(
-        &ws,
+        &store,
         &json!({"t": state::now(), "event": "git-pre-push", "updates": updates.len(),
                 "unverified": problems.len(),
                 "mode": if mode == githook::Mode::Enforce { "enforce" } else { "report" }}),
@@ -1213,31 +1232,72 @@ fn check_push(
     Ok(problems.into_iter().map(|(_, why)| why).collect())
 }
 
-/// Whether the work tree has no change to a tracked file (submodules included).
+/// Whether the work tree has no change to a tracked file, inside submodules too
+/// (`git_worktree` sets `diff.ignoreSubmodules=dirty`; the flag overrides it).
 fn tracked_clean(ws: &Path) -> bool {
     crate::git::run({
         let mut c = crate::git::git_worktree(ws);
-        c.args(["status", "--porcelain=v2", "-z", "--untracked-files=no"]);
+        c.args([
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=no",
+            "--ignore-submodules=none",
+        ]);
         c
     })
     .is_ok_and(|out| out.is_empty())
 }
 
+/// What a push audit found: pushes no pre-push run verified, and a change to the hook.
+#[derive(Default)]
+struct Audit {
+    pushes: Vec<String>,
+    hook: Option<String>,
+}
+
+impl Audit {
+    fn text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.pushes.is_empty() {
+            parts.push(format!(
+                "[harness] pushes the gate did not verify:\n{}",
+                self.pushes.join("\n")
+            ));
+        }
+        if let Some(why) = &self.hook {
+            parts.push(format!(
+                "[harness] the git pre-push hook stopped working during the session: {why}"
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+}
+
 /// Pushes since the last audit that no pre-push run verified (D-16): pushed with
 /// `--no-verify` or a hooksPath override, from outside Claude Code, or let through in report
 /// mode, read from the reflogs of the remote-tracking refs that moved, each reported once.
-/// Whether to look is decided by the hook's state when the window opened, so removing the
-/// hook does not also remove the audit (review M4); its removal is reported. Then the window
-/// moves to now: only an audit moves it (review M3).
-fn push_audit(ws: &Path, cfg: &Config, sid: &str, me: &state::Session) -> Vec<String> {
+/// `look` is false where the window holds a person's pushes (between turns): it then only
+/// moves. Once the hook has been in place, the session stays audited, so removing,
+/// changing or switching off the hook hides nothing (review M4); the change is reported
+/// once. Then the window moves to now.
+fn push_audit(ws: &Path, cfg: &Config, sid: &str, me: &state::Session, look: bool) -> Audit {
     let refs = githook::remote_refs(ws);
     let shim = githook::shim_state(ws, cfg);
-    let mut lines = Vec::new();
-    if me.refs_at > 0 && me.audit {
+    let off = match &shim {
+        Shim::OptedOut => Some("it was switched off (git-hook = false)".to_string()),
+        other => other.off_reason(),
+    };
+    let look = look && me.refs_at > 0 && me.audit;
+    let mut audit = Audit::default();
+    if look {
         let pushes = state::load_pushes(ws);
         let mut found: Vec<(String, String, String)> = Vec::new();
         for (name, oid) in githook::pushed_since(ws, &me.remote_refs, &refs) {
-            if pushes.approved.contains(&oid) || pushes.reported.contains(&oid) {
+            if pushes.approved.contains(&oid)
+                || pushes.reported.contains(&oid)
+                || pushes.known.contains(&format!("{name} {oid}"))
+            {
                 continue;
             }
             let why = pushes
@@ -1261,32 +1321,29 @@ fn push_audit(ws: &Path, cfg: &Config, sid: &str, me: &state::Session) -> Vec<St
                 }
             });
         }
-        lines.extend(found.into_iter().map(|(name, oid, why)| {
-            let short = name.strip_prefix("refs/remotes/").unwrap_or(&name);
-            format!("  {short} → {}: {why}", &oid[..oid.len().min(10)])
-        }));
-        if let Some(why) = shim.off_reason() {
-            lines.push(format!(
-                "  the git pre-push hook stopped working during the session: {why}"
-            ));
+        audit.pushes = found
+            .into_iter()
+            .map(|(name, oid, why)| {
+                let short = name.strip_prefix("refs/remotes/").unwrap_or(&name);
+                format!("  {short} → {}: {why}", &oid[..oid.len().min(10)])
+            })
+            .collect();
+        if off.is_some() && off != me.hook_off {
+            audit.hook.clone_from(&off);
         }
     }
     let at = state::now();
-    let audit = shim == Shim::Ours;
+    let ours = shim == Shim::Ours;
     state::update(ws, |st| {
         let s = st.session(sid);
         s.remote_refs = refs;
         s.refs_at = at;
-        s.audit = audit;
+        s.audit = me.audit || ours;
+        if look || off.is_none() {
+            s.hook_off = off;
+        }
     });
-    lines
-}
-
-fn audit_text(lines: &[String]) -> String {
-    format!(
-        "[harness] pushes the gate did not verify:\n{}",
-        lines.join("\n")
-    )
+    audit
 }
 
 fn prompt(project: &Path, input: &Value) -> Result<Out> {
@@ -1304,13 +1361,7 @@ fn prompt(project: &Path, input: &Value) -> Result<Out> {
         .get(&sid)
         .cloned()
         .unwrap_or_default();
-    let look = state::Session {
-        audit: me.audit && me.in_turn,
-        ..me
-    };
-    let unchecked = push_audit(&ws, &cfg, &sid, &look);
-    if !unchecked.is_empty() {
-        let text = audit_text(&unchecked);
+    if let Some(text) = push_audit(&ws, &cfg, &sid, &me, me.in_turn).text() {
         out.system.push(text.clone());
         out.context.push(format!(
             "{text}\nTell the user whether these need attention. Do not push around the check."

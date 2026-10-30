@@ -97,21 +97,24 @@ fn bypass_in(words: &[String], pushes: bool, depth: usize) -> Option<&'static st
     };
     let before = &words[..i];
     // Whether this simple command itself publishes: what an environment change in front of
-    // it (assignments, `env`, `sudo`, `exec -c`) applies to.
-    let this_pushes = i < words.len() && simple_publishes(&words[i..], &words.join(" "), depth);
+    // it (assignments, `env`, `sudo`, `exec -c`) applies to. A shell reading its script from
+    // stdin or a heredoc, `eval` or `source` runs what its words do not show, so there the
+    // whole command line decides.
+    let opaque = i < words.len()
+        && matches!(
+            program(&words[i]),
+            "sh" | "bash" | "zsh" | "dash" | "ksh" | "eval" | "source" | "."
+        );
+    let this_pushes = i < words.len()
+        && (simple_publishes(&words[i..], &words.join(" "), depth) || (pushes && opaque));
     if this_pushes {
         for (k, w) in before.iter().enumerate() {
-            if let Some((name, value)) = w.split_once('=').filter(|_| is_assignment(w)) {
-                if name == "CLAUDECODE" && value != "1" {
-                    return Some(CLAUDECODE);
-                }
-                if name == "GIT_CONFIG_GLOBAL"
-                    || name == "GIT_CONFIG_SYSTEM"
-                    || (name.starts_with("GIT_CONFIG")
-                        && value.to_ascii_lowercase().contains("hookspath"))
-                {
-                    return Some(HOOKS_PATH);
-                }
+            if let Some(why) = w
+                .split_once('=')
+                .filter(|_| is_assignment(w))
+                .and_then(|(name, value)| assignment_bypass(name, value))
+            {
+                return Some(why);
             }
             let wrapper = |name: &str| {
                 before[..k]
@@ -125,17 +128,20 @@ fn bypass_in(words: &[String], pushes: bool, depth: usize) -> Option<&'static st
             if unset_next
                 || w == "-uCLAUDECODE"
                 || w == "--unset=CLAUDECODE"
-                || (matches!(w.as_str(), "-i" | "-" | "--ignore-environment") && wrapper("env"))
+                || (clears_env(w) && wrapper("env"))
                 || (w == "-c" && wrapper("exec"))
             {
                 return Some(CLAUDECODE);
             }
         }
-        // sudo resets the environment unless told to keep it.
+        // sudo resets the environment unless told to keep it, or `CLAUDECODE` in a list.
         if let Some(at) = before.iter().position(|w| program(w) == "sudo") {
-            let keeps = before[at + 1..]
-                .iter()
-                .any(|w| w == "-E" || w.starts_with("--preserve-env"));
+            let keeps = before[at + 1..].iter().any(|w| {
+                w == "-E"
+                    || w == "--preserve-env"
+                    || w.strip_prefix("--preserve-env=")
+                        .is_some_and(|list| list.split(',').any(|v| v == "CLAUDECODE"))
+            });
             if !keeps {
                 return Some(CLAUDECODE);
             }
@@ -145,16 +151,13 @@ fn bypass_in(words: &[String], pushes: bool, depth: usize) -> Option<&'static st
     let rest = &words[i + 1..];
     match program(prog) {
         "unset" if pushes && rest.iter().any(|w| w == "CLAUDECODE") => Some(CLAUDECODE),
-        "export"
-            if pushes
-                && (rest
-                    .iter()
-                    .any(|w| w.strip_prefix("CLAUDECODE=").is_some_and(|v| v != "1"))
-                    || (rest.iter().any(|w| w == "-n")
-                        && rest.iter().any(|w| w == "CLAUDECODE"))) =>
-        {
-            Some(CLAUDECODE)
-        }
+        "export" if pushes => rest
+            .iter()
+            .find_map(|w| w.split_once('=').and_then(|(n, v)| assignment_bypass(n, v)))
+            .or_else(|| {
+                (rest.iter().any(|w| w == "-n") && rest.iter().any(|w| w == "CLAUDECODE"))
+                    .then_some(CLAUDECODE)
+            }),
         "sh" | "bash" | "zsh" | "dash" | "ksh" => {
             let at = rest
                 .iter()
@@ -168,6 +171,41 @@ fn bypass_in(words: &[String], pushes: bool, depth: usize) -> Option<&'static st
         "eval" => bypass_at(&rest.join(" "), pushes, depth + 1),
         "git" => git_bypass(rest),
         _ => None,
+    }
+}
+
+/// What a variable set for a push does to the git pre-push check, if anything.
+fn assignment_bypass(name: &str, value: &str) -> Option<&'static str> {
+    // `NAME+=value` appends to what the variable holds.
+    let (name, appends) = name.strip_suffix('+').map_or((name, false), |n| (n, true));
+    if name == "CLAUDECODE" {
+        let changed = if appends {
+            !value.is_empty()
+        } else {
+            value != "1"
+        };
+        return changed.then_some(CLAUDECODE);
+    }
+    (name == "GIT_CONFIG_GLOBAL"
+        || name == "GIT_CONFIG_SYSTEM"
+        || (name.starts_with("GIT_CONFIG") && value.to_ascii_lowercase().contains("hookspath")))
+    .then_some(HOOKS_PATH)
+}
+
+/// `env -i` in any spelling, also in a cluster of short options (`-iv`).
+fn clears_env(w: &str) -> bool {
+    match w {
+        "-" | "--ignore-environment" => true,
+        _ => w
+            .strip_prefix('-')
+            .filter(|flags| !flags.starts_with('-'))
+            .is_some_and(|flags| {
+                // Up to the first option that takes a value (`-u NAME`, `-S`, `-C`, `-P`).
+                flags
+                    .chars()
+                    .take_while(|c| !matches!(c, 'u' | 'S' | 'C' | 'P'))
+                    .any(|c| c == 'i')
+            }),
     }
 }
 
@@ -211,7 +249,11 @@ fn git_bypass(rest: &[String]) -> Option<&'static str> {
     };
     if let Some((_, value)) = aliases.iter().find(|(name, _)| name == sub) {
         let lower = value.to_ascii_lowercase();
-        let words: Vec<&str> = lower.split_whitespace().collect();
+        // The alias's own words and the arguments given to it.
+        let words: Vec<&str> = lower
+            .split_whitespace()
+            .chain(args.iter().map(String::as_str))
+            .collect();
         return if no_verify(&words) {
             Some(NO_VERIFY)
         } else if lower.contains("hookspath") || (hooks_path && lower.contains("push")) {
@@ -737,6 +779,8 @@ fn program(word: &str) -> &str {
 
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
+        // `NAME+=value` appends.
+        let name = name.strip_suffix('+').unwrap_or(name);
         !name.is_empty() && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
     })
 }
@@ -1056,6 +1100,15 @@ mod tests {
             "GIT_CONFIG_GLOBAL=/tmp/g git push",
             "git -c alias.p='push --no-verify' p",
             "git config set core.hooksPath x",
+            // Convergence check: exported for the push, and sudo keeping only other variables.
+            "export GIT_CONFIG_GLOBAL=/tmp/g; git push origin main",
+            "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/x; git push",
+            "sudo --preserve-env=PATH git push origin main",
+            "echo 'git push origin main' | CLAUDECODE= sh",
+            "CLAUDECODE= bash <<'X'\ngit push origin main\nX",
+            "git -c alias.p=push p --no-verify origin main",
+            "env -iv git push origin main",
+            "CLAUDECODE+=x git push origin main",
         ] {
             assert!(hook_bypass(cmd).is_some(), "{cmd}");
         }
@@ -1080,6 +1133,12 @@ mod tests {
             "git -c core.hooksPath=x commit -m y",
             "sudo apt-get install -y jq",
             "sudo -E git push",
+            "sudo --preserve-env git push",
+            "sudo --preserve-env=PATH,CLAUDECODE git push",
+            "export GIT_CONFIG_GLOBAL=/tmp/g; cargo build",
+            "CLAUDECODE= bash ./build.sh",
+            "env -uFILE_i git push",
+            "CLAUDECODE+= git push",
             "unset CLAUDECODE; cargo build",
             "CLAUDECODE= cargo test",
         ] {

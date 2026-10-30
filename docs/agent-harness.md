@@ -39,10 +39,10 @@ is the gate of record.
 |---|---|---|---|
 | Session starts | `SessionStart` → `fsmap hook session-start` | Records the baseline (only on `startup`, never on resume or compact). Tells Claude the real `rustc`/`cargo` versions and where each direct dependency's source is, and warns about settings that weaken the gate and about other sessions in the same worktree. Installs the git pre-push hook (see [Pushes](#pushes)). Warms the brief index. | 0.4 s |
 | After each `Edit`/`Write` | `PostToolUse` → `fsmap hook post-edit` | For `.rs`, `Cargo.toml` and `build.rs`: `cargo check --all-targets --offline` on the edited package. Errors go back to Claude as a block reason (first 20, de-duplicated); the fsmap brief for notable files goes along as context. One check at a time per worktree: a later edit waits up to 30 s for the running one, then checks the tree as it is. 60 s budget. | 1.1 s median |
-| Claude ends a turn | `Stop` → `fsmap hook stop` | If the tree changed since the session started or last passed, runs the gate in quick mode. The gate passes only when every step passes. A failure blocks the stop with the failing steps' output, marking which files the session changed. After three blocked stops in a row it lets go and asks Claude to report; when every failure is in files the session did not change, it lets go after one block instead, telling the user the gate did **not** pass. A pass shows the user any added suppressions, ignored tests, removed assertions, and changed lint, format, cargo or toolchain configuration; those already pending when the session started are listed apart. While background agents (subagents, workflows) are still working, it waits for the real end of the turn. Also reports pushes the gate did not verify since the last audit (see [Pushes](#pushes)). | 63 s |
+| Claude ends a turn | `Stop` → `fsmap hook stop` | If the tree changed since the session started or last passed, runs the gate in quick mode. The gate passes only when every step passes. A failure blocks the stop with the failing steps' output, marking which files the session changed. After three blocked stops in a row it lets go and asks Claude to report; when every failure is in files the session did not change, it lets go after one block instead, telling the user the gate did **not** pass. A pass shows the user any added suppressions, ignored tests, removed assertions, and changed lint, format, cargo or toolchain configuration; those already pending when the session started are listed apart. While background agents (subagents, workflows) are still working, it waits for the real end of the turn. Also reports pushes the gate did not verify since the last audit (see [Pushes](#pushes)). | 68 s |
 | The user writes | `UserPromptSubmit` → `fsmap hook prompt` | Resets the failure streak. Runs the push audit when the last turn ended without a Stop (the user interrupted it); after a turn that ended, only moves the audit's starting point, since pushes between turns are a person's. Passes on to Claude what the last audit found. | ms |
-| Before `git push`, `gh pr create` | `PreToolUse` (Bash) → `fsmap hook pre-bash` | Refuses commands that would get around the git hook while that hook is installed: `--no-verify` and abbreviations of it (also in a `git -c alias.…`), setting `core.hooksPath` (`-c`, `--config-env`, `GIT_CONFIG_*`, `git config`; reading it is fine), swapping git's global or system configuration (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`), and pushing without `CLAUDECODE=1` (unset or changed, `env -i`, `exec -c`, `sudo` without `-E`). A change to the environment counts only in front of a command that pushes, `unset` and `export` only in a command that pushes. Where the git hook enforces, a push only runs the gate here, so that git's hook finds a verdict; the push itself is git's hook's to refuse, and `gh pr create` is still decided here. Elsewhere (a cloud session, or no git hook): denies the command while build inputs are uncommitted (the gate checks the working tree; a push sends HEAD): manifests, `Cargo.lock`, cargo, rustfmt, clippy and toolchain configuration, every file a cargo configuration `include`s, every change to a tracked `.rs` file (renames, deletions and edits to `--skip-worktree` files included; an unchanged one, or one a sparse checkout leaves out, does not count), and untracked `.rs` files in a directory a target reads (a scratch file elsewhere does not count). Otherwise runs the quick gate unless this exact tree already passed, and denies on failure, when the gate cannot run, or when the hook itself fails. Commands are read with their quoting (`$'…'` too), comments, command substitutions (inside double quotes too), heredocs inside them (Claude Code's own `git commit -m "$(cat <<'EOF' … EOF)"`; a heredoc whose output a shell or `eval` runs, also behind wrappers (`timeout 60 bash`, `sudo -u x sh`) or through a pipe or process substitution, is a script), delimiter words (`<<'END-MSG'`, `<<\EOF`), arithmetic (`$(( … ))`, `(( … ))`), reserved words, wrappers and their options (`env -u`, `sudo -u`, `timeout -k` …), `sh -c`/`eval`/`env -S` scripts, here-strings, git's and gh's global options, `git -c alias.x=…` and `git subtree`. When the reading is unsure (a quote or substitution left open, nesting past 16 levels, a shell reading its script from stdin), mentioning a push is enough; a heredoc that never ends is not taken as data. Not publishing: heredoc bodies fed to other programs, `--dry-run`, `--help`, pushes that only delete remote refs, and `gh pr merge` (it merges what was already pushed). | 5 ms for other commands |
-| A push from Claude Code | git's `pre-push` → the shim → `fsmap hook git-pre-push` | See [Pushes](#pushes). | 55–96 ms when the push publishes nothing new, 112–180 ms otherwise |
+| Before `git push`, `gh pr create` | `PreToolUse` (Bash) → `fsmap hook pre-bash` | Refuses commands that would get around the git hook while that hook is installed: `--no-verify` and abbreviations of it (also in a `git -c alias.…` or after its name), setting `core.hooksPath` (`-c`, `--config-env`, `GIT_CONFIG_*`, `git config`; reading it is fine), swapping git's global or system configuration (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`), and pushing without `CLAUDECODE=1` (unset or changed, `env -i`, `exec -c`, `sudo` unless it keeps `CLAUDECODE`). A change to the environment counts only in front of a command that pushes, or in front of a shell reading its script from stdin or a heredoc, `eval` or `source` in a command line that pushes; `unset` and `export` count only in a command that pushes. Where the git hook enforces, a push only runs the gate here, so that git's hook finds a verdict; the push itself is git's hook's to refuse, and `gh pr create` is still decided here. Elsewhere (a cloud session, or no git hook): denies the command while build inputs are uncommitted (the gate checks the working tree; a push sends HEAD): manifests, `Cargo.lock`, cargo, rustfmt, clippy and toolchain configuration, every file a cargo configuration `include`s, every change to a tracked `.rs` file (renames, deletions and edits to `--skip-worktree` files included; an unchanged one, or one a sparse checkout leaves out, does not count), and untracked `.rs` files in a directory a target reads (a scratch file elsewhere does not count). Otherwise runs the quick gate unless this exact tree already passed, and denies on failure, when the gate cannot run, or when the hook itself fails. Commands are read with their quoting (`$'…'` too), comments, command substitutions (inside double quotes too), heredocs inside them (Claude Code's own `git commit -m "$(cat <<'EOF' … EOF)"`; a heredoc whose output a shell or `eval` runs, also behind wrappers (`timeout 60 bash`, `sudo -u x sh`) or through a pipe or process substitution, is a script), delimiter words (`<<'END-MSG'`, `<<\EOF`), arithmetic (`$(( … ))`, `(( … ))`), reserved words, wrappers and their options (`env -u`, `sudo -u`, `timeout -k` …), `sh -c`/`eval`/`env -S` scripts, here-strings, git's and gh's global options, `git -c alias.x=…` and `git subtree`. When the reading is unsure (a quote or substitution left open, nesting past 16 levels, a shell reading its script from stdin), mentioning a push is enough; a heredoc that never ends is not taken as data. Not publishing: heredoc bodies fed to other programs, `--dry-run`, `--help`, pushes that only delete remote refs, and `gh pr merge` (it merges what was already pushed). | 5 ms for other commands |
+| A push from Claude Code | git's `pre-push` → the shim → `fsmap hook git-pre-push` | See [Pushes](#pushes). | 62–86 ms when the push publishes nothing new, 117–170 ms otherwise |
 
 When cargo cannot read the project (a broken manifest, a malformed verify table, an unsafe
 toolchain setting), the gate cannot run: the stop is blocked and a push denied with the reason,
@@ -66,11 +66,14 @@ shim in the repository's common hooks directory hands each push made from Claude
   needs no second run, and committing part of it does. Where a tree does not say what the gate
   saw (submodules, git-ignored files cargo compiles, `--skip-worktree` and assume-unchanged
   entries, which `git add` passes over), HEAD of a work tree whose fingerprint passed counts
-  instead, as long as no change to a tracked file is left out of the commit and no build input
-  is uncommitted. An update that publishes no commit the remote's tracking refs lack (a tag on a
-  pushed commit, `--follow-tags`, a new branch at a pushed commit) and a deletion need nothing.
-  Input or a project the hook cannot read is unverified, and so is a commit with a Cargo
-  workspace pushed from a checkout that has none (an orphan `gh-pages`).
+  instead, as long as no change to a tracked file is left out of the commit (inside submodules,
+  and in entries `git status` hides because of `--skip-worktree` or assume-unchanged, too) and no
+  build input is uncommitted. An update that publishes no commit the remote's tracking refs lack
+  (a tag on a pushed commit, `--follow-tags`, a new branch at a pushed commit) and a deletion
+  need nothing; such an update vouches for itself only, never for an earlier push of the same
+  commit. A commit without the workspace's `Cargo.toml` (a `gh-pages` branch) is not the gate's
+  business, from any checkout. Input or a project the hook cannot read is unverified, and so is
+  a commit with the workspace pushed from a checkout that has none.
 - **Outside a cloud session the hook refuses** an unverified push, with the reason; the gate runs
   at the end of the turn and before a push command, so pushing again after a pass works.
 - **In a Claude Code cloud session (`CLAUDE_CODE_REMOTE=true`) it only reports.** The platform
@@ -83,10 +86,11 @@ shim in the repository's common hooks directory hands each push made from Claude
   (an `update by push` entry) that no pre-push run verified: a push let through in a cloud
   session, one made with `--no-verify` or a hooksPath override, or one from outside Claude Code.
   A turn the user interrupts fires no Stop, so the next prompt audits it; pushes made after a
-  turn ended and before the next prompt are a person's and are not reported. Whether to audit is
-  decided by the hook's state when that window opened, so removing or disabling the hook during
-  a turn does not hide a push, and the removal is reported as well. The user sees each push at
-  once and Claude at the next prompt, once per push.
+  turn ended and before the next prompt are a person's and are not reported, and a resumed
+  session starts with its last turn closed. Once the hook has been in place, the session stays
+  audited, so removing, changing or switching off the hook (`git-hook = false`) hides no push;
+  the change is reported once. The user sees each push at once and Claude at the next prompt,
+  once per push.
 - **Installed** only where nothing else claims git's pre-push hook. Not where `core.hooksPath`
   points elsewhere (husky, lefthook), where another tool's `pre-push` exists, or where the
   workspace depends on cargo-husky (which installs its hooks only where none exists). The user is
@@ -161,12 +165,12 @@ left behind cannot hold the gate past the budget.
 
 Timings: a 4-core cloud container, this repository. Session start and pre-bash on a clean clone
 (2026-10-29), three runs each; post-edit from the live session's log; the gate is `fsmap verify`
-run by hand with nothing to rebuild (2026-10-30, 171 tests), five runs: 61.8–64.7 s, median
-63.4 s. Nearly all of it is `cargo test`, whose 67 end-to-end hook tests each build a small Cargo
+run by hand with nothing to rebuild (2026-10-30, 178 tests), five runs: 66.2–69.4 s, median
+68.5 s. Nearly all of it is `cargo test`, whose 74 end-to-end hook tests each build a small Cargo
 project, many with real pushes to a local remote; a repository without such tests pays its own
-test time. The git pre-push hook on this repository (2026-10-30, eight runs each): 55–96 ms for
-a push that publishes nothing new, 112–180 ms for one it checks; recording a verified tree adds
-17–27 ms of git work to a pass (173 ms once, on a cold first run).
+test time. The git pre-push hook on this repository (2026-10-30, eight runs each): 62–86 ms for
+a push that publishes nothing new, 117–170 ms for one it checks; recording a verified tree adds
+20–27 ms of git work to a pass (an earlier cold first run took 173 ms).
 
 ## What it catches
 
@@ -190,11 +194,12 @@ them); the rows below without one are noted.
 | A dev server running in the background switching the gate off | Only background *agents* postpone it |
 | The gate failing forever, or never again after one release | Three strikes then a report; the next user prompt resets |
 | Pushing a broken commit, also from a session that started on it | git's pre-push hook refuses it (outside a cloud session); in a cloud session the pre-bash hook denies the command and the hook reports a push that got through. Only a recorded pass counts |
-| Pushing HEAD while the gate checked uncommitted files (a module left untracked, a data file `include_str!` reads, an edited `--skip-worktree` file) | The pushed commit's tree is not the one that passed, and HEAD counts only with no tracked change left out; in a cloud session the command is denied while build inputs are uncommitted |
+| Pushing HEAD while the gate checked uncommitted files (a module left untracked, a tracked or `--skip-worktree` file left out of the commit, a data file `include_str!` reads among them) | The pushed commit's tree is not the one that passed, and HEAD counts only with no tracked change left out; in a cloud session the command is denied while build inputs are uncommitted |
 | `git commit … && git push` in one command | Outside a cloud session: allowed, and git's hook judges the commit actually pushed |
 | Pushing through `if … then`, `sudo -u`, `sh -c --`, `… \| sh`, `git -c alias.p=push p`, `"$(git push)"`, a line after `echo "<<X"`, a commit message with an apostrophe in `"$(cat <<'EOF' …)"`, a comment with an apostrophe, or a form the reading misses | git's pre-push hook sees the push whatever the command (outside a cloud session); the command reading stays as an early warning, and in a cloud session as the decision (unit tests per form; a parse left open falls back to "mentions a push") |
 | `--no-verify`, `-c core.hooksPath=…`, `GIT_CONFIG_*` naming hooksPath, `GIT_CONFIG_GLOBAL=…`, `git config core.hooksPath x`, `CLAUDECODE=`, `env -u CLAUDECODE`, `env -i`, `sudo` or `exec -c` in front of a push | Refused by the pre-bash hook; a push that got around the hook anyway is reported at the end of the turn |
-| Deleting or disabling the hook, then pushing | The audit follows the hook's state when its window opened, and reports the push and the removal |
+| Deleting or disabling the hook, then pushing | The session stays audited once the hook was in place; the push and the change are reported |
+| Pushing a commit again (a tag, a second branch) after pushing it around the hook | The later update vouches for itself only; the earlier push is still reported |
 | A push in a turn the user interrupts (no Stop), or across an automatic compaction | The next prompt audits it; a compaction leaves the audit's window open |
 | A backdated reflog entry (`GIT_COMMITTER_DATE`) hiding a push from the audit | The audit goes by reflog order, not time |
 | The pre-push check crashing, or fsmap missing or too old at push time | The push is refused, except in a cloud session |
@@ -254,7 +259,13 @@ log in `<git-dir>/fsmap-harness/log.jsonl`.
   The ask rules make the agent's edits to these files ask first, but a shell command can still
   write them. Review the note.
 - **What the push checks cannot see.** Only the commit each updated ref ends at is checked: a
-  broken commit between a ref's old and new position is published when the last one passed.
+  broken commit between a ref's old and new position is published when the last one passed. An
+  untracked file the build reads that is not a build input (a data file `include_str!` reads, a
+  test fixture) can be left out of a commit unseen when HEAD is judged, since `git status` shows
+  only tracked changes, and so can a git-ignored one even when a tree is recorded; the ROADMAP's
+  wider fingerprint would see both. Whether a push publishes anything new is judged by the
+  remote-tracking refs: moving one with `git update-ref` defeats the hook and the audit, like
+  editing the harness state.
   git's pre-push hook does not run for `--no-verify` or a hooksPath override (refused up front where recognised, reported afterwards otherwise), and
   not for publishing that does not go through `git push` in this clone: `gh api`, an MCP tool
   such as `push_files`, another clone, `git send-pack`. The audit reads remote-tracking reflogs,
@@ -267,6 +278,10 @@ log in `<git-dir>/fsmap-harness/log.jsonl`.
   source outside every target's directory (`#[path]`, `include!`, a path dependency that is not a
   workspace member) is not counted as a build input there. The stop gate still runs at the end
   of the turn.
+- **Turn boundaries.** The audit tells the agent's pushes from a person's by turns: a prompt
+  opens one, a Stop that lets it end closes it. In a turn no prompt opened (woken by a
+  background task), a person's push made since the previous turn ended is reported too; an
+  interrupted turn whose session then ends (exit, `/clear`) is not audited.
 - **clippy.toml is not judged.** Raising a lint threshold there is a legitimate choice as often
   as a shortcut. An untracked one fails the gate; changes to a tracked one are shown on pass.
 - **Where hooks run.** In Claude Code cloud sessions, a repository's `.claude/settings.json` hooks
@@ -280,7 +295,7 @@ log in `<git-dir>/fsmap-harness/log.jsonl`.
   in one repository, or a workspace in a subdirectory, are not covered yet. Sessions in two
   workspaces of one repository share the pre-push shim, which checks the workspace of the
   session that started last, and the worktree's harness state, so a pass in one can count for
-  the other.
+  the other; the earlier session reports the hook as changed.
 - **Windows and macOS.** The harness tests are in the CI matrix for both (the Unix-only shell
   tests aside); a real Windows Claude Code session has not been tried.
 - **Stat-only changes.** With filters neutralised, a file whose stat changed but whose content did
@@ -338,3 +353,8 @@ code as it was; two findings became limits above instead of code. Reading the di
 found a regression it had introduced (a person's own push between turns was reported), and a
 test covers it now. All 54 guards, the review fixes included, were then removed one at a time
 again, and each removal made a test fail.
+
+Two more fresh agents then checked those fixes. One compared every changed claim in this guide
+with the code and the binary: 13 of 68 were not true. The other reviewed the code with real
+pushes: 1 blocker (a regression the m1 fix had introduced), 3 majors and 8 minors. What was
+fixed and what became a limit above is in D-16. All 73 guards fail a test when removed.

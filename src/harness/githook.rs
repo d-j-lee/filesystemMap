@@ -4,9 +4,11 @@
 //! directory hands each push made from Claude Code to `fsmap hook git-pre-push`, and the
 //! audit at the end of a turn reports pushes that went around the shim.
 //!
-//! A push is verified when each commit it publishes holds a tree the gate passed on (with
-//! the same configuration, environment and toolchain), or is HEAD of a work tree whose
-//! fingerprint passed with nothing uncommitted. In a Claude Code cloud session the hook only
+//! A push is verified when the commit each updated ref ends at holds a tree the gate passed
+//! on (with the same configuration, environment and toolchain), is HEAD of a work tree whose
+//! fingerprint passed with nothing tracked left out, or is already on the remote. Commits
+//! between a ref's old and new position are not checked one by one. In a Claude Code cloud
+//! session the hook only
 //! reports: the platform pushes the branch when it releases the session, and a refused push
 //! there would lose the session's commits with the container (user decision R1).
 

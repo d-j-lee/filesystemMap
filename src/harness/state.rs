@@ -52,6 +52,9 @@ pub struct Session {
     /// The next prompt audits such a turn (one the user interrupted fires no Stop); after a
     /// turn ends, pushes until the next prompt are a person's.
     pub in_turn: bool,
+    /// Why the git pre-push hook was last reported as not working, so a change is reported
+    /// once.
+    pub hook_off: Option<String>,
     /// For Claude at the next prompt (a Stop hook cannot add context).
     pub pending_context: Vec<String>,
 }
@@ -85,6 +88,10 @@ pub struct Pushes {
     pub unverified: Vec<(String, String)>,
     /// Pushes the audit already reported.
     pub reported: Vec<String>,
+    /// Updates the pre-push hook saw that published nothing new, as `<remote-tracking ref>
+    /// <commit>`. Keyed by ref: an earlier push of the same commit that no hook saw stays
+    /// reported (convergence check B1).
+    pub known: Vec<String>,
 }
 
 pub const PUSH_RECORDS: usize = 256;
