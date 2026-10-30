@@ -106,15 +106,18 @@ target directory stay); and always `RUSTC`, `RUSTDOC`, `RUSTFMT`, `RUSTUP_TOOLCH
 `RUSTC_BOOTSTRAP`, `CLIPPY_CONF_DIR`, loader and compiler-driver injection (`LD_PRELOAD`,
 `DYLD_*`, `COMPILER_PATH`), snapshot-update switches (`INSTA_FORCE_PASS`, `UPDATE_GOLDENFILES`,
 `TRYBUILD` …) and property-test case counts. A repository can keep one with `trust =
-["env:NAME"]`. Steps run with the build directory inside the repository, within a time budget
+["env:NAME"]`. Steps also run without the variables that point git at another repository
+(`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` …). git exports them to its hooks, and a gate run from
+a hook in a linked worktree would let a test that commits in a scratch directory write to this
+repository. Steps run with the build directory inside the repository, within a time budget
 (600 s for the hooks). A step that overruns has its process tree killed; background processes it
 left behind cannot hold the gate past the budget.
 
-Timings: a 4-core cloud container, 2026-10-29, this repository (142 tests). Session start and
-pre-bash on a clean clone, three runs each; post-edit from the live session's log; the gate is
-`fsmap verify` run by hand with nothing to rebuild, three runs: 47.3–47.9 s. Nearly all of it is
-`cargo test`, whose 43 end-to-end hook tests each build a small Cargo project; a repository
-without such tests pays its own test time.
+Timings: a 4-core cloud container, this repository. Session start and pre-bash on a clean clone
+(2026-10-29), three runs each; post-edit from the live session's log; the gate is `fsmap verify`
+run by hand with nothing to rebuild (2026-10-30, 143 tests), three runs: 47.1–47.8 s. Nearly all
+of it is `cargo test`, whose 44 end-to-end hook tests each build a small Cargo project; a
+repository without such tests pays its own test time.
 
 ## What it catches
 

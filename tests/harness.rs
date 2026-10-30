@@ -1132,6 +1132,50 @@ fn verify_cli_reports_steps_and_exit_codes() {
 
 /// A step that overruns the budget is killed, and the report says so.
 #[cfg(unix)]
+/// Design review of D-16, B1: from a linked worktree git exports `GIT_DIR` to its hooks. The
+/// gate run from such a hook must not pass it on, or a test that runs `git init` and
+/// `git commit` in a scratch directory writes to the user's repository instead.
+#[test]
+fn steps_do_not_inherit_a_hooks_repository() {
+    let repo = fixture();
+    let d = repo.path();
+    let other = fixture();
+    let head = |dir: &Path| {
+        let o = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let before = head(other.path());
+    write(
+        d,
+        "Cargo.toml",
+        &format!(
+            "{CARGO_TOML}\n[package.metadata.fsmap.verify]\nextra = [\
+             [\"git\", \"init\", \"-q\", \"scratch\"], \
+             [\"git\", \"-C\", \"scratch\", \"-c\", \"user.name=t\", \"-c\", \
+             \"user.email=t@example.com\", \"commit\", \"-q\", \"--allow-empty\", \"-m\", \"x\"]]\n"
+        ),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_fsmap"))
+        .arg("verify")
+        .arg(d)
+        .env("GIT_DIR", other.path().join(".git"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(head(other.path()), before);
+    assert!(d.join("scratch/.git").is_dir());
+}
+
 #[test]
 fn verify_cli_enforces_its_time_budget() {
     let repo = fixture();

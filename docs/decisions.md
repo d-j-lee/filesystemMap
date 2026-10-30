@@ -473,6 +473,12 @@ The alternative was to strip the prefix by hand: no dependency, about 20 lines. 
 The cases where stripping changes which file a path names (reserved device names, paths over 260
 characters) are the ones dunce already handles, and dunce has no dependencies of its own.
 
+**From the D-16 design review.** git exports `GIT_DIR` to its hooks when the push comes from a
+linked worktree, and the gate's steps inherited it. So a gate run from a hook let a test that
+commits in a scratch directory write to the user's repository; fsmap's own fixtures do exactly
+that. The steps now run without the repository variables that `git::git()` already removed (one
+shared list).
+
 **Costs.** Every turn that changed the tree pays one gate run: on this repository 47–48 s with nothing
 to rebuild (4-core container, 142 tests, three runs). Nearly all of it is `cargo test`, whose 43 end-to-end
 hook tests each build a small Cargo project. Every Rust edit

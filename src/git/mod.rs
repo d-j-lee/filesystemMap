@@ -41,19 +41,24 @@ pub fn git(dir: &Path) -> Command {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null());
-    for var in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_COMMON_DIR",
-        "GIT_PREFIX",
-        "GIT_NAMESPACE",
-    ] {
+    for var in REPOSITORY_ENV {
         c.env_remove(var);
     }
     c
 }
+
+/// Variables that point git at a repository other than the one around the working
+/// directory. git exports some of them to its hooks (`GIT_DIR` from a linked worktree), so
+/// a program started from a hook that runs git elsewhere must remove them.
+pub const REPOSITORY_ENV: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_NAMESPACE",
+];
 
 /// A `git` command for subcommands that compare the work tree with the index (`status`,
 /// `diff` against the work tree). Those can run `filter.<driver>.clean` programs named in

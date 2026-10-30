@@ -372,7 +372,7 @@ fn removed_env(root: &Path, trust: &[String]) -> Vec<String> {
 }
 
 /// A command that runs like a gate step: in `root`, without the weakening environment
-/// variables, with the build directory inside the repository.
+/// variables or a git hook's repository, with the build directory inside the repository.
 pub fn step_command(root: &Path, program: &str, cfg: &Config) -> Command {
     let mut c = Command::new(program);
     // Panic message and location are what an agent needs; backtraces push them out of
@@ -380,6 +380,11 @@ pub fn step_command(root: &Path, program: &str, cfg: &Config) -> Command {
     c.current_dir(root)
         .env("CARGO_TERM_COLOR", "never")
         .env("RUST_BACKTRACE", "0");
+    // Run from a git hook in a linked worktree, a test that runs `git init` and `git commit`
+    // in a scratch directory would otherwise write to this repository.
+    for k in crate::git::REPOSITORY_ENV {
+        c.env_remove(k);
+    }
     for k in removed_env(root, &cfg.trust) {
         c.env_remove(k);
     }
@@ -390,10 +395,14 @@ pub fn step_command(root: &Path, program: &str, cfg: &Config) -> Command {
 }
 
 /// A command for the gate's own cargo and rustc calls (finding the workspace, reading
-/// metadata, the toolchain version): in `dir`, without the weakening variables.
+/// metadata, the toolchain version): in `dir`, without the weakening variables or a git
+/// hook's repository.
 pub fn clean_command(dir: &Path, program: &str) -> Command {
     let mut c = Command::new(program);
     c.current_dir(dir);
+    for k in crate::git::REPOSITORY_ENV {
+        c.env_remove(k);
+    }
     for k in removed_env(dir, &[]) {
         c.env_remove(k);
     }
