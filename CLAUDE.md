@@ -40,7 +40,7 @@ release build to "see if it works".
 | `src/report/` | terminal, html (CSP), context (agents), sarif |
 | `src/brief.rs`, `src/diff.rs` | Briefing/hook/cache; snapshot diff |
 | `src/dupes.rs`, `src/util.rs` | Duplicate detection; formatting and sanitising helpers |
-| `src/harness/` | Agent harness (D-15): `verify` gate, `integrity` (TOML allowlist), `proc` (deadlines), `state` (fingerprint, locked updates, log), `shell` (push detection), `hooks` |
+| `src/harness/` | Agent harness (D-15, D-16): `verify` gate, `integrity` (TOML allowlist), `proc` (deadlines), `state` (fingerprint, locked updates, log), `shell` (push detection), `githook` (git pre-push shim, tree verdicts, push audit), `hooks` |
 | `harness/` | Templates for other repositories; `.claude/` and `AGENTS.md` here are copies, checked by a test |
 | `viewer/` | Report UI, vanilla JS, no dependencies |
 | `tests/cli.rs` | End-to-end against a generated git fixture |

@@ -10,6 +10,7 @@
 //! | `stop` | Stop | the gate: `fsmap verify` when the tree changed; blocks the stop on new failures |
 //! | `prompt` | UserPromptSubmit | the user wrote: reset the failure streak |
 //! | `pre-bash` | PreToolUse `Bash` | the gate before `git push` / `gh pr create` / `gh pr merge` |
+//! | `git-pre-push` | git's pre-push hook (D-16) | lets a push from Claude Code through only when the gate verified what it publishes |
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,6 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use super::githook::{self, Shim};
 use super::verify::{self, Config, Mode, Report};
 use super::{proc, shell, state};
 use crate::brief;
@@ -266,9 +268,12 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
     let dirty = dirty.unwrap_or_default();
     let now = state::now();
     let others = snapshot.live_others(&sid, now);
+    let refs = githook::remote_refs(&ws);
     let saved = state::update(&ws, |st| {
         let s = st.session(&sid);
         s.last_seen = now;
+        s.remote_refs = refs;
+        s.refs_at = now;
         // The baseline that lets a session which changed nothing finish: only on startup,
         // never re-recorded by resume, compact or clear (review finding B3).
         if source == "startup" && s.start_fp.is_none() {
@@ -303,6 +308,30 @@ fn session_start(project: &Path, input: &Value) -> Result<Out> {
         );
     }
     out.context.push(briefing(&ws, &cfg));
+    match githook::install(&ws, &cfg) {
+        Ok(Shim::Ours) => out.context.push(match githook::Mode::current() {
+            githook::Mode::Enforce => "[harness] a git pre-push hook checks your pushes: git \
+                refuses one unless the gate passed on the files of every commit it sends. Do \
+                not get around it (--no-verify, core.hooksPath, changing CLAUDECODE)."
+                .to_string(),
+            githook::Mode::Report => "[harness] a git pre-push hook records your pushes; one \
+                the gate has not verified is reported to the user. Do not get around it \
+                (--no-verify, core.hooksPath, changing CLAUDECODE)."
+                .to_string(),
+        }),
+        Ok(other) => {
+            if let Some(why) = other.off_reason() {
+                out.system.push(format!(
+                    "[harness] the git pre-push check is off here ({why}); pushes are judged \
+                     only by reading the commands"
+                ));
+            }
+        }
+        Err(e) => out.system.push(format!(
+            "[harness] could not install the git pre-push hook ({e:#}); pushes are judged \
+             only by reading the commands"
+        )),
+    }
     let findings = super::integrity::scan(&ws, &verify::members(&ws), &cfg.trust);
     if !findings.is_empty() {
         let list: Vec<String> = findings
@@ -623,10 +652,12 @@ enum Gate {
     /// Nothing to do: the tree already passed, or (for a stop) the session changed nothing.
     Unchanged,
     /// Every step passed; notes for the user (added suppressions). `fp` is `None` when the
-    /// tree could not be fingerprinted: the verdict is then not remembered.
+    /// tree could not be fingerprinted: the verdict is then not remembered. `verified`: the
+    /// tree and context a commit of this work tree would publish (D-16).
     Pass {
         fp: Option<String>,
         notes: Vec<String>,
+        verified: Option<String>,
     },
     /// Something failed. `untouched_only`: every failure is in files the session did not
     /// change, so after one block Claude reports instead of editing unrelated files.
@@ -669,12 +700,18 @@ fn gate(
         }
     }
     let exe = std::env::current_exe().context("locating the fsmap binary")?;
+    // Taken before the steps run, like the fingerprint: what the verdict is about.
+    let verified = githook::verified_key(ws, &cfg.trust);
     let steps = verify::plan(ws, Mode::Quick, &exe, cfg);
     let report = verify::run(ws, Mode::Quick, &steps, cfg, GATE_BUDGET, |_| {});
     let touched = touched_files(ws, me);
     if report.passed() {
         let notes = suppression_summary(ws, me).into_iter().collect();
-        return Ok(Gate::Pass { fp, notes });
+        return Ok(Gate::Pass {
+            fp,
+            notes,
+            verified,
+        });
     }
     // Integrity and unattributable failures (tests, extra steps) never count as someone
     // else's.
@@ -752,6 +789,23 @@ fn stop(project: &Path, input: &Value) -> Result<Out> {
         touch(&ws, &sid, now);
         return Ok(out);
     }
+    if !snapshot.pending_notes.is_empty() {
+        state::update(&ws, |st| out.system.append(&mut st.pending_notes));
+    }
+    let unchecked = push_audit(&ws, &cfg, &sid, &me);
+    if !unchecked.is_empty() {
+        let text = format!(
+            "[harness] pushes the gate did not verify, made since the user last wrote:\n{}",
+            unchecked.join("\n")
+        );
+        out.system.push(text.clone());
+        state::update(&ws, |st| {
+            st.session(&sid).pending_context.push(format!(
+                "{text}\nTell the user whether these need attention. Do not push around the \
+                 check."
+            ));
+        });
+    }
     let started = std::time::Instant::now();
     let verdict = gate(&ws, &cfg, &snapshot, &me, false)?;
     let ms = started.elapsed().as_millis() as u64;
@@ -760,9 +814,14 @@ fn stop(project: &Path, input: &Value) -> Result<Out> {
             log_gate(&ws, &sid, "unchanged", ms);
             touch(&ws, &sid, now)
         }
-        Gate::Pass { fp, notes } => {
+        Gate::Pass {
+            fp,
+            notes,
+            verified,
+        } => {
             out.system.extend(notes);
             log_gate(&ws, &sid, "pass", ms);
+            record_verified(&ws, verified);
             state::update(&ws, |st| {
                 record_pass(st, fp);
                 let s = st.session(&sid);
@@ -842,6 +901,13 @@ fn record_pass(st: &mut state::State, fp: Option<String>) {
     }
 }
 
+/// Remember the tree a pass was about, for the git pre-push hook (D-16).
+fn record_verified(ws: &Path, verified: Option<String>) {
+    if let Some(key) = verified {
+        state::update_pushes(ws, |p| state::remember(&mut p.verified, key));
+    }
+}
+
 fn record_fail(st: &mut state::State, fp: Option<String>, reason: &str, untouched_only: bool) {
     if fp.is_some() {
         st.last_fail_fp = fp;
@@ -860,7 +926,9 @@ fn pre_bash(project: &Path, input: &Value) -> Result<Out> {
     let Some(cmd) = input["tool_input"]["command"].as_str() else {
         return Ok(out);
     };
-    if !shell::publishes(cmd) {
+    let bypass = shell::hook_bypass(cmd);
+    let publishing = shell::publishes(cmd);
+    if bypass.is_none() && !publishing {
         return Ok(out);
     }
     let deny = |why: String| Out {
@@ -872,26 +940,52 @@ fn pre_bash(project: &Path, input: &Value) -> Result<Out> {
     let (ws, cfg) = match workspace(project) {
         Ws::Ready(ws, cfg) => (ws, cfg),
         Ws::NotRust => return Ok(out),
-        Ws::Broken(e) => return Ok(deny(broken_message(&e))),
+        Ws::Broken(e) if publishing => return Ok(deny(broken_message(&e))),
+        Ws::Broken(_) => return Ok(out),
     };
     let sid = session_id(input);
-    let pending = match uncommitted_inputs(&ws) {
-        Ok(p) => p,
-        Err(e) => {
-            log_gate(&ws, &sid, "push-error", 0);
+    let shim = githook::shim_state(&ws, &cfg);
+    if let Some(why) = bypass
+        && shim == Shim::Ours
+    {
+        log_gate(&ws, &sid, "push-bypass", 0);
+        return Ok(Out {
+            deny: Some(format!(
+                "[harness] refused: {why}. Run the command without that; if the check is \
+                 wrong, tell the user."
+            )),
+            ..Out::default()
+        });
+    }
+    if !publishing {
+        return Ok(out);
+    }
+    // With the git hook enforcing, git judges what a push actually sends, so a commit made
+    // in the same command (`git commit … && git push`) is fine and a command that only
+    // mentions a push is not refused (D-16 review M4). A pull request has no git hook, and
+    // in a cloud session the hook only reports (R1): there this hook still decides.
+    let hook_decides = shim == Shim::Ours
+        && githook::Mode::current() == githook::Mode::Enforce
+        && !shell::opens_pr(cmd);
+    if !hook_decides {
+        let pending = match uncommitted_inputs(&ws) {
+            Ok(p) => p,
+            Err(e) => {
+                log_gate(&ws, &sid, "push-error", 0);
+                return Ok(deny(format!(
+                    "[harness] could not list uncommitted build inputs: {e:#}"
+                )));
+            }
+        };
+        if !pending.is_empty() {
+            log_gate(&ws, &sid, "push-uncommitted", 0);
             return Ok(deny(format!(
-                "[harness] could not list uncommitted build inputs: {e:#}"
+                "[harness] the gate checks the working tree, but these build inputs are not \
+                 committed, so the push would send something the gate did not check: {}. \
+                 Commit or stash them, then push.",
+                pending.join(", ")
             )));
         }
-    };
-    if !pending.is_empty() {
-        log_gate(&ws, &sid, "push-uncommitted", 0);
-        return Ok(deny(format!(
-            "[harness] the gate checks the working tree, but these build inputs are not \
-             committed, so the push would send something the gate did not check: {}. Commit \
-             or stash them, then push.",
-            pending.join(", ")
-        )));
     }
     let snapshot = state::load(&ws);
     let me = snapshot.sessions.get(&sid).cloned().unwrap_or_default();
@@ -899,6 +993,14 @@ fn pre_bash(project: &Path, input: &Value) -> Result<Out> {
     // Publishing is the irreversible step: a gate that cannot run denies it.
     let verdict = match gate(&ws, &cfg, &snapshot, &me, true) {
         Ok(v) => v,
+        Err(e) if hook_decides => {
+            log_gate(&ws, &sid, "push-error", 0);
+            out.context.push(format!(
+                "[harness] the gate could not run ({e:#}); the git pre-push hook will refuse \
+                 a push it has not verified."
+            ));
+            return Ok(out);
+        }
         Err(e) => {
             log_gate(&ws, &sid, "push-error", 0);
             return Ok(deny(format!("[harness] the gate could not run: {e:#}")));
@@ -907,9 +1009,22 @@ fn pre_bash(project: &Path, input: &Value) -> Result<Out> {
     let ms = started.elapsed().as_millis() as u64;
     match verdict {
         Gate::Unchanged => log_gate(&ws, &sid, "push-pass", ms),
-        Gate::Pass { fp, .. } => {
+        Gate::Pass {
+            fp,
+            notes,
+            verified,
+        } => {
             log_gate(&ws, &sid, "push-pass", ms);
-            state::update(&ws, |st| record_pass(st, fp));
+            record_verified(&ws, verified);
+            // Shown at the next Stop, which will find this tree already passed (review M3).
+            state::update(&ws, |st| {
+                record_pass(st, fp);
+                for n in notes {
+                    if !st.pending_notes.contains(&n) {
+                        st.pending_notes.push(n);
+                    }
+                }
+            });
         }
         Gate::Fail {
             fp,
@@ -918,10 +1033,193 @@ fn pre_bash(project: &Path, input: &Value) -> Result<Out> {
         } => {
             log_gate(&ws, &sid, "push-block", ms);
             state::update(&ws, |st| record_fail(st, fp, &reason, untouched_only));
-            out = deny(reason);
+            if hook_decides {
+                out.context.push(format!(
+                    "[harness] the gate fails on this tree, so the git pre-push hook will \
+                     refuse a push of it:\n\n{reason}"
+                ));
+            } else {
+                out = deny(reason);
+            }
         }
     }
     Ok(out)
+}
+
+/// `fsmap hook git-pre-push`: the body of git's pre-push hook for a push from Claude Code
+/// (D-16). `workspace` is the gated workspace relative to the pushing work tree's top (git
+/// runs hooks there), `remote` git's first argument, `stdin` its ref updates. Returns
+/// whether git may push and what to print on stderr. Anything that keeps the check from
+/// running counts as unverified: publishing is the irreversible step.
+pub fn git_pre_push(workspace: &str, remote: &str, stdin: &str) -> (bool, String) {
+    // A person's push is not the harness's business (the shim checks this first).
+    if std::env::var("CLAUDECODE").as_deref() != Ok("1") {
+        return (true, String::new());
+    }
+    let mode = githook::Mode::current();
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_push(workspace, remote, stdin, mode)
+    }));
+    let problems = match checked {
+        Ok(Ok(problems)) => problems,
+        Ok(Err(e)) => vec![format!("the check could not run: {e:#}")],
+        Err(_) => vec!["the check crashed".to_string()],
+    };
+    if problems.is_empty() {
+        return (true, String::new());
+    }
+    let list = problems.join("\n  ");
+    match mode {
+        githook::Mode::Enforce => (
+            false,
+            format!(
+                "[harness] push refused, the gate has not verified what it sends:\n  {list}\n\
+                 The gate runs when you end your turn and before a push command; push again \
+                 once it has passed. Do not bypass this check; if it is wrong, tell the user."
+            ),
+        ),
+        githook::Mode::Report => (
+            true,
+            format!(
+                "[harness] this push was not verified by the gate:\n  {list}\nIt is reported \
+                 to the user."
+            ),
+        ),
+    }
+}
+
+/// The problems with a push; none when every commit it publishes is verified.
+fn check_push(
+    workspace_rel: &str,
+    remote: &str,
+    stdin: &str,
+    mode: githook::Mode,
+) -> Result<Vec<String>> {
+    let updates = githook::parse_updates(stdin)?;
+    let top = std::env::current_dir().context("the pushing work tree")?;
+    let project = dunce::canonicalize(top.join(workspace_rel))
+        .with_context(|| format!("the gated workspace {workspace_rel}"))?;
+    let (ws, cfg) = match workspace(&project) {
+        Ws::Ready(ws, cfg) => (ws, cfg),
+        Ws::NotRust => return Ok(Vec::new()),
+        Ws::Broken(e) => return Ok(vec![broken_message(&e)]),
+    };
+    let pushes = state::load_pushes(&ws);
+    let context = std::cell::OnceCell::new();
+    let head = state::head(&ws);
+    let head_ok = std::cell::OnceCell::new();
+    let mut verified = Vec::new();
+    let mut problems = Vec::new();
+    for u in updates.iter().filter(|u| !u.local.is_zero()) {
+        let Some(commit) = githook::commit_of(&ws, &u.local) else {
+            problems.push((
+                u.local.clone(),
+                format!("{} ({}) is not a commit", u.remote_ref, u.local.short()),
+            ));
+            continue;
+        };
+        if githook::publishes_nothing_new(&ws, &commit, remote) {
+            continue;
+        }
+        let key = githook::tree_of(&ws, &commit).map(|t| {
+            format!(
+                "{t} {}",
+                context.get_or_init(|| state::context_digest(&ws, &cfg.trust))
+            )
+        });
+        let tree_verified = key.is_some_and(|k| pushes.verified.contains(&k));
+        // D-15's rule where no tree was recorded: HEAD of a work tree whose fingerprint passed
+        // with every build input committed.
+        let head_verified = || {
+            head.as_deref() == Some(commit.as_str())
+                && *head_ok.get_or_init(|| {
+                    uncommitted_inputs(&ws).is_ok_and(|p| p.is_empty())
+                        && state::fingerprint(&ws, &cfg.trust).is_some_and(|fp| {
+                            state::load(&ws).last_pass_fp.as_deref() == Some(fp.as_str())
+                        })
+                })
+        };
+        if tree_verified || head_verified() {
+            verified.push(commit);
+        } else {
+            problems.push((
+                commit.clone(),
+                format!(
+                    "{} → {} ({}): the gate has not passed on this commit's files",
+                    u.local_ref,
+                    u.remote_ref,
+                    commit.short()
+                ),
+            ));
+        }
+    }
+    state::update_pushes(&ws, |p| {
+        for c in &verified {
+            state::remember(&mut p.approved, c.as_str().to_string());
+        }
+        if mode == githook::Mode::Report {
+            for (c, why) in &problems {
+                state::remember(&mut p.unverified, (c.as_str().to_string(), why.clone()));
+            }
+        }
+    });
+    state::log(
+        &ws,
+        &json!({"t": state::now(), "event": "git-pre-push", "updates": updates.len(),
+                "unverified": problems.len(),
+                "mode": if mode == githook::Mode::Enforce { "enforce" } else { "report" }}),
+    );
+    Ok(problems.into_iter().map(|(_, why)| why).collect())
+}
+
+/// Pushes since the user last wrote that no pre-push run verified (D-16): pushed with
+/// `--no-verify` or a hooksPath override, from outside Claude Code, or let through in
+/// report mode. Read from the reflogs of the remote-tracking refs that moved, while the
+/// shim is ours; each is reported once. Also moves the session's snapshot to now.
+fn push_audit(ws: &Path, cfg: &Config, sid: &str, me: &state::Session) -> Vec<String> {
+    let refs = githook::remote_refs(ws);
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    if me.refs_at > 0 && githook::shim_state(ws, cfg) == Shim::Ours {
+        let pushes = state::load_pushes(ws);
+        for (name, oid) in githook::pushed_since(ws, &me.remote_refs, &refs) {
+            if pushes.approved.contains(&oid) || pushes.reported.contains(&oid) {
+                continue;
+            }
+            let why = pushes
+                .unverified
+                .iter()
+                .find(|(o, _)| *o == oid)
+                .map_or_else(
+                    || {
+                        "the pre-push check did not run (--no-verify, a hooksPath override, \
+                         or a push from outside Claude Code)"
+                            .to_string()
+                    },
+                    |(_, w)| w.clone(),
+                );
+            found.push((name, oid, why));
+        }
+        if !found.is_empty() {
+            state::update_pushes(ws, |p| {
+                for (_, oid, _) in &found {
+                    state::remember(&mut p.reported, oid.clone());
+                }
+            });
+        }
+    }
+    let at = state::now();
+    state::update(ws, |st| {
+        let s = st.session(sid);
+        s.remote_refs = refs;
+        s.refs_at = at;
+    });
+    found
+        .into_iter()
+        .map(|(name, oid, why)| {
+            let short = name.strip_prefix("refs/remotes/").unwrap_or(&name);
+            format!("  {short} → {}: {why}", &oid[..oid.len().min(10)])
+        })
+        .collect()
 }
 
 fn prompt(project: &Path, input: &Value) -> Result<Out> {
@@ -930,8 +1228,18 @@ fn prompt(project: &Path, input: &Value) -> Result<Out> {
         state::update(project, |st| reset(st, &session_id(input)));
         return Ok(Out::default());
     };
-    state::update(&ws, |st| reset(st, &session_id(input)));
-    Ok(Out::default())
+    // The push audit's window starts here: pushes between turns are not the agent's.
+    let refs = githook::remote_refs(&ws);
+    let now = state::now();
+    let mut out = Out::default();
+    state::update(&ws, |st| {
+        reset(st, &session_id(input));
+        let s = st.session(&session_id(input));
+        s.remote_refs = refs;
+        s.refs_at = now;
+        out.context.append(&mut s.pending_context);
+    });
+    Ok(out)
 }
 
 fn reset(st: &mut state::State, sid: &str) {

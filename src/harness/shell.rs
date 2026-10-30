@@ -33,6 +33,159 @@ fn publishes_at(cmd: &str, whole: &str, depth: usize) -> bool {
         || (!parsed.complete && mentions_publish(cmd))
 }
 
+/// Whether `cmd` (already judged publishing by `publishes`) mentions `gh pr create`: a pull
+/// request has no git hook, so only the command can be judged (D-16).
+pub fn opens_pr(cmd: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\bgh\b[^\n]*\bpr\b[^\n]*\bcreate\b").expect("a valid pattern")
+    });
+    RE.is_match(cmd)
+}
+
+/// Why `cmd` would get a push past the git pre-push hook, if it would (D-16): `--no-verify`
+/// or an abbreviation of it, a `core.hooksPath` set by `-c`, `--config-env`, a `GIT_CONFIG_*`
+/// variable or `git config`, or a `CLAUDECODE` the shim no longer recognises (unset,
+/// changed, or the environment cleared). An early warning before the push; the audit at the
+/// end of the turn is what catches the forms this misses.
+pub fn hook_bypass(cmd: &str) -> Option<&'static str> {
+    let lower = cmd.to_ascii_lowercase();
+    if ![
+        "hookspath",
+        "claudecode",
+        "--no-veri",
+        "env -i",
+        "env -",
+        "--ignore-environment",
+    ]
+    .iter()
+    .any(|t| lower.contains(t))
+    {
+        return None;
+    }
+    bypass_at(&strip_data_heredocs(cmd), 0)
+}
+
+const NO_VERIFY: &str = "it skips the harness's git pre-push check (--no-verify)";
+const HOOKS_PATH: &str =
+    "it changes core.hooksPath, which turns off the harness's git pre-push check";
+const CLAUDECODE: &str =
+    "it unsets or changes CLAUDECODE, which the git pre-push check uses to recognise Claude Code";
+
+fn bypass_at(cmd: &str, depth: usize) -> Option<&'static str> {
+    if depth > 3 {
+        return None;
+    }
+    parse(cmd, 0)
+        .commands
+        .iter()
+        .find_map(|words| bypass_in(words, depth))
+}
+
+fn bypass_in(words: &[String], depth: usize) -> Option<&'static str> {
+    let i = match program_index(words) {
+        Program::At(i) => i,
+        Program::SplitString(at) => return words.get(at).and_then(|s| bypass_at(s, depth + 1)),
+        Program::None => words.len(),
+    };
+    let before = &words[..i];
+    for (k, w) in before.iter().enumerate() {
+        if let Some((name, value)) = w.split_once('=').filter(|_| is_assignment(w)) {
+            if name == "CLAUDECODE" && value != "1" {
+                return Some(CLAUDECODE);
+            }
+            if name.starts_with("GIT_CONFIG") && value.to_ascii_lowercase().contains("hookspath") {
+                return Some(HOOKS_PATH);
+            }
+        }
+        let unset_next = matches!(w.as_str(), "-u" | "--unset")
+            && before.get(k + 1).is_some_and(|n| n == "CLAUDECODE");
+        if unset_next
+            || w == "-uCLAUDECODE"
+            || w == "--unset=CLAUDECODE"
+            || (matches!(w.as_str(), "-i" | "-" | "--ignore-environment")
+                && before[..k].iter().any(|p| program(p) == "env"))
+        {
+            return Some(CLAUDECODE);
+        }
+    }
+    let prog = words.get(i)?;
+    let rest = &words[i + 1..];
+    match program(prog) {
+        "unset" if rest.iter().any(|w| w == "CLAUDECODE") => Some(CLAUDECODE),
+        "export"
+            if rest
+                .iter()
+                .any(|w| w.strip_prefix("CLAUDECODE=").is_some_and(|v| v != "1"))
+                || (rest.iter().any(|w| w == "-n") && rest.iter().any(|w| w == "CLAUDECODE")) =>
+        {
+            Some(CLAUDECODE)
+        }
+        "sh" | "bash" | "zsh" | "dash" | "ksh" => {
+            let at = rest
+                .iter()
+                .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))?;
+            let script = match rest.get(at + 1).map(String::as_str) {
+                Some("--") => rest.get(at + 2),
+                _ => rest.get(at + 1),
+            }?;
+            bypass_at(script, depth + 1)
+        }
+        "eval" => bypass_at(&rest.join(" "), depth + 1),
+        "git" => git_bypass(rest),
+        _ => None,
+    }
+}
+
+fn git_bypass(rest: &[String]) -> Option<&'static str> {
+    let sets_hooks_path = |kv: &str| {
+        kv.split_once('=')
+            .is_some_and(|(k, _)| k.eq_ignore_ascii_case("core.hooksPath"))
+    };
+    let mut i = 0;
+    while let Some(a) = rest.get(i) {
+        if a == "-c" || a == "--config-env" {
+            if rest.get(i + 1).is_some_and(|kv| sets_hooks_path(kv)) {
+                return Some(HOOKS_PATH);
+            }
+            i += 2;
+        } else if let Some(kv) = a.strip_prefix("--config-env=") {
+            if sets_hooks_path(kv) {
+                return Some(HOOKS_PATH);
+            }
+            i += 1;
+        } else if GIT_VALUE_OPTIONS.contains(&a.as_str()) {
+            i += 2;
+        } else if a.starts_with('-') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let sub = rest.get(i)?;
+    let args = &rest[i + 1..];
+    match sub.as_str() {
+        "config" => {
+            let reading = args.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "--get" | "--get-all" | "--get-regexp" | "-l" | "--list" | "get" | "list"
+                )
+            });
+            let names_it = args
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case("core.hooksPath"));
+            (names_it && !reading).then_some(HOOKS_PATH)
+        }
+        // git accepts any unambiguous abbreviation; `--no-ve…` shorter than this is ambiguous
+        // with `--no-verbose`.
+        "push" => args
+            .iter()
+            .any(|a| a.len() >= "--no-veri".len() && "--no-verify".starts_with(a.as_str()))
+            .then_some(NO_VERIFY),
+        _ => None,
+    }
+}
+
 /// Whether the text mentions a publishing command anywhere.
 pub fn mentions_publish(text: &str) -> bool {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -797,6 +950,47 @@ mod tests {
 
     /// Deep nesting must not overflow the stack (the hook would die and the wrapper would
     /// let the command through); past the limit, mentioning a push is enough.
+    #[test]
+    fn ways_around_the_git_hook_are_found() {
+        for cmd in [
+            "git push --no-verify origin main",
+            "git push --no-veri origin main",
+            "git push origin main --no-verif",
+            "git -c core.hooksPath=/dev/null push",
+            "git -c CORE.HOOKSPATH=x push",
+            "git --config-env=core.hooksPath=H push",
+            "git --config-env core.hooksPath=H push",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=x git push",
+            "GIT_CONFIG_PARAMETERS=\"'core.hooksPath'='x'\" git push",
+            "git config core.hooksPath x",
+            "git config --global core.hookspath x",
+            "CLAUDECODE= git push",
+            "CLAUDECODE=0 git push",
+            "env -u CLAUDECODE git push",
+            "env --unset=CLAUDECODE git push",
+            "env -i PATH=/usr/bin git push",
+            "unset CLAUDECODE; git push",
+            "export CLAUDECODE=; git push",
+            "bash -c 'git push --no-verify'",
+            "sh -c \"env -u CLAUDECODE git push\"",
+        ] {
+            assert!(hook_bypass(cmd).is_some(), "{cmd}");
+        }
+        for cmd in [
+            "git push origin main",
+            "git push --verbose origin main",
+            "git config --get core.hooksPath",
+            "git config --list",
+            "git commit -m 'about --no-verify and core.hooksPath'",
+            "CLAUDECODE=1 git push",
+            "echo $CLAUDECODE",
+            "env FOO=1 git push",
+            "grep -r hooksPath docs/",
+        ] {
+            assert!(hook_bypass(cmd).is_none(), "{cmd}");
+        }
+    }
+
     #[test]
     fn deep_nesting_is_bounded() {
         let cmd = format!("{}git push origin main", "echo \"$(".repeat(20_000));
