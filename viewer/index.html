@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="generator" content="fsmap">
+{{CSP}}
+<title>{{TITLE}}</title>
+<style>/*{{CSS}}*/</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="mark">
+      <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+        <rect x="1" y="1" width="16" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <path d="M1 7h9V1M10 7v10M10 12h7" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      </svg>
+      fsmap
+    </div>
+    <div class="root-path" id="root-path"></div>
+    <div class="stamp" id="stamp"></div>
+    <div class="theme-switch" role="group" aria-label="Theme">
+      <button type="button" data-theme-set="auto" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-set="light" aria-pressed="false">Light</button>
+      <button type="button" data-theme-set="dark" aria-pressed="false">Dark</button>
+    </div>
+  </div>
+</header>
+<div class="ribbon"><div class="wrap"><div class="grid" id="ribbon"></div></div></div>
+<nav class="tabs" aria-label="Views"><div class="wrap" id="tabs"></div></nav>
+<main><div class="wrap">
+  <section class="view" id="view-overview" aria-label="Overview"></section>
+  <section class="view" id="view-map" aria-label="Map" hidden></section>
+  <section class="view" id="view-hotspots" aria-label="Hotspots" hidden></section>
+  <section class="view" id="view-architecture" aria-label="Architecture" hidden></section>
+  <section class="view" id="view-coupling" aria-label="Change coupling" hidden></section>
+  <section class="view" id="view-repos" aria-label="Repositories" hidden></section>
+  <section class="view" id="view-files" aria-label="Files" hidden></section>
+  <noscript><p class="empty">This report needs JavaScript to draw the map. The raw snapshot is embedded in the page source (script#fsmap-data).</p></noscript>
+</div></main>
+<footer><div class="wrap" id="footer"></div></footer>
+<script type="application/json" id="fsmap-data">{{DATA}}</script>
+<script>/*{{JS}}*/</script>
+</body>
+</html>
