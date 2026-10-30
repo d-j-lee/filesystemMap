@@ -76,7 +76,7 @@ it to a ticket. Its tabs:
 | `brief [FILES…] [--diff [BASE]] [--hook] [--root DIR] [--refresh]` | Pre/post-edit briefing; forgotten co-change partners; Claude Code hook protocol. The index is cached per repository and HEAD |
 | `diff OLD.json NEW.json [--top N]` | Growth, new large files, new/resolved findings |
 | `verify [PATH] [--mode quick\|full] [--strict] [--json] [--timeout S]` | Rust gate: settings that weaken it, fmt, clippy `-D warnings`, tests, the repository's extra steps, cargo-deny in `full`. Exit 1 on failure, 2 when it cannot run |
-| `hook session-start\|post-edit\|stop\|prompt\|pre-bash\|stats` | Claude Code hooks for the [agent harness](docs/agent-harness.md); `stats` summarises their log |
+| `hook session-start\|post-edit\|stop\|prompt\|pre-bash\|git-pre-push\|stats` | Claude Code hooks for the [agent harness](docs/agent-harness.md); `git-pre-push` is run by the git pre-push hook the session-start hook installs; `stats` summarises their log |
 | `agent-ignore [PATH] [--format claude\|gitignore]` | Read-deny rules for dependency, build-output and vendored directories; `gitignore` format adds reasons and token costs |
 
 Common analysis flags:
@@ -97,7 +97,7 @@ Common analysis flags:
 
 Exit codes: `0` ok, `1` findings at or above `--fail-on` or a failing `verify`, `2` error.
 The event hooks (`hook session-start` … `hook pre-bash`) always exit `0` and report problems in
-their JSON answer.
+their JSON answer; `hook git-pre-push` exits `1` to refuse a push.
 
 ## What the numbers mean
 

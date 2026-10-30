@@ -33,6 +33,277 @@ fn publishes_at(cmd: &str, whole: &str, depth: usize) -> bool {
         || (!parsed.complete && mentions_publish(cmd))
 }
 
+/// Whether `cmd` (already judged publishing by `publishes`) mentions `gh pr create`: a pull
+/// request has no git hook, so only the command can be judged (D-16).
+pub fn opens_pr(cmd: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\bgh\b[^\n]*\bpr\b[^\n]*\bcreate\b").expect("a valid pattern")
+    });
+    RE.is_match(cmd)
+}
+
+/// Why `cmd` would get a push past the git pre-push hook, if it would (D-16): `--no-verify`
+/// or an abbreviation of it; a `core.hooksPath` set for the push (`-c`, `--config-env`, a
+/// `GIT_CONFIG_*` variable, another global or system config file) or kept (`git config
+/// core.hooksPath <dir>`); a `CLAUDECODE` the shim no longer sees because it was unset or
+/// changed, or the environment cleared (`env -i`, `exec -c`, `sudo` without `-E`), for a
+/// command that pushes; an alias that pushes with `--no-verify`. An early warning before the
+/// push; the audit at the end of the turn is what catches the forms this misses.
+pub fn hook_bypass(cmd: &str) -> Option<&'static str> {
+    let lower = cmd.to_ascii_lowercase();
+    if ![
+        "hookspath",
+        "claudecode",
+        "--no-veri",
+        "env",
+        "sudo",
+        "exec",
+        "git_config",
+    ]
+    .iter()
+    .any(|t| lower.contains(t))
+    {
+        return None;
+    }
+    let cmd = strip_data_heredocs(cmd);
+    bypass_at(&cmd, publishes(&cmd), 0)
+}
+
+const NO_VERIFY: &str = "it skips the harness's git pre-push check (--no-verify)";
+const HOOKS_PATH: &str =
+    "it changes core.hooksPath, which turns off the harness's git pre-push check";
+const CLAUDECODE: &str = "it pushes without the CLAUDECODE variable the git pre-push check uses to \
+                          recognise Claude Code (unset, changed, or the environment cleared)";
+
+fn bypass_at(cmd: &str, pushes: bool, depth: usize) -> Option<&'static str> {
+    if depth > 3 {
+        return None;
+    }
+    parse(cmd, 0)
+        .commands
+        .iter()
+        .find_map(|words| bypass_in(words, pushes, depth))
+}
+
+/// `pushes`: the whole command line publishes, so an environment change anywhere in it
+/// matters (`unset CLAUDECODE; git push`).
+fn bypass_in(words: &[String], pushes: bool, depth: usize) -> Option<&'static str> {
+    let i = match program_index(words) {
+        Program::At(i) => i,
+        Program::SplitString(at) => {
+            return words.get(at).and_then(|s| bypass_at(s, pushes, depth + 1));
+        }
+        Program::None => words.len(),
+    };
+    let before = &words[..i];
+    // Whether this simple command itself publishes: what an environment change in front of
+    // it (assignments, `env`, `sudo`, `exec -c`) applies to. A shell reading its script from
+    // stdin or a heredoc, `eval` or `source` runs what its words do not show, so there the
+    // whole command line decides.
+    let opaque = i < words.len()
+        && matches!(
+            program(&words[i]),
+            "sh" | "bash" | "zsh" | "dash" | "ksh" | "eval" | "source" | "."
+        );
+    let this_pushes = i < words.len()
+        && (simple_publishes(&words[i..], &words.join(" "), depth) || (pushes && opaque));
+    if this_pushes {
+        for (k, w) in before.iter().enumerate() {
+            if let Some(why) = w
+                .split_once('=')
+                .filter(|_| is_assignment(w))
+                .and_then(|(name, value)| assignment_bypass(name, value))
+            {
+                return Some(why);
+            }
+            let wrapper = |name: &str| {
+                before[..k]
+                    .iter()
+                    .rev()
+                    .find(|p| WRAPPERS.iter().any(|(n, _)| program(p) == *n))
+                    .is_some_and(|p| program(p) == name)
+            };
+            let unset_next = matches!(w.as_str(), "-u" | "--unset")
+                && before.get(k + 1).is_some_and(|n| n == "CLAUDECODE");
+            if unset_next
+                || w == "-uCLAUDECODE"
+                || w == "--unset=CLAUDECODE"
+                || (clears_env(w) && wrapper("env"))
+                || (w == "-c" && wrapper("exec"))
+            {
+                return Some(CLAUDECODE);
+            }
+        }
+        // sudo resets the environment unless told to keep it, or `CLAUDECODE` in a list.
+        if let Some(at) = before.iter().position(|w| program(w) == "sudo") {
+            let keeps = before[at + 1..].iter().any(|w| {
+                w == "-E"
+                    || w == "--preserve-env"
+                    || w.strip_prefix("--preserve-env=")
+                        .is_some_and(|list| list.split(',').any(|v| v == "CLAUDECODE"))
+            });
+            if !keeps {
+                return Some(CLAUDECODE);
+            }
+        }
+    }
+    let prog = words.get(i)?;
+    let rest = &words[i + 1..];
+    match program(prog) {
+        "unset" if pushes && rest.iter().any(|w| w == "CLAUDECODE") => Some(CLAUDECODE),
+        "export" if pushes => rest
+            .iter()
+            .find_map(|w| w.split_once('=').and_then(|(n, v)| assignment_bypass(n, v)))
+            .or_else(|| {
+                (rest.iter().any(|w| w == "-n") && rest.iter().any(|w| w == "CLAUDECODE"))
+                    .then_some(CLAUDECODE)
+            }),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" => {
+            let at = rest
+                .iter()
+                .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))?;
+            let script = match rest.get(at + 1).map(String::as_str) {
+                Some("--") => rest.get(at + 2),
+                _ => rest.get(at + 1),
+            }?;
+            bypass_at(script, pushes, depth + 1)
+        }
+        "eval" => bypass_at(&rest.join(" "), pushes, depth + 1),
+        "git" => git_bypass(rest),
+        _ => None,
+    }
+}
+
+/// What a variable set for a push does to the git pre-push check, if anything.
+fn assignment_bypass(name: &str, value: &str) -> Option<&'static str> {
+    // `NAME+=value` appends to what the variable holds.
+    let (name, appends) = name.strip_suffix('+').map_or((name, false), |n| (n, true));
+    if name == "CLAUDECODE" {
+        let changed = if appends {
+            !value.is_empty()
+        } else {
+            value != "1"
+        };
+        return changed.then_some(CLAUDECODE);
+    }
+    (name == "GIT_CONFIG_GLOBAL"
+        || name == "GIT_CONFIG_SYSTEM"
+        || (name.starts_with("GIT_CONFIG") && value.to_ascii_lowercase().contains("hookspath")))
+    .then_some(HOOKS_PATH)
+}
+
+/// `env -i` in any spelling, also in a cluster of short options (`-iv`).
+fn clears_env(w: &str) -> bool {
+    match w {
+        "-" | "--ignore-environment" => true,
+        _ => w
+            .strip_prefix('-')
+            .filter(|flags| !flags.starts_with('-'))
+            .is_some_and(|flags| {
+                // Up to the first option that takes a value (`-u NAME`, `-S`, `-C`, `-P`).
+                flags
+                    .chars()
+                    .take_while(|c| !matches!(c, 'u' | 'S' | 'C' | 'P'))
+                    .any(|c| c == 'i')
+            }),
+    }
+}
+
+fn git_bypass(rest: &[String]) -> Option<&'static str> {
+    let names_hooks_path = |kv: &str| {
+        kv.split_once('=')
+            .is_some_and(|(k, _)| k.eq_ignore_ascii_case("core.hooksPath"))
+    };
+    let mut hooks_path = false;
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while let Some(a) = rest.get(i) {
+        if a == "-c" || a == "--config-env" {
+            if let Some(kv) = rest.get(i + 1) {
+                hooks_path |= names_hooks_path(kv);
+                if let Some((name, value)) = kv.split_once('=').and_then(|(k, v)| {
+                    k.strip_prefix("alias.")
+                        .map(|n| (n.to_string(), v.to_string()))
+                }) {
+                    aliases.push((name, value));
+                }
+            }
+            i += 2;
+        } else if let Some(kv) = a.strip_prefix("--config-env=") {
+            hooks_path |= names_hooks_path(kv);
+            i += 1;
+        } else if GIT_VALUE_OPTIONS.contains(&a.as_str()) {
+            i += 2;
+        } else if a.starts_with('-') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let sub = rest.get(i)?;
+    let args = &rest[i + 1..];
+    let no_verify = |words: &[&str]| {
+        words
+            .iter()
+            .any(|a| a.len() >= "--no-veri".len() && "--no-verify".starts_with(a))
+    };
+    if let Some((_, value)) = aliases.iter().find(|(name, _)| name == sub) {
+        let lower = value.to_ascii_lowercase();
+        // The alias's own words and the arguments given to it.
+        let words: Vec<&str> = lower
+            .split_whitespace()
+            .chain(args.iter().map(String::as_str))
+            .collect();
+        return if no_verify(&words) {
+            Some(NO_VERIFY)
+        } else if lower.contains("hookspath") || (hooks_path && lower.contains("push")) {
+            Some(HOOKS_PATH)
+        } else {
+            None
+        };
+    }
+    match sub.as_str() {
+        "config" => {
+            const READING: &[&str] = &[
+                "--get",
+                "--get-all",
+                "--get-regexp",
+                "-l",
+                "--list",
+                "get",
+                "list",
+                "--show-origin",
+                "--show-scope",
+                "--unset",
+                "--unset-all",
+                "unset",
+            ];
+            if args.iter().any(|a| READING.contains(&a.as_str())) {
+                return None;
+            }
+            // Setting it: a value follows the name (`git config core.hooksPath` alone reads it).
+            let at = args
+                .iter()
+                .position(|a| a.eq_ignore_ascii_case("core.hooksPath"))?;
+            args[at + 1..]
+                .iter()
+                .any(|a| !a.starts_with('-'))
+                .then_some(HOOKS_PATH)
+        }
+        "push" => {
+            let words: Vec<&str> = args.iter().map(String::as_str).collect();
+            if no_verify(&words) {
+                Some(NO_VERIFY)
+            } else if hooks_path {
+                Some(HOOKS_PATH)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Whether the text mentions a publishing command anywhere.
 pub fn mentions_publish(text: &str) -> bool {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -508,6 +779,8 @@ fn program(word: &str) -> &str {
 
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
+        // `NAME+=value` appends.
+        let name = name.strip_suffix('+').unwrap_or(name);
         !name.is_empty() && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
     })
 }
@@ -797,6 +1070,82 @@ mod tests {
 
     /// Deep nesting must not overflow the stack (the hook would die and the wrapper would
     /// let the command through); past the limit, mentioning a push is enough.
+    #[test]
+    fn ways_around_the_git_hook_are_found() {
+        for cmd in [
+            "git push --no-verify origin main",
+            "git push --no-veri origin main",
+            "git push origin main --no-verif",
+            "git -c core.hooksPath=/dev/null push",
+            "git -c CORE.HOOKSPATH=x push",
+            "git --config-env=core.hooksPath=H push",
+            "git --config-env core.hooksPath=H push",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=x git push",
+            "GIT_CONFIG_PARAMETERS=\"'core.hooksPath'='x'\" git push",
+            "git config core.hooksPath x",
+            "git config --global core.hookspath x",
+            "CLAUDECODE= git push",
+            "CLAUDECODE=0 git push",
+            "env -u CLAUDECODE git push",
+            "env --unset=CLAUDECODE git push",
+            "env -i PATH=/usr/bin git push",
+            "unset CLAUDECODE; git push",
+            "export CLAUDECODE=; git push",
+            "bash -c 'git push --no-verify'",
+            "sh -c \"env -u CLAUDECODE git push\"",
+            // Implementation review m7: forms the first version missed.
+            "sudo git push origin main",
+            "sudo -u me git push",
+            "exec -c git push",
+            "GIT_CONFIG_GLOBAL=/tmp/g git push",
+            "git -c alias.p='push --no-verify' p",
+            "git config set core.hooksPath x",
+            // Convergence check: exported for the push, and sudo keeping only other variables.
+            "export GIT_CONFIG_GLOBAL=/tmp/g; git push origin main",
+            "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/x; git push",
+            "sudo --preserve-env=PATH git push origin main",
+            "echo 'git push origin main' | CLAUDECODE= sh",
+            "CLAUDECODE= bash <<'X'\ngit push origin main\nX",
+            "git -c alias.p=push p --no-verify origin main",
+            "env -iv git push origin main",
+            "CLAUDECODE+=x git push origin main",
+        ] {
+            assert!(hook_bypass(cmd).is_some(), "{cmd}");
+        }
+        for cmd in [
+            "git push origin main",
+            "git push --verbose origin main",
+            "git config --get core.hooksPath",
+            "git config --list",
+            "git commit -m 'about --no-verify and core.hooksPath'",
+            "CLAUDECODE=1 git push",
+            "echo $CLAUDECODE",
+            "env FOO=1 git push",
+            "grep -r hooksPath docs/",
+            // Implementation review m7: reading the setting, or changing the environment of a
+            // command that does not push, gets nothing past the hook.
+            "git config core.hooksPath",
+            "git config core.hooksPath --type=path",
+            "git config core.hooksPath -z",
+            "git config --show-origin core.hooksPath",
+            "git config --unset core.hooksPath",
+            "env -i HOME=/root cargo build",
+            "git -c core.hooksPath=x commit -m y",
+            "sudo apt-get install -y jq",
+            "sudo -E git push",
+            "sudo --preserve-env git push",
+            "sudo --preserve-env=PATH,CLAUDECODE git push",
+            "export GIT_CONFIG_GLOBAL=/tmp/g; cargo build",
+            "CLAUDECODE= bash ./build.sh",
+            "env -uFILE_i git push",
+            "CLAUDECODE+= git push",
+            "unset CLAUDECODE; cargo build",
+            "CLAUDECODE= cargo test",
+        ] {
+            assert!(hook_bypass(cmd).is_none(), "{cmd}");
+        }
+    }
+
     #[test]
     fn deep_nesting_is_bounded() {
         let cmd = format!("{}git push origin main", "echo \"$(".repeat(20_000));

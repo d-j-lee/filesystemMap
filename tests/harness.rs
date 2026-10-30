@@ -1,6 +1,10 @@
-//! End-to-end tests of the agent harness (decision D-15): the real binary's hooks against a
-//! small Cargo project in a git repository. Each test pins one way the gate could fail
-//! open; most come from the design review and from the two parallel harnesses' findings.
+//! End-to-end tests of the agent harness (decisions D-15, D-16): the real binary's hooks
+//! against a small Cargo project in a git repository. Each test pins one way the gate could
+//! fail open; most come from the design reviews and the parallel harnesses' findings.
+//!
+//! Hooks run as in a Claude Code cloud session (`CLAUDE_CODE_REMOTE=true`), where the git
+//! pre-push hook only reports and the pre-bash hook decides about pushes (D-16, R1). Tests
+//! of the git hook enforcing, as it does elsewhere, push for real to a local bare remote.
 
 #![expect(
     clippy::unwrap_used,
@@ -60,6 +64,8 @@ fn hook_env(d: &Path, event: &str, input: &Value, env: &[(&str, &str)]) -> Value
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fsmap"));
     cmd.args(["hook", event])
         .current_dir(d)
+        .env_remove("CLAUDECODE")
+        .env("CLAUDE_CODE_REMOTE", "true")
         .env("CLAUDE_PROJECT_DIR", d)
         .env("XDG_CACHE_HOME", d.join(".cache-test"))
         .env("XDG_STATE_HOME", d.join(".state-test"))
@@ -1359,4 +1365,1176 @@ fn stats_summarise_the_log() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("gate block"), "{text}");
     assert!(text.contains("session-start"), "{text}");
+}
+
+// ---------------------------------------------------------------- git pre-push hook (D-16)
+
+/// A bare repository as `origin`, holding the fixture's `main`. Call it before the session
+/// starts: the pushes here are a person's (no `CLAUDECODE`) either way.
+fn origin(d: &Path) -> tempfile::TempDir {
+    let r = tempfile::tempdir().unwrap();
+    let ok = Command::new("git")
+        .args(["init", "-q", "--bare", "-b", "main"])
+        .arg(r.path())
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git init --bare");
+    git(
+        d,
+        &["remote", "add", "origin", &r.path().to_string_lossy()],
+        T0,
+    );
+    let ok = Command::new("git")
+        .args(["push", "-q", "origin", "main"])
+        .current_dir(d)
+        .env_remove("CLAUDECODE")
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "initial push");
+    r
+}
+
+/// `git push <args>` from `d` as Claude Code's Bash tool runs it outside a cloud session:
+/// `CLAUDECODE=1`, fsmap on `PATH`. Returns whether it succeeded and git's stderr.
+fn git_push(d: &Path, args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
+    let bin = Path::new(env!("CARGO_BIN_EXE_fsmap")).parent().unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let mut c = Command::new("git");
+    c.arg("push")
+        .args(args)
+        .current_dir(d)
+        .env("PATH", path)
+        .env("CLAUDECODE", "1")
+        .env_remove("CLAUDE_CODE_REMOTE");
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let out = c.output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn rev(dir: &Path, what: &str) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", what])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn shim(d: &Path) -> Option<String> {
+    std::fs::read_to_string(d.join(".git/hooks/pre-push")).ok()
+}
+
+/// The shim goes in only where nothing else claims git's pre-push hook, comes back when it
+/// is changed, and goes away when the repository opts out.
+#[test]
+fn the_pre_push_hook_is_installed_only_where_nothing_else_claims_it() {
+    let repo = fixture();
+    let d = repo.path();
+    let v = start(d, "startup");
+    let text = shim(d).expect("installed");
+    assert!(text.contains("fsmap-harness pre-push"), "{text}");
+    assert!(
+        v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("git pre-push hook"),
+        "{v}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(d.join(".git/hooks/pre-push"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "executable");
+    }
+    // Changed (here: made to let everything through) → restored at the next start.
+    std::fs::write(d.join(".git/hooks/pre-push"), format!("{text}exit 0\n")).unwrap();
+    start(d, "resume");
+    assert_eq!(shim(d).as_deref(), Some(text.as_str()));
+    // Opting out removes ours.
+    write(
+        d,
+        "Cargo.toml",
+        &format!("{CARGO_TOML}\n[package.metadata.fsmap.verify]\ngit-hook = false\n"),
+    );
+    start(d, "resume");
+    assert!(shim(d).is_none());
+
+    // Someone else's hook stays, and the user is told the check is off.
+    let repo = fixture();
+    let d = repo.path();
+    write(d, ".git/hooks/pre-push", "#!/bin/sh\nexit 0\n");
+    let v = start(d, "startup");
+    assert_eq!(shim(d).as_deref(), Some("#!/bin/sh\nexit 0\n"));
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("pre-push check is off"),
+        "{v}"
+    );
+
+    // core.hooksPath elsewhere: git would never run ours.
+    let repo = fixture();
+    let d = repo.path();
+    git(d, &["config", "core.hooksPath", ".husky"], T0);
+    let v = start(d, "startup");
+    assert!(shim(d).is_none() && !d.join(".husky/pre-push").exists());
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("core.hooksPath"),
+        "{v}"
+    );
+
+    // cargo-husky installs its hooks only where none exists.
+    let repo = fixture();
+    let d = repo.path();
+    write(
+        d,
+        "Cargo.toml",
+        &format!("{CARGO_TOML}\n[dev-dependencies]\ncargo-husky = \"1\"\n"),
+    );
+    let v = start(d, "startup");
+    assert!(shim(d).is_none());
+    assert!(
+        v["systemMessage"].as_str().unwrap().contains("cargo-husky"),
+        "{v}"
+    );
+}
+
+/// The hook refuses a push the gate has not verified, outside a cloud session.
+#[test]
+fn a_push_the_gate_has_not_verified_is_refused() {
+    let repo = fixture();
+    let d = repo.path();
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    let before = rev(remote.path(), "main");
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "{err}");
+    assert!(err.contains("push refused"), "{err}");
+    assert_eq!(rev(remote.path(), "main"), before);
+    // A person's push is not checked.
+    let (ok, err) = git_push(d, &["origin", "main"], &[("CLAUDECODE", "")]);
+    assert!(ok, "{err}");
+    write(d, "src/lib.rs", GOOD);
+    commit(d, "Agent", "fixed", T0 + 120);
+    // The audit cannot tell that push from one around the hook, and says so.
+    let v = stop(d, false);
+    assert!(!blocked(&v), "passes: {v}");
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("outside Claude Code"),
+        "{v}"
+    );
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(ok, "{err}");
+    assert_eq!(rev(remote.path(), "main"), rev(d, "HEAD"));
+}
+
+/// The verdict follows the files, not the commit (review M4): a pass on the work tree covers
+/// committing all of it, without running the gate again, but not committing part of it.
+#[test]
+fn a_commit_of_exactly_the_passed_tree_is_verified() {
+    let repo = fixture();
+    let d = repo.path();
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", &format!("pub mod helper;\n{GOOD}"));
+    write(d, "src/helper.rs", "pub const ONE: u32 = 1;\n");
+    assert!(stop(d, false).is_null(), "passes");
+    // Committing only part of it publishes files the gate never saw together.
+    git(d, &["add", "src/lib.rs"], T0 + 60);
+    commit_staged(d, "uses helper", T0 + 60);
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "{err}");
+    // In the same command as the commit, the pre-bash hook leaves the push to git's hook.
+    let v = hook_env(
+        d,
+        "pre-bash",
+        &json!({"session_id": "s1", "tool_input": {"command": "git add -A && git commit -qm x && git push origin main"}}),
+        &[("CLAUDE_CODE_REMOTE", "false")],
+    );
+    assert!(
+        v["hookSpecificOutput"]["permissionDecision"].is_null(),
+        "{v}"
+    );
+    git(d, &["add", "src/helper.rs"], T0 + 120);
+    commit_staged(d, "helper", T0 + 120);
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(ok, "{err}");
+    assert_eq!(rev(remote.path(), "main"), rev(d, "HEAD"));
+}
+
+/// What publishes nothing new needs no verdict: a tag on a pushed commit, an older pushed
+/// commit to another ref, a deletion, a push with everything up to date.
+#[test]
+fn pushes_that_publish_nothing_new_need_no_verdict() {
+    let repo = fixture();
+    let d = repo.path();
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    git(
+        d,
+        &[
+            "-c",
+            "user.name=A",
+            "-c",
+            "user.email=a@example.com",
+            "tag",
+            "-a",
+            "-m",
+            "v1",
+            "v1",
+        ],
+        T0 + 30,
+    );
+    let (ok, err) = git_push(d, &["origin", "v1"], &[]);
+    assert!(ok, "tag on a pushed commit: {err}");
+    let (ok, err) = git_push(d, &["origin", "HEAD:refs/heads/copy"], &[]);
+    assert!(ok, "pushed commit to another ref: {err}");
+    let (ok, err) = git_push(d, &["origin", "--delete", "copy"], &[]);
+    assert!(ok, "deletion: {err}");
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(ok, "up to date: {err}");
+    // A new commit on another ref is not.
+    commit(d, "Agent", "broken", T0 + 60);
+    let (ok, err) = git_push(d, &["origin", "HEAD:refs/heads/other"], &[]);
+    assert!(!ok, "{err}");
+    assert!(rev(remote.path(), "other").is_empty());
+}
+
+/// In a cloud session the hook lets the push through and the user hears about it at the end
+/// of the turn, once; Claude is told at the next prompt (R1).
+#[test]
+fn in_a_cloud_session_an_unverified_push_is_reported() {
+    let repo = fixture();
+    let d = repo.path();
+    let remote = origin(d);
+    start(d, "startup");
+    // A second session in the same repository, also there before the push.
+    let s2 = |event: &str| {
+        hook(
+            d,
+            event,
+            &json!({"session_id": "s2", "source": "startup", "stop_hook_active": false}),
+        )
+    };
+    s2("session-start");
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    let (ok, err) = git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]);
+    assert!(ok, "{err}");
+    assert!(err.contains("not verified"), "{err}");
+    let first = rev(d, "HEAD");
+    // A second unverified push in the same turn is reported too.
+    write(d, "src/lib.rs", &FAILING_TEST.replace("+ 1", "+ 2"));
+    commit(d, "Agent", "still broken", T0 + 90);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    assert_eq!(rev(remote.path(), "main"), rev(d, "HEAD"));
+    let v = stop(d, false);
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("origin/main") && msg.contains("has not passed"),
+        "{v}"
+    );
+    for commit in [&first, &rev(d, "HEAD")] {
+        assert!(msg.contains(&commit[..10]), "{commit}: {v}");
+    }
+    assert!(
+        !s2("stop")["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("origin/main"),
+        "another session does not report it again"
+    );
+    let again = stop(d, true);
+    assert!(
+        !again["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("origin/main"),
+        "reported once: {again}"
+    );
+    let v = hook(d, "prompt", &json!({"session_id": "s1"}));
+    assert!(
+        v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("origin/main"),
+        "{v}"
+    );
+}
+
+/// A push that went around the hook is reported at the end of the turn; a verified push and
+/// a fetch are not.
+#[test]
+fn a_push_around_the_hook_is_reported() {
+    let repo = fixture();
+    let d = repo.path();
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(stop(d, false).is_null());
+    commit(d, "Agent", "verified", T0 + 60);
+    assert!(git_push(d, &["origin", "main"], &[]).0);
+    // Someone else's push, fetched here, moves origin/main too.
+    let other = tempfile::tempdir().unwrap();
+    let ok = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(remote.path())
+        .arg(other.path())
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    write(other.path(), "notes.md", "theirs\n");
+    commit(other.path(), "B", "theirs", T0 + 90);
+    let ok = Command::new("git")
+        .args(["push", "-q", "origin", "main"])
+        .current_dir(other.path())
+        .env_remove("CLAUDECODE")
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    git(
+        d,
+        &["pull", "-q", "--no-rebase", "origin", "main"],
+        T0 + 100,
+    );
+    let v = stop(d, false);
+    assert!(
+        !v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not verify"),
+        "verified push and fetch are not reported: {v}"
+    );
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 120);
+    // Backdated, as GIT_COMMITTER_DATE dates the reflog entry: the audit goes by order.
+    let (ok, err) = git_push(
+        d,
+        &["--no-verify", "origin", "main"],
+        &[("GIT_COMMITTER_DATE", "@1600000000 +0000")],
+    );
+    assert!(ok, "{err}");
+    let v = stop(d, false);
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("origin/main") && msg.contains("did not run"),
+        "{v}"
+    );
+}
+
+/// With the hook in place, the pre-bash hook refuses the usual ways around it; without it,
+/// there is nothing to get around.
+#[test]
+fn pre_bash_refuses_ways_around_the_hook() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    let bash = |cmd: &str| {
+        hook(
+            d,
+            "pre-bash",
+            &json!({"session_id": "s1", "tool_input": {"command": cmd}}),
+        )
+    };
+    for cmd in [
+        "git push --no-verif origin main",
+        "git -c core.hooksPath=/dev/null push origin main",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=x git push",
+        "CLAUDECODE= git push origin main",
+        "env -u CLAUDECODE git push origin main",
+        "git config core.hooksPath /tmp/none",
+    ] {
+        let v = bash(cmd);
+        let why = v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(why.contains("refused"), "{cmd}: {v}");
+    }
+    for cmd in [
+        "git config --get core.hooksPath",
+        "git commit -qm 'mention core.hooksPath and --no-verify'",
+    ] {
+        assert!(bash(cmd).is_null(), "{cmd}");
+    }
+    write(
+        d,
+        "Cargo.toml",
+        &format!("{CARGO_TOML}\n[package.metadata.fsmap.verify]\ngit-hook = false\n"),
+    );
+    start(d, "resume");
+    let v = bash("git config core.hooksPath /tmp/none");
+    assert!(v.is_null(), "no hook to get around: {v}");
+}
+
+/// Review M3: a pass recorded before a push still shows the user what it found (here an
+/// ignored test) at the end of the turn, which finds the tree already passed.
+#[test]
+fn notes_from_a_pass_before_a_push_reach_the_user() {
+    let repo = fixture();
+    let d = repo.path();
+    start(d, "startup");
+    write(
+        d,
+        "src/lib.rs",
+        &GOOD.replace("#[test]", "#[test]\n    #[ignore]"),
+    );
+    commit(d, "Agent", "ignore it", T0 + 60);
+    assert!(push(d).is_null(), "passes");
+    let v = stop(d, false);
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ignored test"),
+        "{v}"
+    );
+}
+
+/// From a linked worktree git exports GIT_DIR to the hook; the verdict and the push records
+/// are shared through the common git directory.
+#[test]
+fn a_push_from_a_linked_worktree_is_checked() {
+    let repo = fixture();
+    let d = repo.path();
+    let remote = origin(d);
+    let wt = tempfile::tempdir().unwrap();
+    let wt_dir = wt.path().join("wt");
+    git(
+        d,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            &wt_dir.to_string_lossy(),
+        ],
+        T0,
+    );
+    let w = wt_dir.as_path();
+    start(w, "startup");
+    write(w, "src/lib.rs", FAILING_TEST);
+    commit(w, "Agent", "broken", T0 + 60);
+    let (ok, err) = git_push(w, &["origin", "side"], &[]);
+    assert!(!ok, "{err}");
+    write(w, "src/lib.rs", GOOD);
+    commit(w, "Agent", "fixed", T0 + 120);
+    assert!(stop(w, false).is_null());
+    let (ok, err) = git_push(w, &["origin", "side"], &[]);
+    assert!(ok, "{err}");
+    assert_eq!(rev(remote.path(), "side"), rev(w, "HEAD"));
+}
+
+/// A tree verdict covers only what a commit holds: with git-ignored files cargo compiles,
+/// or with submodules, the gate saw more than the tree, so a commit made after the pass
+/// needs the gate again.
+#[test]
+fn a_tree_verdict_is_not_kept_where_the_tree_is_not_what_the_gate_saw() {
+    // A git-ignored integration test.
+    let repo = fixture();
+    let d = repo.path();
+    write(d, ".gitignore", &format!("{IGNORE}/tests/local.rs\n"));
+    commit(d, "A", "ignore a local test", T0 + 10);
+    let _remote = origin(d);
+    start(d, "startup");
+    write(d, "tests/local.rs", "#[test]\nfn local() {}\n");
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(stop(d, false).is_null());
+    commit(d, "Agent", "change", T0 + 60);
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "{err}");
+
+    // A submodule.
+    let repo = fixture();
+    let d = repo.path();
+    let sub = tempfile::tempdir().unwrap();
+    init(sub.path());
+    write(sub.path(), "x.txt", "x\n");
+    commit(sub.path(), "A", "sub", T0);
+    git(
+        d,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &sub.path().to_string_lossy(),
+            "vendor/sub",
+        ],
+        T0 + 10,
+    );
+    commit(d, "A", "add submodule", T0 + 10);
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(stop(d, false).is_null());
+    commit(d, "Agent", "change", T0 + 60);
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "{err}");
+    // Gated again with everything committed, HEAD itself is verified (D-15's rule).
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    assert!(stop(d, false).is_null());
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(ok, "{err}");
+    assert_eq!(rev(remote.path(), "main"), rev(d, "HEAD"));
+}
+
+/// The hook's own checks, run directly: only Claude Code's pushes, and input or a project
+/// it cannot read is a refusal, not a pass.
+#[test]
+fn the_hook_refuses_what_it_cannot_read() {
+    let repo = fixture();
+    let d = repo.path();
+    let head = rev(d, "HEAD");
+    let zero = "0".repeat(40);
+    let run = |stdin: &str, env: &[(&str, &str)]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_fsmap"));
+        c.args([
+            "hook",
+            "git-pre-push",
+            "--workspace",
+            ".",
+            "origin",
+            "unused",
+        ])
+        .current_dir(d)
+        .env("CLAUDECODE", "1")
+        .env_remove("CLAUDE_CODE_REMOTE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let mut child = c.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let update = format!("refs/heads/main {head} refs/heads/main {zero}\n");
+    let (ok, err) = run(&update, &[]);
+    assert!(!ok, "no verdict for this commit: {err}");
+    let (ok, _) = run(&update, &[("CLAUDECODE", "")]);
+    assert!(ok, "not a Claude Code push");
+    let (ok, err) = run("garbage\n", &[]);
+    assert!(!ok && err.contains("could not run"), "{err}");
+    let (ok, err) = run("", &[]);
+    assert!(ok, "nothing to push: {err}");
+    write(d, "Cargo.toml", &format!("{CARGO_TOML}this is not toml\n"));
+    let (ok, err) = run(&update, &[]);
+    assert!(!ok, "{err}");
+}
+
+/// Review M7: a Cargo workspace below the work tree top. Git runs the hook at the top; the
+/// shim names the workspace, or the hook would find no Rust there and let the push through.
+#[test]
+fn a_workspace_below_the_top_is_the_one_checked() {
+    let repo = tempfile::tempdir().unwrap();
+    let top = repo.path();
+    init(top);
+    let d = top.join("backend");
+    write(&d, "Cargo.toml", CARGO_TOML);
+    write(&d, ".gitignore", IGNORE);
+    write(&d, "src/lib.rs", GOOD);
+    lockfile(&d);
+    commit(top, "A", "init", T0);
+    let remote = origin(top);
+    start(&d, "startup");
+    assert!(shim(top).unwrap().contains("--workspace 'backend'"));
+    write(&d, "src/lib.rs", FAILING_TEST);
+    commit(top, "Agent", "broken", T0 + 60);
+    let before = rev(remote.path(), "main");
+    let (ok, err) = git_push(&d, &["origin", "main"], &[]);
+    assert!(!ok, "{err}");
+    assert_eq!(rev(remote.path(), "main"), before);
+}
+
+/// In a cloud session the shim never refuses, whatever fsmap does (R1): a refused push
+/// there can lose the session's commits. Elsewhere an fsmap that cannot run refuses.
+#[cfg(unix)]
+#[test]
+fn a_broken_fsmap_never_blocks_a_cloud_push() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    write(d, "notes.md", "unverified\n");
+    commit(d, "Agent", "notes", T0 + 60);
+    let fake = tempfile::tempdir().unwrap();
+    let bin = fake.path().join("fsmap");
+    std::fs::write(&bin, "#!/bin/sh\nexit 2\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(fake.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let path = path.to_string_lossy().into_owned();
+    let (ok, err) = git_push(d, &["origin", "main"], &[("PATH", &path)]);
+    assert!(!ok && err.contains("could not run the push check"), "{err}");
+    let (ok, err) = git_push(
+        d,
+        &["origin", "main"],
+        &[("PATH", &path), ("CLAUDE_CODE_REMOTE", "true")],
+    );
+    assert!(ok, "{err}");
+}
+
+// ------------------------------------------------- implementation review of D-16 (e759166)
+
+/// Review M1: HEAD of a work tree that passed counts only when the work tree holds nothing
+/// tracked that the commit lacks; a data file read by `include_str!` is not a build input.
+#[test]
+fn head_counts_only_when_nothing_tracked_is_left_out() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "data.txt", "1");
+    write(
+        d,
+        "src/lib.rs",
+        "pub fn data() -> &'static str {\n    include_str!(\"../data.txt\")\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn data() {\n        assert_eq!(super::data(), \"1\");\n    }\n}\n",
+    );
+    commit(d, "A", "data", T0 + 10);
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "data.txt", "2");
+    let lib = std::fs::read_to_string(d.join("src/lib.rs")).unwrap();
+    write(d, "src/lib.rs", &lib.replace("\"1\"", "\"2\""));
+    git(d, &["add", "src/lib.rs"], T0 + 60);
+    commit_staged(d, "expects 2", T0 + 60);
+    let v = stop(d, false);
+    assert!(!blocked(&v), "passes on the work tree: {v}");
+    let before = rev(remote.path(), "main");
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "data.txt is not in the commit: {err}");
+    assert_eq!(rev(remote.path(), "main"), before);
+}
+
+/// Review M2: an edited `--skip-worktree` file is not in the tree `git add -A` makes.
+#[test]
+fn an_edited_skip_worktree_file_keeps_its_commit_unverified() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "src/lib.rs", &format!("pub mod cfg;\n{GOOD}"));
+    write(d, "src/cfg.rs", "pub const X: u32 = 1;\n");
+    commit(d, "A", "cfg", T0 + 10);
+    let _remote = origin(d);
+    start(d, "startup");
+    git(
+        d,
+        &["update-index", "--skip-worktree", "src/cfg.rs"],
+        T0 + 20,
+    );
+    write(d, "src/cfg.rs", "pub const X: u32 = 2;\n");
+    write(
+        d,
+        "src/lib.rs",
+        &format!("pub mod cfg;\n{GOOD}\n#[test]\nfn x() {{\n    assert_eq!(cfg::X, 2);\n}}\n"),
+    );
+    git(d, &["add", "src/lib.rs"], T0 + 60);
+    commit_staged(d, "expects 2", T0 + 60);
+    assert!(stop(d, false).is_null(), "passes with the local copy");
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "the commit holds X = 1: {err}");
+}
+
+/// Convergence check: the same with a data file the build reads, which is not a build input.
+/// HEAD does not count while an edited hidden entry exists.
+#[test]
+fn an_edited_skip_worktree_data_file_keeps_head_unverified() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "data.txt", "1\n");
+    commit(d, "A", "data", T0 + 10);
+    let _remote = origin(d);
+    start(d, "startup");
+    git(d, &["update-index", "--skip-worktree", "data.txt"], T0 + 20);
+    write(d, "data.txt", "2\n");
+    write(
+        d,
+        "src/lib.rs",
+        &format!(
+            "{GOOD}\n#[test]\nfn x() {{\n    assert_eq!(include_str!(\"../data.txt\").trim(), \"2\");\n}}\n"
+        ),
+    );
+    git(d, &["add", "src/lib.rs"], T0 + 60);
+    commit_staged(d, "expects 2", T0 + 60);
+    assert!(stop(d, false).is_null(), "passes with the local copy");
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "the commit holds 1: {err}");
+}
+
+/// Review M3: the audit's window moves only after an audit. A compaction in between, or a
+/// turn the user interrupts (no Stop), does not lose a push.
+#[test]
+fn an_unverified_push_is_reported_across_compaction_and_interruption() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    start(d, "compact");
+    let v = stop(d, false);
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("origin/main"),
+        "reported after a compaction: {v}"
+    );
+    // Interrupted: a push, then the next prompt without a Stop in between.
+    write(d, "src/lib.rs", &FAILING_TEST.replace("+ 1", "+ 2"));
+    commit(d, "Agent", "still broken", T0 + 90);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let second = rev(d, "HEAD");
+    let v = hook(d, "prompt", &json!({"session_id": "s1"}));
+    assert!(
+        v.to_string().contains(&second[..10]),
+        "the second push is reported at the prompt: {v}"
+    );
+}
+
+/// What happens between turns is not the agent's: the prompt audits only a turn no Stop
+/// closed (one the user interrupted), so a person's own push after a turn is not reported.
+#[test]
+fn a_persons_push_between_turns_is_not_reported() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(!blocked(&stop(d, false)), "the turn ends");
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Person", "theirs", T0 + 60);
+    let ok = Command::new("git")
+        .args(["push", "-q", "origin", "main"])
+        .current_dir(d)
+        .env_remove("CLAUDECODE")
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let theirs = rev(d, "HEAD");
+    let v = hook(d, "prompt", &json!({"session_id": "s1"}));
+    assert!(
+        !v.to_string().contains("did not verify"),
+        "a person's push between turns: {v}"
+    );
+    // The prompt opened a turn: the agent's push in it is audited when the user interrupts.
+    write(d, "src/lib.rs", &FAILING_TEST.replace("+ 1", "+ 2"));
+    commit(d, "Agent", "broken", T0 + 90);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let ours = rev(d, "HEAD");
+    let v = hook(d, "prompt", &json!({"session_id": "s1"})).to_string();
+    assert!(v.contains(&ours[..10]), "the agent's push: {v}");
+    assert!(
+        !v.contains(&theirs[..10]),
+        "the person's push stays out: {v}"
+    );
+}
+
+/// Work after a turn ended, while background agents run (a Stop that waits for them), is the
+/// agent's: a push in it is audited at the next prompt.
+#[test]
+fn a_push_while_background_agents_work_is_audited_at_the_prompt() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(!blocked(&stop(d, false)), "the turn ends");
+    // Woken by a background agent's notification; its Stop waits for the agents.
+    hook(
+        d,
+        "stop",
+        &json!({"session_id": "s1", "hook_event_name": "Stop", "stop_hook_active": false,
+                "background_tasks": [{"id": "x", "type": "subagent", "status": "running"}]}),
+    );
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let ours = rev(d, "HEAD");
+    let v = hook(d, "prompt", &json!({"session_id": "s1"})).to_string();
+    assert!(v.contains(&ours[..10]), "{v}");
+}
+
+/// Convergence check: switching the hook off in the verify table during the session is
+/// reported like removing it.
+#[test]
+fn switching_the_hook_off_is_reported() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    write(
+        d,
+        "Cargo.toml",
+        &format!("{CARGO_TOML}\n[package.metadata.fsmap.verify]\ngit-hook = false\n"),
+    );
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "off", T0 + 60);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let v = stop(d, false);
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(msg.contains("origin/main"), "{v}");
+    assert!(
+        msg.contains("git-hook = false"),
+        "the switch is reported: {v}"
+    );
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", &FAILING_TEST.replace("+ 1", "+ 2"));
+    commit(d, "Agent", "broken again", T0 + 90);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let again = rev(d, "HEAD");
+    let v = stop(d, false);
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(msg.contains(&again[..10]), "a later push is audited: {v}");
+    assert!(!msg.contains("git-hook = false"), "reported once: {v}");
+}
+
+/// Review M4: removing the hook does not also remove the audit; the removal is reported.
+#[test]
+fn removing_the_hook_does_not_hide_the_push() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    std::fs::remove_file(d.join(".git/hooks/pre-push")).unwrap();
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(ok, "no hook ran: {err}");
+    let v = stop(d, false);
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(msg.contains("origin/main"), "{v}");
+    assert!(
+        msg.contains("pre-push hook"),
+        "the removal is reported: {v}"
+    );
+    // The next turn: still audited, and the removal is not reported again.
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", &FAILING_TEST.replace("+ 1", "+ 2"));
+    commit(d, "Agent", "broken again", T0 + 90);
+    assert!(git_push(d, &["origin", "main"], &[]).0);
+    let again = rev(d, "HEAD");
+    let v = stop(d, false);
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(msg.contains(&again[..10]), "a later push is audited: {v}");
+    assert!(!msg.contains("pre-push hook stopped"), "reported once: {v}");
+}
+
+/// Convergence check (B1): a later push that publishes nothing new does not approve a commit
+/// an earlier, unverified push sent.
+#[test]
+fn a_later_push_of_the_same_commit_does_not_hide_an_unverified_one() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    let cloud = [("CLAUDE_CODE_REMOTE", "true")];
+    assert!(git_push(d, &["origin", "main"], &cloud).0);
+    let x = rev(d, "HEAD");
+    assert!(git_push(d, &["origin", "HEAD:refs/heads/backup"], &cloud).0);
+    let v = stop(d, false);
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&x[..10]),
+        "{v}"
+    );
+}
+
+/// Convergence check: a push made after the gate let go (three strikes), in a continuation
+/// another Stop hook forced, is audited.
+#[test]
+fn a_push_after_the_gate_let_go_is_audited() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    write(d, "src/lib.rs", FAILING_TEST);
+    assert!(blocked(&stop(d, false)));
+    assert!(blocked(&stop(d, true)));
+    assert!(!blocked(&stop(d, true)), "the third failure lets go");
+    commit(d, "Agent", "broken", T0 + 60);
+    assert!(git_push(d, &["origin", "main"], &[("CLAUDE_CODE_REMOTE", "true")]).0);
+    let x = rev(d, "HEAD");
+    let v = stop(d, true);
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&x[..10]),
+        "{v}"
+    );
+}
+
+/// Convergence check: resuming a session whose last turn was interrupted does not report
+/// the person's own pushes made in between.
+#[test]
+fn a_resumed_session_does_not_report_a_persons_pushes() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    // Interrupted: no Stop; then the person works and pushes, and later resumes.
+    write(d, "notes.md", "theirs\n");
+    commit(d, "Person", "theirs", T0 + 60);
+    let ok = Command::new("git")
+        .args(["push", "-q", "origin", "main"])
+        .current_dir(d)
+        .env_remove("CLAUDECODE")
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    start(d, "resume");
+    let v = hook(d, "prompt", &json!({"session_id": "s1"}));
+    assert!(!v.to_string().contains("did not verify"), "{v}");
+}
+
+/// Convergence check: a branch without the Cargo workspace (`gh-pages`) is not the gate's
+/// business, pushed from the Rust checkout or from a checkout of its own; it is neither
+/// refused nor reported.
+#[test]
+fn a_branch_without_the_workspace_is_neither_refused_nor_reported() {
+    // An orphan branch with a page, made in the checkout, then left.
+    let orphan = |top: &Path, at: i64| {
+        git(top, &["checkout", "-q", "--orphan", "pages"], at);
+        git(top, &["rm", "-rqf", "."], at);
+        write(top, "index.html", "<p>hi</p>\n");
+        // Only the page: nothing of the workspace's directory, not even the hooks' state.
+        git(top, &["add", "index.html"], at);
+        commit_staged(top, "pages", at);
+        git(top, &["checkout", "-q", "-f", "main"], at);
+    };
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    hook(d, "prompt", &json!({"session_id": "s1"}));
+    orphan(d, T0 + 70);
+    let (ok, err) = git_push(d, &["origin", "pages:refs/heads/gh-pages"], &[]);
+    assert!(ok, "from the Rust checkout: {err}");
+    let site = tempfile::tempdir().unwrap();
+    let site = site.path().join("site");
+    git(
+        d,
+        &["worktree", "add", "-q", &site.to_string_lossy(), "pages"],
+        T0 + 80,
+    );
+    write(&site, "index.html", "<p>hello</p>\n");
+    commit(&site, "Agent", "page", T0 + 90);
+    let (ok, err) = git_push(&site, &["origin", "HEAD:refs/heads/gh-pages"], &[]);
+    assert!(ok, "from its own checkout: {err}");
+    let v = stop(d, false);
+    assert!(
+        !v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not verify"),
+        "{v}"
+    );
+
+    // A workspace below the top, and a checkout without its directory.
+    let repo = tempfile::tempdir().unwrap();
+    let top = repo.path();
+    init(top);
+    let w = top.join("backend");
+    write(&w, "Cargo.toml", CARGO_TOML);
+    write(&w, ".gitignore", IGNORE);
+    write(&w, "src/lib.rs", GOOD);
+    lockfile(&w);
+    commit(top, "A", "init", T0);
+    let _remote = origin(top);
+    start(&w, "startup");
+    orphan(top, T0 + 70);
+    let site = tempfile::tempdir().unwrap();
+    let site = site.path().join("site");
+    git(
+        top,
+        &["worktree", "add", "-q", &site.to_string_lossy(), "pages"],
+        T0 + 80,
+    );
+    let (ok, err) = git_push(&site, &["origin", "pages"], &[]);
+    assert!(ok, "no backend directory here: {err}");
+}
+
+/// Convergence check: an uncommitted change inside a submodule is in the gate's build but
+/// not in the commit, so HEAD does not count.
+#[test]
+fn an_uncommitted_change_in_a_submodule_keeps_head_unverified() {
+    let repo = fixture();
+    let d = repo.path();
+    let sub = tempfile::tempdir().unwrap();
+    init(sub.path());
+    write(sub.path(), "x.txt", "1\n");
+    commit(sub.path(), "A", "sub", T0);
+    git(
+        d,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &sub.path().to_string_lossy(),
+            "vendor/sub",
+        ],
+        T0 + 10,
+    );
+    commit(d, "A", "add submodule", T0 + 10);
+    let _remote = origin(d);
+    start(d, "startup");
+    write(d, "vendor/sub/x.txt", "2\n");
+    write(
+        d,
+        "src/lib.rs",
+        &format!(
+            "{GOOD}\n#[test]\nfn x() {{\n    assert_eq!(include_str!(\"../vendor/sub/x.txt\").trim(), \"2\");\n}}\n"
+        ),
+    );
+    git(d, &["add", "src/lib.rs"], T0 + 60);
+    commit_staged(d, "expects 2", T0 + 60);
+    assert!(
+        stop(d, false).is_null(),
+        "passes with the submodule's local copy"
+    );
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "the submodule's commit holds 1: {err}");
+}
+
+/// Review m1: an existing commit pushed to a new branch publishes nothing; it is not a push
+/// around the hook.
+#[test]
+fn a_known_commit_on_a_new_branch_is_not_reported() {
+    let repo = fixture();
+    let d = repo.path();
+    let _remote = origin(d);
+    start(d, "startup");
+    let (ok, err) = git_push(d, &["origin", "HEAD:refs/heads/copy"], &[]);
+    assert!(ok, "{err}");
+    let v = stop(d, false);
+    assert!(
+        !v["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("origin/copy"),
+        "{v}"
+    );
+}
+
+/// Review m3: from a work tree without the Cargo workspace (an orphan `gh-pages`), a push of
+/// a branch that has it is not let through unchecked.
+#[test]
+fn a_push_from_a_checkout_without_the_workspace_is_checked() {
+    let repo = fixture();
+    let d = repo.path();
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "src/lib.rs", FAILING_TEST);
+    commit(d, "Agent", "broken", T0 + 60);
+    git(d, &["checkout", "-q", "--orphan", "pages"], T0 + 70);
+    git(d, &["rm", "-rqf", "."], T0 + 70);
+    write(d, "index.html", "<p>hi</p>\n");
+    commit(d, "Agent", "pages", T0 + 80);
+    let before = rev(remote.path(), "main");
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(!ok, "{err}");
+    assert_eq!(rev(remote.path(), "main"), before);
+    // A commit the remote already has publishes nothing new, from here too.
+    let (ok, err) = git_push(d, &["origin", &format!("{before}:refs/heads/copy")], &[]);
+    assert!(ok, "{err}");
+}
+
+/// Review m5: a verdict reached in one worktree holds in another, also with configuration
+/// files in the tree (their paths differ per worktree).
+#[test]
+fn a_verdict_holds_across_worktrees_with_config_in_the_tree() {
+    let repo = fixture();
+    let d = repo.path();
+    write(d, "rustfmt.toml", "edition = \"2021\"\n");
+    commit(d, "A", "rustfmt", T0 + 10);
+    let remote = origin(d);
+    let wt = tempfile::tempdir().unwrap();
+    let w = wt.path().join("wt");
+    git(
+        d,
+        &["worktree", "add", "-q", "-b", "side", &w.to_string_lossy()],
+        T0 + 20,
+    );
+    start(&w, "startup");
+    write(&w, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(stop(&w, false).is_null());
+    commit(&w, "Agent", "change", T0 + 60);
+    let (ok, err) = git_push(d, &["origin", "side"], &[]);
+    assert!(ok, "verified in the other worktree: {err}");
+    assert_eq!(rev(remote.path(), "side"), rev(&w, "HEAD"));
+}
+
+/// Review m2: with a clean filter (as Git LFS has), the verified tree is the one a commit
+/// makes, so committing what passed is accepted.
+#[test]
+fn a_verdict_follows_clean_filters() {
+    let repo = fixture();
+    let d = repo.path();
+    git(d, &["config", "filter.up.clean", "tr a-z A-Z"], T0);
+    git(d, &["config", "filter.up.smudge", "cat"], T0);
+    write(d, ".gitattributes", "*.txt filter=up\n");
+    write(d, "notes.txt", "one\n");
+    commit(d, "A", "filtered", T0 + 10);
+    let remote = origin(d);
+    start(d, "startup");
+    write(d, "notes.txt", "two\n");
+    write(d, "src/lib.rs", &GOOD.replace("a + b", "b + a"));
+    assert!(stop(d, false).is_null());
+    commit(d, "Agent", "change", T0 + 60);
+    let (ok, err) = git_push(d, &["origin", "main"], &[]);
+    assert!(ok, "{err}");
+    assert_eq!(rev(remote.path(), "main"), rev(d, "HEAD"));
 }

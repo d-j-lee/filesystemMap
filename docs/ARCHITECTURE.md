@@ -122,8 +122,9 @@ Measured 2026-10-28 on a 4-core cloud container, release build.
 | `/usr`, 93 k entries, `--no-git` | scan 0.14 s; content 1.6 s warm / 10.8 s cold (456 MiB text); peak RSS 88 MB |
 | `/usr --sizes-only` → HTML | 0.57 s, 6.6 MiB report |
 | `brief --hook` on ripgrep with a warm cache (one git call) | 8 ms (median of 30) |
-| `verify` (quick gate) on this repository, 2026-10-30, 144 tests | 49–51 s with nothing to rebuild, three runs, another agent running (47–48 s without it); nearly all `cargo test` (44 end-to-end hook tests) |
+| `verify` (quick gate) on this repository, 2026-10-30, 178 tests | 66–69 s with nothing to rebuild, five runs; nearly all `cargo test` (74 end-to-end hook tests) |
 | `hook session-start` / `hook pre-bash` (non-publishing command) on a clean clone | 0.4 s / 5 ms (3 runs each) |
+| `hook git-pre-push` on this repository, 2026-10-30 | 62–86 ms for a push that publishes nothing new, 117–170 ms for one it checks (8 runs each) |
 
 ## 7. Safety and privacy
 
@@ -148,16 +149,17 @@ Measured 2026-10-28 on a 4-core cloud container, release build.
 ## 8. Agent harness
 
 `src/harness/` puts the compiler, the tests and fsmap's repository knowledge into an AI agent's
-loop. Usage and limits: [agent-harness.md](agent-harness.md); decision record: D-15.
+loop. Usage and limits: [agent-harness.md](agent-harness.md); decision records: D-15, D-16.
 
 | Module | Role |
 |---|---|
 | `verify` | The gate: plan the steps, run each in the workspace root with weakening variables removed and `CARGO_TARGET_DIR` inside the repository, attribute fmt/clippy failures to files, render text or JSON |
 | `integrity` | Find every cargo, rustfmt, clippy and rustup file that applies (ancestors, `CARGO_HOME`, files a cargo config `include`s, the user's rustfmt files, rustup directory overrides, every nested `rustfmt.toml`/`clippy.toml`, ignored ones included) and place it with `git ls-files -v`: tracked files are not judged, hidden ones inside the repository (untracked, ignored, skip-worktree) are judged and never trusted, ones outside it are judged and trustable. Judging parses TOML against an allowlist (target tables only for the host). Toolchain settings are checked before any cargo runs; environment variables are judged by name and value |
 | `proc` | Run a command with a deadline; kill its process group on expiry and after exit; stop waiting for output a background process keeps open; keep the last 256 KiB |
-| `state` | Per-worktree state (per-session baseline, last pass and failure); hooks record outcomes through a locked read-modify-write; the outcome log; the work-tree fingerprint |
+| `state` | Per-worktree state (per-session baseline, last pass and failure, remote-ref snapshot); push records shared by worktrees in the common git directory; every update a read-modify-write under an operating-system file lock; the outcome log; the work-tree fingerprint, split so its non-file part keys tree verdicts |
 | `shell` | Recognise publishing commands (`git push`, `gh pr create`) through quoting, comments, substitutions, heredocs (with a stack of quoting contexts), wrappers, `sh -c` and global options; a reading left open falls back to "mentions a push"; deleting refs, `--help` and `--dry-run` are not publishing |
-| `hooks` | The five Claude Code hooks and `stats`: JSON in, one JSON answer out, exit 0; panics become a message |
+| `githook` | The git pre-push shim (where it goes, whether it is ours, installing it), the tree a work tree would commit (on a copy of the index that keeps its mtime), what a push publishes, remote-tracking refs and the pushes in their reflogs; `Mode`: refuse, or report in a cloud session |
+| `hooks` | The five Claude Code hooks, the body of the git pre-push hook, the push audit and `stats`: JSON in, one JSON answer out, exit 0 (the git hook answers with its exit code); panics become a message |
 
 The stop gate keys on a **fingerprint** of what the gate depends on: HEAD, `git status`
 (filters neutralised, submodules fingerprinted separately), the contents of dirty files,
@@ -170,9 +172,21 @@ and is byte-identical now (hashes taken at first sight). When all failures are i
 session did not change (never integrity failures), the stop is blocked once and then released
 with a report, and the user is told the gate did not pass. When cargo cannot read the
 project, the gate cannot run: the stop is blocked and a push denied. Without a fingerprint (no
-git) the gate runs every time. A push is denied while build inputs are uncommitted (manifests,
-configuration, and sources in a directory a target reads, from `cargo metadata`), since the gate
-checks the work tree and the push sends HEAD; a pre-push hook that fails denies the push. The threat model (hidden configuration fails,
+git) the gate runs every time.
+
+A pass also records the tree a commit of the work tree would hold, with a digest of the
+fingerprint's non-file part (configuration, judged environment, toolchain). git's pre-push hook,
+through a shim the session-start hook installs, lets a push from Claude Code through when the
+commit each updated ref ends at holds such a tree, or is HEAD of a work tree whose fingerprint
+passed with nothing tracked and no build input left uncommitted, or is already on the remote,
+or does not hold the workspace at all; it refuses otherwise,
+except in a cloud session, where it only reports (D-16). Where the hook enforces, the pre-bash hook runs the
+gate before a push so a verdict exists, and leaves the decision to git; elsewhere it denies a
+push while build inputs are uncommitted (manifests, configuration, and sources in a directory a
+target reads, from `cargo metadata`), since the gate checks the work tree and the push sends
+HEAD. At the end of a turn the Stop hook reports pushes in the remote-tracking reflogs since the
+last audit that no pre-push run verified; the next prompt does the same for a turn no Stop
+ended (the user interrupted it), and otherwise leaves the gap between turns, a person's, alone. The threat model (hidden configuration fails,
 tracked changes are reported) is in [agent-harness.md](agent-harness.md).
 
 Templates for other repositories are in `harness/`; this repository uses copies of them in

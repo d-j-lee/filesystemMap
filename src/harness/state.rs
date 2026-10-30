@@ -3,12 +3,15 @@
 //!
 //! State lives in `<git-dir>/fsmap-harness/` (per worktree, outside the work tree,
 //! untouched by `cargo clean`), or under `$XDG_STATE_HOME/fsmap/harness/` when there is no
-//! usable git directory. Every hook treats missing or unreadable state as "nothing known".
+//! usable git directory. What the git pre-push hook needs across worktrees (verified trees,
+//! push records; D-16) lives in the common git directory instead. Every hook treats missing
+//! or unreadable state as "nothing known".
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::integrity;
@@ -37,6 +40,23 @@ pub struct Session {
     pub released: bool,
     /// Unix seconds of the last hook call for this session.
     pub last_seen: i64,
+    /// Remote-tracking refs and their commits when the last push audit ran (or the session
+    /// was first seen), and when; the next audit reads the reflogs of the refs that moved
+    /// since (D-16). `refs_at` is 0 before the first snapshot.
+    pub remote_refs: BTreeMap<String, String>,
+    pub refs_at: i64,
+    /// The git pre-push hook was in place when that snapshot was taken: the next audit runs
+    /// even if the hook is gone by then (review M4).
+    pub audit: bool,
+    /// A prompt started a turn that no Stop has ended: pushes in the window are the agent's.
+    /// The next prompt audits such a turn (one the user interrupted fires no Stop); after a
+    /// turn ends, pushes until the next prompt are a person's.
+    pub in_turn: bool,
+    /// Why the git pre-push hook was last reported as not working, so a change is reported
+    /// once.
+    pub hook_off: Option<String>,
+    /// For Claude at the next prompt (a Stop hook cannot add context).
+    pub pending_context: Vec<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -49,7 +69,40 @@ pub struct State {
     pub last_fail_reason: Option<String>,
     /// Every failure of that run was in files the session did not change.
     pub last_fail_untouched_only: bool,
+    /// What a pass found worth telling the user (added suppressions, changed configuration)
+    /// when the pass was not a Stop's: shown at the next Stop (D-16 review M3).
+    pub pending_notes: Vec<String>,
     pub sessions: BTreeMap<String, Session>,
+}
+
+/// What the git pre-push hook and the push audit share across worktrees (D-16), in the
+/// common git directory. Each list keeps its newest `PUSH_RECORDS` entries.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Pushes {
+    /// `<tree> <context digest>` of work trees the gate passed on (see `context_digest`).
+    pub verified: Vec<String>,
+    /// Commits the pre-push hook let through as verified.
+    pub approved: Vec<String>,
+    /// Commits pushed without a verdict (report mode), with the reason.
+    pub unverified: Vec<(String, String)>,
+    /// Pushes the audit already reported.
+    pub reported: Vec<String>,
+    /// Updates the pre-push hook saw that published nothing new, as `<remote-tracking ref>
+    /// <commit>`. Keyed by ref: an earlier push of the same commit that no hook saw stays
+    /// reported (convergence check B1).
+    pub known: Vec<String>,
+}
+
+pub const PUSH_RECORDS: usize = 256;
+
+/// Add `item` as the newest entry of a bounded list.
+pub fn remember<T: PartialEq>(list: &mut Vec<T>, item: T) {
+    list.retain(|x| *x != item);
+    list.push(item);
+    if list.len() > PUSH_RECORDS {
+        list.drain(..list.len() - PUSH_RECORDS);
+    }
 }
 
 impl State {
@@ -101,10 +154,31 @@ pub fn load(root: &Path) -> State {
 }
 
 fn load_in(d: &Path) -> State {
-    std::fs::read(d.join("state.json"))
+    read_json(&d.join("state.json"))
+}
+
+fn read_json<T: Default + DeserializeOwned>(path: &Path) -> T {
+    std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
+}
+
+/// The common git directory's state directory (shared by all worktrees), if there is one.
+pub fn common_dir(root: &Path) -> Option<PathBuf> {
+    let common = super::githook::rev_parse(root, &["--git-common-dir"])?.pop()?;
+    let d = root.join(common).join("fsmap-harness");
+    std::fs::create_dir_all(&d).ok()?;
+    Some(d)
+}
+
+pub fn load_pushes(root: &Path) -> Pushes {
+    common_dir(root).map_or_else(Pushes::default, |d| read_json(&d.join("pushes.json")))
+}
+
+/// Like `update`, for the push records in the common git directory.
+pub fn update_pushes(root: &Path, f: impl FnOnce(&mut Pushes)) -> bool {
+    common_dir(root).is_some_and(|d| update_json(&d, "pushes.json", "pushes.lock", f))
 }
 
 /// Apply `f` to the freshest state and save it, under a short lock. Hooks run the gate on
@@ -116,15 +190,36 @@ pub fn update(root: &Path, f: impl FnOnce(&mut State)) -> bool {
 }
 
 fn update_in(d: &Path, f: impl FnOnce(&mut State)) -> bool {
+    update_json(d, "state.json", "state.lock", |st: &mut State| {
+        f(st);
+        let now = now();
+        st.sessions
+            .retain(|_, s| now - s.last_seen < SESSION_TTL_SECS);
+    })
+}
+
+/// Read `name` in `d`, apply `f` and write it back atomically, holding `lock` throughout.
+fn update_json<T: Default + Serialize + DeserializeOwned>(
+    d: &Path,
+    name: &str,
+    lock: &str,
+    f: impl FnOnce(&mut T),
+) -> bool {
     if std::fs::create_dir_all(d).is_err() {
         return false;
     }
-    let Some(_lock) = Lock::acquire(&d.join("state.lock")) else {
+    let Some(_lock) = Lock::acquire(&d.join(lock)) else {
         return false;
     };
-    let mut st = load_in(d);
-    f(&mut st);
-    save_in(d, &mut st)
+    let mut value: T = read_json(&d.join(name));
+    f(&mut value);
+    let Ok(json) = serde_json::to_vec_pretty(&value) else {
+        return false;
+    };
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = d.join(format!("{name}.{}.{n}.tmp", std::process::id()));
+    std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, d.join(name)).is_ok()
 }
 
 /// An exclusive operating-system lock on `state.lock` (`flock`, `LockFileEx`), held for one
@@ -152,21 +247,6 @@ impl Drop for Lock {
         // Closing the file releases the lock as well.
         let _ = self.0.unlock();
     }
-}
-
-/// Atomic replace (write a temp file, rename).
-fn save_in(d: &Path, state: &mut State) -> bool {
-    let now = now();
-    state
-        .sessions
-        .retain(|_, s| now - s.last_seen < SESSION_TTL_SECS);
-    let Ok(json) = serde_json::to_vec_pretty(state) else {
-        return false;
-    };
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = d.join(format!("state.json.{}.{n}.tmp", std::process::id()));
-    std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, d.join("state.json")).is_ok()
 }
 
 /// One line per hook outcome, for `fsmap hook stats` (D-15: measure before claiming the
@@ -212,12 +292,37 @@ pub fn head(root: &Path) -> Option<String> {
 pub fn fingerprint(root: &Path, trust: &[String]) -> Option<String> {
     let mut h = xxhash_rust::xxh3::Xxh3::new();
     hash_tree(&mut h, root, 0)?;
+    hash_context(&mut h, root, trust);
+    Some(format!("{:016x}", h.digest()))
+}
+
+/// The part of the fingerprint that is not the files git sees: with the tree a commit
+/// would hold, it keys a verdict that survives committing (D-16).
+pub fn context_digest(root: &Path, trust: &[String]) -> String {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    hash_context(&mut h, root, trust);
+    format!("{:016x}", h.digest())
+}
+
+fn hash_context(h: &mut xxhash_rust::xxh3::Xxh3, root: &Path, trust: &[String]) {
+    // Named relative to the root where they are inside it, so that the same tree gives the
+    // same digest in every worktree (review m5).
+    let croot = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let name = |p: &Path| {
+        p.strip_prefix(root)
+            .or_else(|_| p.strip_prefix(&croot))
+            .map_or_else(
+                |_| p.to_string_lossy().into_owned(),
+                |r| r.to_string_lossy().replace('\\', "/"),
+            )
+    };
     for path in ignored_build_inputs(root) {
-        hash_file(&mut h, &root.join(path));
+        hash_file_as(h, &path, &root.join(&path));
     }
     // Through links: a tracked link's target is what cargo reads (fifth review).
     for path in integrity::config_files(root) {
-        hash_file(&mut h, &dunce::canonicalize(&path).unwrap_or(path));
+        let target = dunce::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        hash_file_as(h, &name(&path), &target);
     }
     let vars = super::verify::env_vars();
     for name in integrity::weakening_env(
@@ -236,7 +341,6 @@ pub fn fingerprint(root: &Path, trust: &[String]) -> Option<String> {
         h.update(&o.stdout);
     }
     h.update(env!("CARGO_PKG_VERSION").as_bytes());
-    Some(format!("{:016x}", h.digest()))
 }
 
 fn hash_tree(h: &mut xxhash_rust::xxh3::Xxh3, root: &Path, depth: usize) -> Option<()> {
@@ -281,7 +385,7 @@ fn hash_tree(h: &mut xxhash_rust::xxh3::Xxh3, root: &Path, depth: usize) -> Opti
 }
 
 /// Paths of submodules (gitlinks) in the index.
-fn submodules(root: &Path) -> Vec<String> {
+pub fn submodules(root: &Path) -> Vec<String> {
     git::run({
         let mut c = git::git(root);
         c.args(["ls-files", "-s", "-z"]);
@@ -300,7 +404,7 @@ fn submodules(root: &Path) -> Vec<String> {
 }
 
 /// Git-ignored files that cargo still compiles or reads (review finding M4).
-fn ignored_build_inputs(root: &Path) -> Vec<String> {
+pub fn ignored_build_inputs(root: &Path) -> Vec<String> {
     git::run({
         let mut c = git::git(root);
         c.args([
@@ -498,7 +602,12 @@ fn toplevel(dir: &Path) -> Option<PathBuf> {
 }
 
 fn hash_file(h: &mut xxhash_rust::xxh3::Xxh3, path: &Path) {
-    h.update(path.to_string_lossy().as_bytes());
+    hash_file_as(h, &path.to_string_lossy(), path);
+}
+
+/// The file at `path`, hashed under `name`.
+fn hash_file_as(h: &mut xxhash_rust::xxh3::Xxh3, name: &str, path: &Path) {
+    h.update(name.as_bytes());
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         h.update(b"\0missing");
         return;
