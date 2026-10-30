@@ -1,5 +1,7 @@
 # CLAUDE.md — working on fsmap
 
+@AGENTS.md
+
 fsmap is a Rust CLI. It maps a directory into an arena tree, enriches it (classification,
 content metrics, git status and history, imports, duplicates), derives findings, and renders
 HTML/JSON/Markdown/SARIF. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before structural
@@ -15,6 +17,7 @@ cargo test                                    # unit + end-to-end (tests/cli.rs)
 node --check viewer/app.js                    # viewer syntax (embedded via include_str!)
 cargo build --release && ./target/release/fsmap report . -q -o /tmp/r.html
 ./target/release/fsmap insights . --fail-on high   # dogfood: the repo must stay clean
+./target/release/fsmap verify .               # the gate the hooks run: all of the above in one go
 ```
 
 Iterate in that order: get `cargo check` clean, then clippy, then tests. Do not jump to a
@@ -37,8 +40,11 @@ release build to "see if it works".
 | `src/report/` | terminal, html (CSP), context (agents), sarif |
 | `src/brief.rs`, `src/diff.rs` | Briefing/hook/cache; snapshot diff |
 | `src/dupes.rs`, `src/util.rs` | Duplicate detection; formatting and sanitising helpers |
+| `src/harness/` | Agent harness (D-15): `verify` gate, `integrity` (TOML allowlist), `proc` (deadlines), `state` (fingerprint, locked updates, log), `shell` (push detection), `hooks` |
+| `harness/` | Templates for other repositories; `.claude/` and `AGENTS.md` here are copies, checked by a test |
 | `viewer/` | Report UI, vanilla JS, no dependencies |
 | `tests/cli.rs` | End-to-end against a generated git fixture |
+| `tests/harness.rs` | Hooks end to end on a generated Cargo fixture; each guard's test fails without the guard |
 | `tests/review_regressions.rs` | Tests for defects found by independent reviews (D-13, D-14); a few D-14 checks extend `tests/cli.rs` |
 
 ## Rules
@@ -48,9 +54,12 @@ release build to "see if it works".
   Commands that compare the work tree with the index (`status`, `diff` against the work tree)
   use `git::git_worktree()`, which also disables the repository's filter drivers (D-13).
   Never call `Command::new("git")` directly in library code.
+- **Canonical paths come from `dunce::canonicalize`** (`clippy.toml` forbids std's). On Windows
+  std returns `\\?\C:\…`, which never compares equal to the paths git, cargo and rustfmt print.
 - **Determinism**: sort anything that reaches an output; `context` must stay byte-identical for
   the same tree (there is a test).
-- **Never put file contents or commit messages into outputs.** Paths and metrics only.
+- **Never put file contents or commit messages into outputs.** Paths and metrics only. The
+  one exception is the harness gate's failure text for the agent in the same session (D-15).
 - **Viewer**: render data with `textContent`/`h()` only — never `innerHTML` with data. Colours
   come from CSS tokens; any new colour needs a light and a dark value.
 - **Snapshot schema**: additive changes keep `fsmap/1`; anything else bumps it. Update
@@ -64,8 +73,8 @@ release build to "see if it works".
 
 ## Keeping the docs alive
 
-- `README.md`, `docs/ARCHITECTURE.md` and `docs/snapshot-schema.md` describe **the current
-  state**. Edit them in place; they are not changelogs.
+- `README.md`, `docs/ARCHITECTURE.md`, `docs/snapshot-schema.md` and `docs/agent-harness.md`
+  describe **the current state**. Edit them in place; they are not changelogs.
 - `docs/decisions.md` is append-only. Add `D-NN` entries with alternatives and costs; mark
   replaced ones **Superseded by D-xx** instead of deleting them.
 - `docs/ROADMAP.md` holds seeds. Delete ideas that stop making sense; move shipped ones into

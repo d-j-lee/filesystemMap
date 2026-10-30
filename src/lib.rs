@@ -11,6 +11,7 @@ pub mod deps;
 pub mod diff;
 pub mod dupes;
 pub mod git;
+pub mod harness;
 pub mod insights;
 pub mod model;
 pub mod prune;

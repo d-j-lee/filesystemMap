@@ -41,19 +41,24 @@ pub fn git(dir: &Path) -> Command {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null());
-    for var in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_COMMON_DIR",
-        "GIT_PREFIX",
-        "GIT_NAMESPACE",
-    ] {
+    for var in REPOSITORY_ENV {
         c.env_remove(var);
     }
     c
 }
+
+/// Variables that point git at a repository other than the one around the working
+/// directory. git exports some of them to its hooks (`GIT_DIR` from a linked worktree), so
+/// a program started from a hook that runs git elsewhere must remove them.
+pub const REPOSITORY_ENV: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_NAMESPACE",
+];
 
 /// A `git` command for subcommands that compare the work tree with the index (`status`,
 /// `diff` against the work tree). Those can run `filter.<driver>.clean` programs named in
@@ -116,7 +121,7 @@ fn run_with_stdin(mut cmd: Command, input: Vec<u8>) -> Result<Vec<u8>> {
     let out = child.wait_with_output()?;
     writer
         .join()
-        .map_err(|_| anyhow::anyhow!("stdin writer panicked"))??;
+        .map_err(|panic| anyhow::anyhow!("stdin writer panicked: {panic:?}"))??;
     if !out.status.success() {
         bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -225,7 +230,7 @@ pub fn discover(tree: &Tree, root: &Path, max_repos: usize) -> (Vec<Repo>, usize
         c
     }) {
         let top = PathBuf::from(text(top));
-        let top = std::fs::canonicalize(&top).unwrap_or(top);
+        let top = dunce::canonicalize(&top).unwrap_or(top);
         let prefix = root
             .strip_prefix(&top)
             .ok()
@@ -263,7 +268,7 @@ pub fn discover(tree: &Tree, root: &Path, max_repos: usize) -> (Vec<Repo>, usize
             })
             .ok()?;
             let top = PathBuf::from(text(top));
-            let same = std::fs::canonicalize(&top).ok()? == std::fs::canonicalize(&dir).ok()?;
+            let same = dunce::canonicalize(&top).ok()? == dunce::canonicalize(&dir).ok()?;
             same.then(|| Repo {
                 node: id,
                 path: tree.rel_path(id),

@@ -1,6 +1,6 @@
 # Using fsmap with AI coding agents
 
-Three integrations, from zero setup to automatic. The examples target Claude Code; the
+Four integrations, from zero setup to automatic. The examples target Claude Code; the
 outputs are plain Markdown/JSON, so any agent that reads files or runs commands can use them.
 
 ## 1. A repo map in the agent's context — `fsmap context`
@@ -64,6 +64,9 @@ file's commits. Hook field names follow the Claude Code hooks documentation as o
 2026-10 (`https://code.claude.com/docs/en/hooks`). If a future version renames them, check
 that page first.
 
+In a Rust repository with the [agent harness](agent-harness.md), `fsmap hook post-edit`
+already includes this brief next to its `cargo check`; register one of the two, not both.
+
 ## 3. Keep agents out of bulky paths — `fsmap agent-ignore`
 
 ```bash
@@ -97,3 +100,11 @@ fsmap insights . --baseline .fsmap-baseline.json --fail-on medium
 Only findings that are **new** relative to the baseline fail the build: a new import cycle, a
 newly committed `dist/` or `target/`, a secret-looking file. Existing debt does not block work but
 cannot grow. `--format sarif` feeds GitHub code scanning.
+
+## 5. For Rust repositories — the agent harness
+
+`fsmap verify` runs fmt, clippy `-D warnings`, the tests and the repository's own checks, and
+fails when cargo or rustfmt settings would make them pass without the code changing. Five
+Claude Code hooks run it at the end of each turn and before `git push`, run `cargo check` after
+each edit, and tell Claude the real toolchain and dependency sources at session start. Setup,
+what it catches and its limits: [agent-harness.md](agent-harness.md).

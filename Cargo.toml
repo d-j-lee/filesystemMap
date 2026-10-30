@@ -12,6 +12,7 @@ anstyle = "1.0.14"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
+dunce = "1.0.5"
 globset = "0.4.21"
 indicatif = "0.18.6"
 memchr = "2.8.3"
@@ -21,20 +22,39 @@ regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+toml = "1.1.8"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
 [dev-dependencies]
 serde_json = "1.0.154"
 tempfile = "3.27.0"
 
+# Extra steps for `fsmap verify` (the gate people, agent hooks and CI share; D-15).
+# `{fsmap}` is the running fsmap binary.
+[package.metadata.fsmap.verify]
+extra = [
+    ["node", "--check", "viewer/app.js"],
+    ["{fsmap}", "insights", ".", "--fail-on", "high", "-q"],
+]
+
 [lints.rust]
 unsafe_code = "forbid"
 
-# Guardrails for AI-written code (see docs/rust-ai-playbook.md §4.3).
+# Guardrails for AI-written code (see docs/rust-ai-playbook.md §4.3 and decision D-15).
+# The gate runs clippy with -D warnings, so "warn" here fails `fsmap verify`.
 [lints.clippy]
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
+# Suppressions need a reason and must still be needed: `#[expect(lint, reason = "...")]`.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+# Panics and swallowed errors that compile fine (tests may unwrap: clippy.toml).
+unwrap_used = "warn"
+map_err_ignore = "warn"
+# Borrow-checker evasion by copying.
+redundant_clone = "warn"
+clone_on_ref_ptr = "warn"
 
 [profile.release]
 lto = "thin"

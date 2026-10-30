@@ -91,7 +91,7 @@ impl Ctx<'_> {
 /// Walk `root` and build the arena. `seen` is bumped once per entry (for progress display).
 pub fn scan(root: &Path, opts: &ScanOptions, seen: &AtomicU64) -> Result<ScanOutput> {
     let root_path =
-        fs::canonicalize(root).with_context(|| format!("cannot access {}", root.display()))?;
+        dunce::canonicalize(root).with_context(|| format!("cannot access {}", root.display()))?;
     let meta =
         fs::metadata(&root_path).with_context(|| format!("cannot stat {}", root_path.display()))?;
 

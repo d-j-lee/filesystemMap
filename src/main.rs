@@ -17,6 +17,7 @@ use globset::{Glob, GlobSetBuilder};
 use fsmap::analysis::{self, Analysis, AuthorMode, Progress};
 use fsmap::brief::{self, CodeOwners, Index};
 use fsmap::git::history::Window;
+use fsmap::harness::{hooks, verify};
 use fsmap::insights::{self, Finding, Severity};
 use fsmap::report::{context, html, sarif, terminal};
 use fsmap::snapshot::{Parts, PruneInfo, Snapshot};
@@ -27,7 +28,7 @@ use fsmap::{dupes, prune, util};
     name = "fsmap",
     version,
     about = "Map a filesystem or codebase: sizes, code, git history, imports — and the findings worth acting on.",
-    after_help = "Examples:\n  fsmap report .                     interactive HTML report\n  fsmap context . > REPO_MAP.md      repo map for AI agents\n  fsmap insights . --fail-on high    CI gate\n  fsmap brief --diff                 files you probably forgot to change\n  fsmap report ~ --no-git            where did my disk go?"
+    after_help = "Examples:\n  fsmap report .                     interactive HTML report\n  fsmap context . > REPO_MAP.md      repo map for AI agents\n  fsmap insights . --fail-on high    CI gate\n  fsmap brief --diff                 files you probably forgot to change\n  fsmap verify                       the gate to pass before calling a change done\n  fsmap report ~ --no-git            where did my disk go?"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -121,6 +122,30 @@ enum Cmd {
         #[arg(long, default_value_t = 15)]
         top: usize,
     },
+    /// The verification gate: settings that weaken it, fmt, clippy -D warnings, tests, the
+    /// repository's extra steps (`[workspace.metadata.fsmap.verify] extra`), and cargo-deny in
+    /// full mode.
+    Verify {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = verify::Mode::Quick)]
+        mode: verify::Mode,
+        /// Treat a skipped step (a tool that is not installed) as a failure.
+        #[arg(long)]
+        strict: bool,
+        /// Machine-readable report.
+        #[arg(long)]
+        json: bool,
+        /// Time budget in seconds for all steps; a step still running is killed and fails.
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+    },
+    /// Claude Code hooks for the agent harness: reads the hook event JSON on stdin and
+    /// prints the hook's JSON answer (`stats` summarises past outcomes instead).
+    Hook {
+        #[arg(value_enum)]
+        event: HookArg,
+    },
     /// Suggested read-deny rules so AI agents skip bulky, low-value paths.
     AgentIgnore {
         #[arg(default_value = ".")]
@@ -130,6 +155,16 @@ enum Cmd {
         #[command(flatten)]
         a: AnalyzeArgs,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HookArg {
+    SessionStart,
+    PostEdit,
+    Stop,
+    Prompt,
+    PreBash,
+    Stats,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -239,7 +274,7 @@ fn with_progress<T>(quiet: bool, f: impl FnOnce(&Progress) -> T) -> T {
     let done = Arc::new(AtomicBool::new(false));
     let show = !quiet && std::io::stderr().is_terminal();
     let handle = show.then(|| {
-        let (p, d) = (progress.clone(), done.clone());
+        let (p, d) = (Arc::clone(&progress), Arc::clone(&done));
         std::thread::spawn(move || {
             let bar = indicatif::ProgressBar::new_spinner();
             bar.set_style(
@@ -472,6 +507,66 @@ fn run(cli: Cli) -> Result<ExitCode> {
             write_out(None, text.as_bytes())?;
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Hook { event } => {
+            let event = match event {
+                HookArg::SessionStart => hooks::Event::SessionStart,
+                HookArg::PostEdit => hooks::Event::PostEdit,
+                HookArg::Stop => hooks::Event::Stop,
+                HookArg::Prompt => hooks::Event::Prompt,
+                HookArg::PreBash => hooks::Event::PreBash,
+                HookArg::Stats => {
+                    let dir = std::env::var_os("CLAUDE_PROJECT_DIR")
+                        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+                    write_out(None, hooks::stats(&dir)?.as_bytes())?;
+                    return Ok(ExitCode::SUCCESS);
+                }
+            };
+            let mut input = String::new();
+            let _ = std::io::stdin().read_to_string(&mut input);
+            if let Some(json) = hooks::run(event, &input) {
+                println!("{json}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Verify {
+            path,
+            mode,
+            strict,
+            json,
+            timeout,
+        } => {
+            let root = verify::workspace_root(&path)?;
+            let exe = std::env::current_exe().context("locating the fsmap binary")?;
+            let cfg = verify::config(&root)?;
+            let steps = verify::plan(&root, mode, &exe, &cfg);
+            let budget = Duration::from_secs(timeout);
+            let report = verify::run(&root, mode, &steps, &cfg, budget, |r| {
+                if !json {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "verify: {} {} ({:.1}s)",
+                        r.name,
+                        r.status.label(),
+                        r.ms as f64 / 1000.0
+                    );
+                }
+            });
+            let text = if json {
+                serde_json::to_string_pretty(&report)? + "\n"
+            } else {
+                verify::render(&report)
+            };
+            write_out(None, text.as_bytes())?;
+            let skipped = report
+                .steps
+                .iter()
+                .any(|s| s.status == verify::Status::Skip);
+            Ok(if report.passed() && !(strict && skipped) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
         Cmd::AgentIgnore { path, format, a } => {
             let (analysis, _) = analyse(&path, &a)?;
             let skip = context::skip_list(&analysis);
@@ -511,27 +606,14 @@ fn repo_root(dir: &Path) -> (PathBuf, Option<String>) {
     match brief::locate(dir) {
         Some((top, head)) => (top, Some(head)),
         None => (
-            std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+            dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
             None,
         ),
     }
 }
 
 fn brief_index(root: &Path, head: Option<&str>, refresh: bool, quiet: bool) -> Result<Index> {
-    if !refresh
-        && let Some(head) = head
-        && let Some(idx) = brief::load_cached(root, head)
-    {
-        return Ok(idx);
-    }
-    let opts = analysis::Options {
-        dupes: None,
-        ..Default::default()
-    };
-    let a = with_progress(quiet, |p| analysis::run(root, &opts, p))?;
-    let idx = Index::build(&a);
-    brief::store_cached(root, &idx);
-    Ok(idx)
+    with_progress(quiet, |p| brief::index(root, head, refresh, p))
 }
 
 fn run_brief(
@@ -603,7 +685,7 @@ fn run_brief(
             } else {
                 cwd.join(&p)
             };
-            let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
+            let abs = dunce::canonicalize(&abs).unwrap_or(abs);
             let rel = abs
                 .strip_prefix(&root)
                 .map(|r| r.to_string_lossy().replace('\\', "/"))

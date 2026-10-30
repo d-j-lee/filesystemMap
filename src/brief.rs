@@ -165,7 +165,7 @@ pub fn locate(dir: &Path) -> Option<(PathBuf, String)> {
     // HEAD is the last line; the top-level path before it may itself contain newlines.
     let text = String::from_utf8_lossy(&out);
     let (top, head) = text.trim_end().rsplit_once('\n')?;
-    let top = std::fs::canonicalize(top.trim_end_matches('\r')).ok()?;
+    let top = dunce::canonicalize(top.trim_end_matches('\r')).ok()?;
     Some((top, head.trim().to_string()))
 }
 
@@ -236,20 +236,33 @@ impl CodeOwners {
     }
 }
 
-fn likely_tests<'a>(idx: &'a Index, path: &str) -> Vec<&'a str> {
-    let stem = Path::new(path)
+/// The name a file is known by for test pairing: its stem, or for module roots (`mod.rs`,
+/// `lib.rs`, `index.ts`, `__init__.py`, …) its directory's name. Otherwise every `mod.rs`
+/// pairs with `tests/common/mod.rs`.
+fn pairing_name(path: &str) -> String {
+    let p = Path::new(path);
+    let stem = p
         .file_stem()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
+    // `index.test.ts` tests a module root too: look at the part before the first dot.
+    let base = stem.split('.').next().unwrap_or(&stem);
+    if matches!(base, "mod" | "lib" | "main" | "index" | "__init__" | "init")
+        && let Some(dir) = p.parent().and_then(Path::file_name)
+    {
+        return dir.to_string_lossy().to_ascii_lowercase();
+    }
+    stem
+}
+
+fn likely_tests<'a>(idx: &'a Index, path: &str) -> Vec<&'a str> {
+    let stem = pairing_name(path);
     let mut out: Vec<&str> = Vec::new();
     for (p, f) in &idx.files {
         if !f.test || p == path {
             continue;
         }
-        let other = Path::new(p)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
+        let other = pairing_name(p);
         let named = other.contains(&stem) && stem.len() >= 3;
         let imports = idx
             .imports
@@ -455,11 +468,32 @@ pub fn hook_response(
     let v: serde_json::Value = serde_json::from_str(stdin).ok()?;
     let event = v.get("hook_event_name")?.as_str()?.to_string();
     let file = v.get("tool_input")?.get("file_path")?.as_str()?;
+    let text = hook_context(idx, owners, root, file, &event)?;
+    Some(
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": text,
+            }
+        })
+        .to_string(),
+    )
+}
+
+/// The briefing text for a file an agent is editing, when the file is notable (co-change
+/// partners, generated, a hotspot, or widely imported). `file` may be absolute.
+pub fn hook_context(
+    idx: &Index,
+    owners: Option<&CodeOwners>,
+    root: &Path,
+    file: &str,
+    event: &str,
+) -> Option<String> {
     // The root is canonical; make the file canonical too (symlinked project paths). A
     // file that does not exist yet (Write) is resolved through its parent directory.
     let abs = PathBuf::from(file);
-    let abs = std::fs::canonicalize(&abs).ok().or_else(|| {
-        let parent = std::fs::canonicalize(abs.parent()?).ok()?;
+    let abs = dunce::canonicalize(&abs).ok().or_else(|| {
+        let parent = dunce::canonicalize(abs.parent()?).ok()?;
         Some(parent.join(abs.file_name()?))
     })?;
     let rel = abs
@@ -492,15 +526,30 @@ pub fn hook_response(
         text.truncate(cut);
         text.push('…');
     }
-    Some(
-        serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": event,
-                "additionalContext": text,
-            }
-        })
-        .to_string(),
-    )
+    Some(text)
+}
+
+/// The cached index for `root` at `head`, or a fresh analysis (cached for next time).
+pub fn index(
+    root: &Path,
+    head: Option<&str>,
+    refresh: bool,
+    progress: &crate::analysis::Progress,
+) -> Result<Index> {
+    if !refresh
+        && let Some(head) = head
+        && let Some(idx) = load_cached(root, head)
+    {
+        return Ok(idx);
+    }
+    let opts = crate::analysis::Options {
+        dupes: None,
+        ..Default::default()
+    };
+    let a = crate::analysis::run(root, &opts, progress)?;
+    let idx = Index::build(&a);
+    store_cached(root, &idx);
+    Ok(idx)
 }
 
 #[cfg(test)]
@@ -551,13 +600,17 @@ mod tests {
         assert!(s.contains("Usually changes with: `src/b.rs` (80%"));
         let s = brief_file(&idx, None, "src/alpha.rs", &HashSet::new());
         assert!(s.contains("Likely tests: `tests/alpha_test.rs`"));
+        assert_eq!(pairing_name("src/harness/mod.rs"), "harness");
+        assert_eq!(pairing_name("tests/common/mod.rs"), "common");
+        assert_eq!(pairing_name("src/scan.rs"), "scan");
+        assert_eq!(pairing_name("src/helper/css/index.test.ts"), "css");
     }
 
     #[test]
     fn hook_protocol() {
         let idx = idx();
         let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.rs"), "").unwrap();
         let event = |file: &str| {

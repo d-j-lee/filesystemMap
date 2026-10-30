@@ -1,6 +1,11 @@
 //! End-to-end tests: build a small git repository with a known history, run the real
 //! binary against it, and check every output contract.
 
+#![expect(
+    clippy::unwrap_used,
+    reason = "allow-unwrap-in-tests does not cover helper functions in integration tests"
+)]
+
 mod common;
 
 use common::{commit, fsmap, git, write};
@@ -198,7 +203,7 @@ fn brief_diff_reports_forgotten_partner() {
     assert!(text.contains("proto/schema.txt"), "{text}");
 
     // Hook mode: JSON for Claude Code, silent for unremarkable files.
-    let abs = std::fs::canonicalize(d.join("client/api.py")).unwrap();
+    let abs = dunce::canonicalize(d.join("client/api.py")).unwrap();
     let out = hook(d, &abs, &[]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("hook JSON");
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");

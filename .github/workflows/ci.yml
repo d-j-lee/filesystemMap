@@ -36,6 +36,34 @@ jobs:
         if: runner.os == 'Linux'
         run: node --check viewer/app.js
 
+  msrv:
+    # Cargo.toml declares rust-version = "1.88"; this keeps the claim true.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
+
+  gate:
+    # The agent harness's gate (decision D-15) run on this repository, cargo-deny
+    # included. The explicit steps above stay the gate of record: a change that weakens
+    # `fsmap verify` cannot pass CI by grading itself.
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the dogfood extra step needs history
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo build --release --locked
+      - name: fsmap verify --mode full --strict
+        run: ./target/release/fsmap verify . --mode full --strict
+
   dogfood:
     # fsmap analyses itself: new high-severity findings fail the build, and the report
     # is kept as an artifact for review.
