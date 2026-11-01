@@ -14,3 +14,8 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # The msrv job pins the toolchain to Cargo.toml's rust-version on purpose, and the
+      # other jobs use the `stable` branch. Dependabot reads `@1.89` as a version to bump
+      # and proposed `@1.120`, a branch name for a Rust that is not released (PR #4).
+      - dependency-name: "dtolnay/rust-toolchain"
