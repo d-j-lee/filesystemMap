@@ -25,6 +25,9 @@ from the fsmap agent harness: <https://github.com/d-j-lee/filesystemMap> (`docs/
 - **Never suppress to get green.** No `#[allow]`; use `#[expect(lint, reason = "...")]` only when
   the lint is wrong for this code, with a reason that would convince a reviewer. Never skip, ignore,
   weaken or delete a test to make it pass.
+- **Never push around the check.** No `--no-verify`, no `core.hooksPath` change, no unsetting
+  `CLAUDECODE`. If the git pre-push hook refuses a push, make the gate pass; if the refusal looks
+  wrong, tell the user.
 - **Errors**: no `unwrap` on external input (files, network, user, other processes). Add context
   when propagating (`.context("reading the index")`). Libraries use typed errors (`thiserror`),
   binaries `anyhow`.

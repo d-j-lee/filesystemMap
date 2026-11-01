@@ -512,3 +512,170 @@ configs, workflows or `.claude/`.
 
 **Evidence still missing.** Whether the gate reduces broken "done" claims, and how often it
 blocks falsely, needs logs from real sessions. `fsmap hook stats` reads them.
+
+## D-16 A git pre-push hook decides about pushes; a push audit reports the rest
+
+**Context.** D-15 gated publishing in the pre-bash hook by reading the agent's shell commands.
+Six review rounds each found command forms the reading missed. The reading had fallen back to
+"mentions a push" when unsure, which also denied harmless commands, and it denied
+`git commit … && git push` as a whole because the commit had not happened when it judged.
+
+**Decision.**
+- Outside a cloud session, git's own pre-push hook decides. A shim installed in the common hooks
+  directory hands each push from Claude Code (`CLAUDECODE=1`) to `fsmap hook git-pre-push`.
+- A push is verified when the commit each updated ref ends at falls in one of four cases:
+  - its tree is one the gate passed on, with the same configuration, judged environment and
+    toolchain;
+  - it is HEAD of a work tree whose fingerprint passed, with no tracked change (hidden ones
+    included) and no build input left out of it;
+  - it publishes nothing the remote's tracking refs lack;
+  - it does not hold the workspace at all (a `gh-pages` branch).
+- The hook never runs the gate itself: Stop and pre-bash produce the verdicts within their
+  budgets, and the hook only reads them.
+- The Stop hook audits the remote-tracking reflogs and reports pushes no hook run verified;
+  the next prompt does the same for a turn no Stop ended.
+- With the hook in place, pre-bash refuses the usual ways around it.
+
+**Alternatives.**
+- **A gate in a clean worktree** (option B), the design first proposed. An independent review
+  found:
+  - absolute `include`s and links still reach the original repository, so the placement code
+    could not be deleted as planned;
+  - a shared clean tree needs a lock;
+  - submodules, sparse checkouts and hook managers each need handling;
+  - every cloud session would pay a second cold build (about +50 s and 0.9 GB here).
+  The user chose this design (A) over B and over stopping at D-15 (C).
+- **Enforce in cloud sessions too** (R2). The Claude Code binary pushes the branch when it
+  releases a cloud session (`push-on-release`, seen in its strings), and every process it starts
+  carries `CLAUDECODE=1`. If that push runs git hooks, a refusal would lose the session's
+  commits with the container. Whether it does could not be observed, so the user chose R1: in a
+  cloud session (`CLAUDE_CODE_REMOTE=true`, which the Claude Code process itself starts with)
+  the hook only reports, the shim never refuses even when fsmap is missing or fails, and
+  pre-bash keeps deciding about the agent's push commands there.
+- **Recognising the Bash tool** by variables only it sets (R3). Not taken: they are undocumented
+  and can change in any release.
+
+**Review of this design** (one independent agent, before code). No blocker, 7 majors. Adopted:
+- the hook reads verdicts and never runs the gate (a gate inside it runs under the Bash tool's
+  timeout, not a hook's);
+- updates that publish nothing new pass;
+- push records live in the common git directory, so a push verified in one worktree is not
+  reported from another;
+- the audit diffs `for-each-ref` snapshots, cheaper than reading every reflog at every Stop;
+- the notes of a pass made before a push are kept for the next Stop (they had been lost: a
+  D-15 defect);
+- pre-bash does not decide a push the hook will judge;
+- the shim finds fsmap on `PATH`, names the workspace, and stays out of cargo-husky's way.
+
+Two of its observations were confirmed live in this session: pre-bash denying a commit-and-push
+command, and a cached flaky failure blocking every push of a tree. The second led to
+replacing the state lock (OS file lock, MSRV 1.89, PR #5).
+
+**Found while building it.** All 31 guards were each removed in turn, and each removal made a
+test fail. Four survived at first:
+- two were missing tests: dedup across sessions, and a workspace below the work tree top;
+- one was a mistake in the mutation script;
+- one exposed a real defect: the audit stopped at reflog entries dated before the session's
+  window, and an entry's date is the committer date, which `GIT_COMMITTER_DATE` sets. The audit
+  now goes by reflog order, down to the entry that produced the snapshot's commit.
+
+Separately, a verified push was refused in 4 of 25 runs of one test. The cause was git's "racy
+git" rule: git trusts an index entry's stat data only when the entry is older than the index
+file. A copy of the index made now made every entry older, so a same-size change made in the
+timestamp tick of the last `git add` went unseen, and the verdict named the old tree. The copy
+now keeps the index's mtime. A unit test reproduces the case by fixing the stat data, and 0 of
+25 runs fail after the fix.
+
+**Implementation review** (a fresh agent, with real pushes to local remotes). No blocker, 5
+majors, 8 minors; all but two (traced in the code) were reproduced. Each fix began with a test
+that failed on the code as it was:
+- M1: the HEAD rule let out a commit that left a tracked data file behind (read by
+  `include_str!`, so not a build input), and its tests failed on a fresh clone. HEAD now counts
+  only with no tracked change at all.
+- M2: `git add -A` passes over an edited `--skip-worktree` file, so the recorded tree was not the
+  one the gate built. No tree is recorded while such entries exist.
+- M3: a compaction and the next prompt moved the audit's window without auditing, so a push the
+  hook said was "reported to the user" never was. A compaction now leaves the window open, and
+  the prompt audits before it moves it (narrowed below: after a turn that ended, it only moves
+  it).
+- M4: deleting or disabling the shim switched the audit off too. Whether to audit follows the
+  hook's state when the window opened, and the removal is reported.
+- M5: git older than 2.31 echoes the unknown `--path-format` and exits 0, so state files landed
+  in the work tree under a name starting with `--`. Paths are now resolved relative to the
+  directory, and output with the wrong number of lines is rejected.
+- Minors fixed:
+  - m1: a known commit pushed to a new branch was reported as a bypass.
+  - m2: in a repository with a clean filter, every push after a pass was refused, because the
+    recorded tree skipped the filter. The tree is now recorded with filters on; the harness runs
+    the repository's own code anyway.
+  - m3: any push from a checkout without the workspace got through.
+  - m5: verdicts were not shared across worktrees once a config file was tracked, because the
+    digest hashed absolute paths.
+  - m6: a refspec with spaces was refused.
+  - m7: pre-bash refused reading `core.hooksPath` and environment changes on commands that do
+    not push, and missed `sudo`, `exec -c`, `GIT_CONFIG_GLOBAL`, and an alias with
+    `--no-verify`.
+- Documented instead (Limits in the guide):
+  - m4: only each ref's tip is checked. Checking every commit would refuse nearly every push,
+    since intermediate commits never ran the gate.
+  - m8: one shim names one workspace.
+
+Reading the diff of the M3 fix found a regression: the prompt now audited the gap between turns,
+so a person's own push made there was reported. The session now records whether a turn is open
+(set by the prompt and by a Stop that blocks or waits for background agents, cleared by a Stop
+that ends the turn), and the prompt audits only an open one.
+
+The 18 guards the review fixes added and the 5 of the turn flag were then removed one at a time,
+like the first 31. Two survived at first: a test that an earlier Stop's report already satisfied,
+and a branch no test told apart (`git config core.hooksPath` followed only by flags, which
+reads). Each got the test it lacked, and all 54 now fail a test when removed.
+
+**Convergence check** (two fresh agents on those fixes: one compared every changed claim in the
+docs with the code and the binary, one reviewed the code with real pushes). The claims check
+found 13 of 68 claims untrue; the review found 1 blocker, 3 majors and 8 minors. Fixed, each
+with a test that failed first:
+- B1, a regression from the m1 fix: approving the commit of an update that published nothing
+  new also cleared an earlier push of it that no hook saw, so a tag or a second branch hid an
+  unverified push. Such an update is now recorded for its remote-tracking ref only.
+- HEAD counted while an edited `--skip-worktree` data file, or an uncommitted change inside a
+  submodule, was left out of the commit; `git status` hides both. (The M2 test used a `.rs`
+  file, which another check already caught.)
+- After the hook was removed, or switched off with `git-hook = false` (which was not even
+  reported), the session stopped auditing. Once the hook has been in place the session stays
+  audited, and each change to the hook is reported once.
+- A Stop in a continuation that another Stop hook forced after this one let go skipped the
+  audit. It audits first now.
+- A branch without the workspace (`gh-pages`) was refused from the Rust checkout and from a
+  checkout without the workspace's directory, and reported when it got through. It is not the
+  gate's business now.
+- A resumed session reported the person's pushes made while it was closed. Resuming closes its
+  last turn.
+- pre-bash missed `export GIT_CONFIG_GLOBAL=…`, `sudo --preserve-env=PATH`, `env -iv`,
+  `CLAUDECODE+=x`, `--no-verify` after an alias's name, and an environment change in front of a
+  shell reading its script from stdin (dropped by the m7 narrowing).
+
+Documented instead, in the guide's Limits:
+- an untracked or git-ignored data file the build reads (ROADMAP: wider fingerprint);
+- a remote-tracking ref moved with `git update-ref`, a deliberate manipulation like editing the
+  harness state;
+- turn boundaries the hooks do not see: a turn no prompt opened, and an interrupted turn whose
+  session ends (ROADMAP);
+- a second session's shim reported as a change by the first.
+
+The 14 guards this round added were removed one at a time with the earlier ones. Three of the
+earlier mutants had to be moved to the code that now carries their guard. One new test passed
+with its guard removed: its orphan branch had picked up the hooks' state files, so the
+workspace's directory existed after all; it now commits only the page. All 73 fail a test when
+removed.
+
+**Costs** (this repository, 4 cores):
+- the hook takes 62–86 ms when nothing new is published, 117–170 ms when it checks (eight runs
+  each, after the convergence check);
+- recording a verified tree adds 20–27 ms of git work to a pass (an earlier cold run: 173 ms);
+- the 30 new end-to-end tests raised this repository's gate from about 48 s to 66–69 s.
+
+**Not covered.** Publishing outside `git push` in this clone (`gh api`, MCP tools, another
+clone, `send-pack`). Commits between a ref's old and new tip. Sessions in two workspaces of one
+repository. A remote-tracking ref moved by hand. Turn boundaries no hook marks. The audit misses tags, URL pushes, untracked branches of single-branch
+clones, `core.logAllRefUpdates=false`, and entries pruned before Stop. In a cloud session
+the command reading still decides, so a form it misses is reported rather than stopped.

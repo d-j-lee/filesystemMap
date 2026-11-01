@@ -5,6 +5,7 @@
 //! agent can edit what the hooks read. CI, running the same gate, is the gate of record.
 //! Guide: docs/agent-harness.md.
 
+pub mod githook;
 pub mod hooks;
 pub mod integrity;
 pub mod proc;

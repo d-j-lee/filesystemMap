@@ -99,6 +99,8 @@ impl Report {
 pub struct Config {
     pub extra: Vec<Vec<String>>,
     pub trust: Vec<String>,
+    /// `git-hook = false`: no git pre-push hook (D-16).
+    pub no_git_hook: bool,
 }
 
 /// The Cargo workspace root containing `dir`. Toolchain files are checked first: rustup
@@ -266,7 +268,12 @@ fn config_of(manifest: &Path) -> Result<Config> {
             "trust" => {
                 cfg.trust = strings(v).context("fsmap.verify.trust must be an array of strings")?;
             }
-            other => bail!("unknown key fsmap.verify.{other} (expected extra, trust)"),
+            "git-hook" => {
+                cfg.no_git_hook = !v
+                    .as_bool()
+                    .context("fsmap.verify.git-hook must be true or false")?;
+            }
+            other => bail!("unknown key fsmap.verify.{other} (expected extra, trust, git-hook)"),
         }
     }
     Ok(cfg)

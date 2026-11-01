@@ -145,6 +145,12 @@ enum Cmd {
     Hook {
         #[arg(value_enum)]
         event: HookArg,
+        /// git-pre-push: the gated workspace, relative to the pushing work tree's top.
+        #[arg(long, default_value = ".")]
+        workspace: String,
+        /// git-pre-push: git's arguments (remote name and URL).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Suggested read-deny rules so AI agents skip bulky, low-value paths.
     AgentIgnore {
@@ -164,6 +170,8 @@ enum HookArg {
     Stop,
     Prompt,
     PreBash,
+    /// Run by the git pre-push hook the session-start hook installs (D-16).
+    GitPrePush,
     Stats,
 }
 
@@ -507,13 +515,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
             write_out(None, text.as_bytes())?;
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Hook { event } => {
+        Cmd::Hook {
+            event,
+            workspace,
+            args,
+        } => {
             let event = match event {
                 HookArg::SessionStart => hooks::Event::SessionStart,
                 HookArg::PostEdit => hooks::Event::PostEdit,
                 HookArg::Stop => hooks::Event::Stop,
                 HookArg::Prompt => hooks::Event::Prompt,
                 HookArg::PreBash => hooks::Event::PreBash,
+                HookArg::GitPrePush => {
+                    let mut input = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut input)
+                        .context("reading the pre-push hook's input")?;
+                    let remote = args.first().map_or("", String::as_str);
+                    let (allow, message) = hooks::git_pre_push(&workspace, remote, &input);
+                    if !message.is_empty() {
+                        eprintln!("{message}");
+                    }
+                    return Ok(if allow {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    });
+                }
                 HookArg::Stats => {
                     let dir = std::env::var_os("CLAUDE_PROJECT_DIR")
                         .map_or_else(|| PathBuf::from("."), PathBuf::from);
